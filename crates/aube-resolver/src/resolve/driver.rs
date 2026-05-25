@@ -29,7 +29,9 @@ use crate::{
     Error, ExoticSubdepDetails, FxHashMap, FxHashSet, ResolutionMode, ResolveTask, ResolvedPackage,
     Resolver, error, is_deprecation_allowed, is_supported,
 };
-use aube_lockfile::{DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph};
+use aube_lockfile::{
+    DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph, git_commits_match,
+};
 use aube_manifest::PackageJson;
 use aube_util::adaptive::{AdaptiveLimit, PersistentState};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -874,6 +876,9 @@ impl<'a> ResolveDriver<'a> {
         // LockedPackage lets both policies work without a
         // second packument fetch at write time.
         let tarball_url = version_meta.dist.as_ref().map(|d| d.tarball.clone());
+        let registry_git_hosted = tarball_url
+            .as_deref()
+            .is_some_and(|url| url.contains("://npm.pkg.github.com/"));
 
         // Stream this resolved package for early tarball fetching.
         // `alias_of` mirrors what the LockedPackage below
@@ -962,6 +967,7 @@ impl<'a> ResolveDriver<'a> {
                     v
                 },
                 tarball_url,
+                registry_git_hosted,
                 // `name` is the alias for npm-aliased tasks
                 // (`"h3-v2": "npm:h3@..."` → name = "h3-v2"),
                 // so stash the real registry name here. The
@@ -1313,9 +1319,11 @@ impl<'a> ResolveDriver<'a> {
                 ),
             ));
         }
-        let (local, real_version, target_deps) = if let LocalSource::Git(ref g) = raw_local {
+        let (mut local, real_version, target_deps, integrity) = if let LocalSource::Git(ref g) =
+            raw_local
+        {
             let shallow = aube_store::git_host_in_list(&g.url, &self.resolver.git_shallow_hosts);
-            let (resolved_local, version, deps) =
+            let (resolved_local, version, deps, integrity) =
                 resolve_git_source(&task.name, g, shallow, Some(self.resolver.client.as_ref()))
                     .await
                     .map_err(|e| {
@@ -1324,7 +1332,15 @@ impl<'a> ResolveDriver<'a> {
                             format!("git resolve {}: {e}", task.range),
                         )
                     })?;
-            (resolved_local, version, deps)
+            let integrity = integrity.or_else(|| {
+                existing_local_source_integrity(
+                    self.existing,
+                    &task.name,
+                    &version,
+                    &resolved_local,
+                )
+            });
+            (resolved_local, version, deps, integrity)
         } else if let LocalSource::RemoteTarball(ref t) = raw_local {
             let (resolved_local, version, deps) =
                 resolve_remote_tarball(&task.name, t, self.resolver.client.as_ref())
@@ -1335,7 +1351,7 @@ impl<'a> ResolveDriver<'a> {
                             format!("remote tarball {}: {e}", task.range),
                         )
                     })?;
-            (resolved_local, version, deps)
+            (resolved_local, version, deps, None)
         } else {
             // Rewrite the path to be relative to the project root so
             // every downstream consumer can resolve it with a single
@@ -1357,8 +1373,9 @@ impl<'a> ResolveDriver<'a> {
                     .unwrap_or_else(|_| (task.name.clone(), "0.0.0".to_string(), BTreeMap::new()));
                 (version, deps)
             };
-            (local, version, deps)
+            (local, version, deps, None)
         };
+        attach_integrity_to_git_source(&mut local, integrity.as_deref());
         let dep_path = local.dep_path(&task.name);
         let linked_name = task.name.clone();
 
@@ -1413,6 +1430,7 @@ impl<'a> ResolveDriver<'a> {
                 LockedPackage {
                     name: linked_name.clone(),
                     version: real_version.clone(),
+                    integrity: integrity.clone(),
                     dep_path: dep_path.clone(),
                     local_source: Some(local.clone()),
                     ..Default::default()
@@ -1427,7 +1445,7 @@ impl<'a> ResolveDriver<'a> {
                         dep_path: dep_path.clone(),
                         name: linked_name.clone(),
                         version: real_version.clone(),
-                        integrity: None,
+                        integrity: integrity.clone(),
                         tarball_url: None,
                         // local_source deps aren't aliased —
                         // `file:`/`link:` specifiers go through the
@@ -1882,6 +1900,7 @@ impl<'a> ResolveDriver<'a> {
                     optional: locked_pkg.optional,
                     transitive_peer_dependencies: locked_pkg.transitive_peer_dependencies.clone(),
                     tarball_url: locked_pkg.tarball_url.clone(),
+                    registry_git_hosted: locked_pkg.registry_git_hosted,
                     alias_of: locked_pkg.alias_of.clone(),
                     yarn_checksum: locked_pkg.yarn_checksum.clone(),
                     engines: locked_pkg.engines.clone(),
@@ -1954,5 +1973,186 @@ impl<'a> ResolveDriver<'a> {
         };
         self.link_to_existing_version(task, &matched_ver);
         true
+    }
+}
+
+fn existing_local_source_integrity(
+    existing: Option<&LockfileGraph>,
+    name: &str,
+    version: &str,
+    local: &LocalSource,
+) -> Option<String> {
+    existing
+        .and_then(|g| {
+            g.packages.values().find(|pkg| {
+                pkg.name == name
+                    && pkg.local_source.as_ref().is_some_and(|old| {
+                        local_sources_match_for_integrity(old, local)
+                            && (pkg.version == version
+                                || matches!(
+                                    (old, local),
+                                    (LocalSource::Git(_), LocalSource::Git(_))
+                                ) && pkg.version == "0.0.0")
+                    })
+            })
+        })
+        .and_then(|pkg| pkg.integrity.clone())
+}
+
+fn local_sources_match_for_integrity(old: &LocalSource, new: &LocalSource) -> bool {
+    match (old, new) {
+        (LocalSource::Git(old), LocalSource::Git(new)) => {
+            git_commits_match(&old.resolved, &new.resolved) && old.subpath == new.subpath
+        }
+        _ => old == new,
+    }
+}
+
+fn attach_integrity_to_git_source(local: &mut LocalSource, integrity: Option<&str>) {
+    if let LocalSource::Git(git) = local
+        && git.integrity.is_none()
+    {
+        git.integrity = integrity.map(str::to_string);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_lockfile::{GitSource, LockedPackage};
+
+    #[test]
+    fn existing_local_source_integrity_matches_resolved_git_commit() {
+        let source = LocalSource::Git(GitSource {
+            url: "git+https://github.com/acme/dep.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            integrity: None,
+            subpath: None,
+        });
+        let graph = LockfileGraph {
+            packages: BTreeMap::from([(
+                "dep@git+https://github.com/acme/dep.git#abcdef0123456789abcdef0123456789abcdef01"
+                    .to_string(),
+                LockedPackage {
+                    name: "dep".to_string(),
+                    version: "1.0.0".to_string(),
+                    integrity: Some("sha512-old".to_string()),
+                    local_source: Some(source.clone()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &source).as_deref(),
+            Some("sha512-old")
+        );
+
+        let changed_commit = LocalSource::Git(GitSource {
+            resolved: "1111111111111111111111111111111111111111".to_string(),
+            ..match source {
+                LocalSource::Git(g) => g,
+                _ => unreachable!(),
+            }
+        });
+        assert!(
+            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &changed_commit)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_local_source_integrity_matches_git_by_resolved_commit() {
+        let old_source = LocalSource::Git(GitSource {
+            url: "git+ssh://git@github.com/acme/dep.git".to_string(),
+            committish: None,
+            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            integrity: None,
+            subpath: Some("packages/dep".to_string()),
+        });
+        let graph = LockfileGraph {
+            packages: BTreeMap::from([(
+                "dep@git+ssh://git@github.com/acme/dep.git#abcdef0123456789abcdef0123456789abcdef01"
+                    .to_string(),
+                LockedPackage {
+                    name: "dep".to_string(),
+                    version: "1.0.0".to_string(),
+                    integrity: Some("sha512-old".to_string()),
+                    local_source: Some(old_source),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let resolved_source = LocalSource::Git(GitSource {
+            url: "https://github.com/acme/dep.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            integrity: None,
+            subpath: Some("packages/dep".to_string()),
+        });
+
+        assert_eq!(
+            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &resolved_source)
+                .as_deref(),
+            Some("sha512-old")
+        );
+    }
+
+    #[test]
+    fn existing_local_source_integrity_matches_git_abbrev_and_placeholder_version() {
+        let old_source = LocalSource::Git(GitSource {
+            url: "git+ssh://git@github.com/acme/dep.git".to_string(),
+            committish: None,
+            resolved: "abcdef0".to_string(),
+            integrity: None,
+            subpath: None,
+        });
+        let graph = LockfileGraph {
+            packages: BTreeMap::from([(
+                "dep@git+ssh://git@github.com/acme/dep.git#abcdef0".to_string(),
+                LockedPackage {
+                    name: "dep".to_string(),
+                    version: "0.0.0".to_string(),
+                    integrity: Some("sha512-old".to_string()),
+                    local_source: Some(old_source),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let resolved_source = LocalSource::Git(GitSource {
+            url: "https://github.com/acme/dep.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            integrity: None,
+            subpath: None,
+        });
+
+        assert_eq!(
+            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &resolved_source)
+                .as_deref(),
+            Some("sha512-old")
+        );
+    }
+
+    #[test]
+    fn attach_integrity_to_git_source_fills_missing_git_integrity() {
+        let mut source = LocalSource::Git(GitSource {
+            url: "https://github.com/acme/dep.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            integrity: None,
+            subpath: None,
+        });
+
+        attach_integrity_to_git_source(&mut source, Some("sha512-old"));
+
+        let LocalSource::Git(git) = source else {
+            unreachable!();
+        };
+        assert_eq!(git.integrity.as_deref(), Some("sha512-old"));
     }
 }

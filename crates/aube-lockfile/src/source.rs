@@ -49,6 +49,7 @@ pub enum LocalSource {
 pub struct RemoteTarballSource {
     pub url: String,
     pub integrity: String,
+    pub git_hosted: bool,
 }
 
 /// A git dependency spec. See [`LocalSource::Git`].
@@ -67,6 +68,24 @@ pub struct GitSource {
     /// stable regardless of whether the user wrote `path:/x` or
     /// `path:x`.
     pub subpath: Option<String>,
+}
+
+pub fn git_commits_match(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    let left = left.trim();
+    let right = right.trim();
+    if left.len().min(right.len()) < 7
+        || !left.bytes().all(|b| b.is_ascii_hexdigit())
+        || !right.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    (left.len() == 40 && right.len() < 40 && left.starts_with(&right))
+        || (right.len() == 40 && left.len() < 40 && right.starts_with(&left))
 }
 
 impl LocalSource {
@@ -196,6 +215,7 @@ impl LocalSource {
             return Some(LocalSource::RemoteTarball(RemoteTarballSource {
                 url: spec.to_string(),
                 integrity: String::new(),
+                git_hosted: false,
             }));
         }
         let (kind, rest) = if let Some(r) = spec.strip_prefix("file:") {
@@ -635,6 +655,17 @@ mod tests {
         assert!(LocalSource::looks_like_remote_tarball_url(
             "https://codeload.github.com/user/repo/tar.gz/main"
         ));
+    }
+
+    #[test]
+    fn git_commits_match_only_allows_full_sha_prefix_pairs() {
+        let full = "abcdef0123456789abcdef0123456789abcdef01";
+        assert!(git_commits_match(full, "abcdef0"));
+        assert!(git_commits_match("abcdef0", full));
+        assert!(git_commits_match(full, full));
+        assert!(!git_commits_match("abcdef0", "abcdef012"));
+        assert!(!git_commits_match(full, "abcdef1"));
+        assert!(!git_commits_match("main", full));
     }
 
     #[test]

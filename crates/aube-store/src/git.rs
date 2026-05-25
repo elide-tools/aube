@@ -568,11 +568,50 @@ pub fn codeload_cache_lookup(
     target.is_dir().then_some((target, head_sha))
 }
 
+/// Return the SRI integrity sidecar for a cached codeload extract.
+///
+/// Fresh extracts write this next to the cache directory so resolver
+/// re-runs from a warm cache keep emitting the same lockfile integrity.
+pub fn codeload_cache_integrity(
+    url: &str,
+    commit: &str,
+    integrity: Option<&str>,
+) -> Option<String> {
+    let git_root = crate::dirs::cache_dir()
+        .map(|d| d.join("git"))
+        .unwrap_or_else(std::env::temp_dir);
+    let (target, _) = codeload_cache_paths(&git_root, url, commit, integrity)?;
+    target
+        .is_dir()
+        .then(|| read_codeload_integrity(&target))
+        .flatten()
+}
+
 /// Compute the deterministic `(target, head_sha)` pair for a
 /// `(url, commit)` cache lookup, without touching the FS. Returns
 /// `None` for any input shape that `extract_codeload_tarball` would
 /// reject with `Err`, so the lookup and write paths agree on which
 /// inputs even *can* have a cache entry.
+pub(crate) fn codeload_integrity_path(target: &Path) -> PathBuf {
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| format!("{s}.integrity"))
+        .unwrap_or_else(|| "aube-codeload.integrity".to_string());
+    target.with_file_name(file_name)
+}
+
+fn codeload_integrity(bytes: &[u8]) -> String {
+    crate::sha512_integrity(bytes)
+}
+
+pub(crate) fn read_codeload_integrity(target: &Path) -> Option<String> {
+    std::fs::read_to_string(codeload_integrity_path(target))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn codeload_cache_paths(
     cache_root: &Path,
     url: &str,
@@ -652,8 +691,14 @@ pub(crate) fn extract_codeload_tarball_at(
     // The atomic-rename pattern below makes a populated `target` always
     // a complete tree — no half-extracted state to worry about.
     if target.is_dir() {
+        if read_codeload_integrity(&target).is_none() {
+            let integrity = codeload_integrity(bytes);
+            let _ = std::fs::write(codeload_integrity_path(&target), &integrity);
+        }
         return Ok((target, head_sha));
     }
+
+    let integrity = codeload_integrity(bytes);
 
     // Extract into a scratch dir and atomic-rename into place. Same
     // failure-recovery and concurrent-install reasoning as
@@ -822,13 +867,19 @@ pub(crate) fn extract_codeload_tarball_at(
     }
 
     match aube_util::fs_atomic::rename_with_retry(&scratch, &target) {
-        Ok(()) => Ok((target, head_sha)),
+        Ok(()) => {
+            let _ = std::fs::write(codeload_integrity_path(&target), &integrity);
+            Ok((target, head_sha))
+        }
         Err(_) => {
             // Two concurrent extracts of the same (url, commit) — the
             // loser sees `target` already populated. Drop the loser's
             // scratch and reuse the winner's directory.
             if target.is_dir() {
                 let _ = std::fs::remove_dir_all(&scratch);
+                if read_codeload_integrity(&target).is_none() {
+                    let _ = std::fs::write(codeload_integrity_path(&target), &integrity);
+                }
                 return Ok((target, head_sha));
             }
             let _ = std::fs::remove_dir_all(&target);
@@ -836,6 +887,7 @@ pub(crate) fn extract_codeload_tarball_at(
                 let _ = std::fs::remove_dir_all(&scratch);
                 Error::Git(format!("rename codeload extract into place: {e}"))
             })?;
+            let _ = std::fs::write(codeload_integrity_path(&target), &integrity);
             Ok((target, head_sha))
         }
     }

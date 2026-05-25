@@ -220,6 +220,8 @@ pub(super) struct RawPeerDepMeta {
 #[derive(Debug, Deserialize)]
 pub(super) struct Resolution {
     pub(super) integrity: Option<String>,
+    #[serde(default, rename = "gitHosted")]
+    pub(super) git_hosted: bool,
     #[serde(default)]
     pub(super) directory: Option<String>,
     #[serde(default)]
@@ -276,6 +278,7 @@ pub(super) fn local_source_from_resolution(res: &Resolution) -> Option<LocalSour
             return Some(LocalSource::RemoteTarball(RemoteTarballSource {
                 url: tb.clone(),
                 integrity: res.integrity.clone().unwrap_or_default(),
+                git_hosted: res.git_hosted,
             }));
         }
         return None;

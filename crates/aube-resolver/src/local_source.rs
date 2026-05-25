@@ -328,7 +328,15 @@ pub(crate) async fn resolve_git_source(
     git: &aube_lockfile::GitSource,
     shallow: bool,
     client: Option<&RegistryClient>,
-) -> Result<(LocalSource, String, BTreeMap<String, String>), Error> {
+) -> Result<
+    (
+        LocalSource,
+        String,
+        BTreeMap<String, String>,
+        Option<String>,
+    ),
+    Error,
+> {
     let original_url = git.url.clone();
     let committish = git.committish.clone();
     let subpath = git.subpath.clone();
@@ -381,6 +389,11 @@ pub(crate) async fn resolve_git_source(
             git.integrity.as_deref(),
         )
     {
+        let integrity = aube_store::codeload_cache_integrity(
+            &original_url,
+            &resolved_sha,
+            git.integrity.as_deref(),
+        );
         let pkg_root = match &subpath {
             Some(sub) => clone_dir.join(sub),
             None => clone_dir.clone(),
@@ -408,6 +421,7 @@ pub(crate) async fn resolve_git_source(
             }),
             version,
             pj.dependencies,
+            integrity,
         ));
     }
 
@@ -467,6 +481,7 @@ pub(crate) async fn resolve_git_source(
                 .map_err(|e| {
                     Error::Registry(name.to_string(), format!("codeload extract panicked: {e}"))
                 })?;
+                let integrity = aube_store::sha512_integrity(&bytes);
                 match extracted {
                     Ok((resolved, version, deps)) => {
                         return Ok((
@@ -474,11 +489,12 @@ pub(crate) async fn resolve_git_source(
                                 url: original_url,
                                 committish,
                                 resolved,
-                                integrity: Some(integrity),
+                                integrity: Some(integrity.clone()),
                                 subpath,
                             }),
                             version,
                             deps,
+                            Some(integrity),
                         ));
                     }
                     Err(e) => {
@@ -552,7 +568,7 @@ pub(crate) async fn resolve_git_source(
     })
     .await
     .map_err(|e| Error::Registry(name.to_string(), format!("git task panicked: {e}")))??;
-    Ok((local, version, deps))
+    Ok((local, version, deps, None))
 }
 
 /// Fetch a remote tarball URL, compute its sha512 integrity, and read
@@ -576,13 +592,7 @@ pub(crate) async fn resolve_remote_tarball(
     let name_owned = name.to_string();
     let url = aube_util::url::redact_url(&tarball.url);
     let (integrity, version, deps) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
-        use sha2::{Digest, Sha512};
-        let mut hasher = Sha512::new();
-        hasher.update(&bytes);
-        let digest = hasher.finalize();
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
-        let integrity = format!("sha512-{b64}");
+        let integrity = aube_store::sha512_integrity(&bytes);
 
         // Walk the tarball once to pull out the top-level
         // `package.json` (wrapper name varies, so the helper looks
@@ -601,6 +611,7 @@ pub(crate) async fn resolve_remote_tarball(
         LocalSource::RemoteTarball(aube_lockfile::RemoteTarballSource {
             url: tarball.url.clone(),
             integrity,
+            git_hosted: tarball.git_hosted,
         }),
         version,
         deps,
