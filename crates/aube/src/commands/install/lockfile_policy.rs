@@ -57,13 +57,21 @@ pub(super) async fn verify_frozen_lockfile_policy(
             });
         }
         while let Some(result) = tasks.join_next().await {
-            let (_name, versions, fetched_times) = result.into_diagnostic()??;
+            let (name, versions, fetched_times) = result.into_diagnostic()??;
+            let mut unresolved_versions = Vec::new();
             for key in versions {
-                if let Some((_, version)) = key.rsplit_once('@')
-                    && let Some(published_at) = fetched_times.get(version)
-                {
-                    times.insert(key, published_at.clone());
+                if let Some((_, version)) = key.rsplit_once('@') {
+                    if let Some(published_at) = fetched_times.get(version) {
+                        times.insert(key, published_at.clone());
+                    } else {
+                        unresolved_versions.push(version.to_string());
+                    }
                 }
+            }
+            if !unresolved_versions.is_empty() {
+                unresolved_versions.sort();
+                unresolved_versions.dedup();
+                return Err(unverifiable_times_error(&name, &unresolved_versions));
             }
         }
     }
@@ -104,6 +112,21 @@ fn missing_times_error(name: &str, count: usize) -> miette::Report {
     )
 }
 
+fn unverifiable_times_error(name: &str, versions: &[String]) -> miette::Report {
+    let shown = versions.iter().take(12).cloned().collect::<Vec<_>>();
+    let mut detail = shown.join(", ");
+    if versions.len() > shown.len() {
+        detail.push_str(&format!(", ... and {} more", versions.len() - shown.len()));
+    }
+    miette!(
+        code = aube_codes::errors::ERR_AUBE_LOCKFILE_POLICY,
+        help = "check whether the configured registry publishes per-version time metadata, or set minimumReleaseAge=0 to disable this policy",
+        "cannot verify minimumReleaseAge for {name}: registry metadata has no publish time for version{} {}",
+        if versions.len() == 1 { "" } else { "s" },
+        detail,
+    )
+}
+
 fn missing_time_entries(
     graph: &LockfileGraph,
     mra: &MinimumReleaseAge,
@@ -114,12 +137,11 @@ fn missing_time_entries(
         if pkg.local_source.is_some() || is_excluded(mra, pkg.name.as_str(), pkg.registry_name()) {
             continue;
         }
-        let key = time_key(pkg.registry_name(), &pkg.version);
-        if !times.contains_key(&key) {
+        if locked_time(times, pkg.name.as_str(), pkg.registry_name(), &pkg.version).is_none() {
             missing
                 .entry(pkg.registry_name().to_string())
                 .or_default()
-                .insert(key);
+                .insert(time_key(pkg.name.as_str(), &pkg.version));
         }
     }
     missing
@@ -137,11 +159,13 @@ fn minimum_release_age_violations(
         if pkg.local_source.is_some() || is_excluded(mra, pkg.name.as_str(), pkg.registry_name()) {
             continue;
         }
-        let key = time_key(pkg.registry_name(), &pkg.version);
-        if !seen.insert(key.clone()) {
+        let dedupe_key = time_key(pkg.name.as_str(), &pkg.version);
+        if !seen.insert(dedupe_key) {
             continue;
         }
-        let Some(published_at) = times.get(&key) else {
+        let Some(published_at) =
+            locked_time(times, pkg.name.as_str(), pkg.registry_name(), &pkg.version)
+        else {
             continue;
         };
         if published_at.as_str() > cutoff {
@@ -153,6 +177,17 @@ fn minimum_release_age_violations(
         }
     }
     violations
+}
+
+fn locked_time<'a>(
+    times: &'a BTreeMap<String, String>,
+    display_name: &str,
+    registry_name: &str,
+    version: &str,
+) -> Option<&'a String> {
+    times
+        .get(&time_key(display_name, version))
+        .or_else(|| times.get(&time_key(registry_name, version)))
 }
 
 fn time_key(name: &str, version: &str) -> String {
@@ -209,5 +244,21 @@ mod tests {
         let violations =
             minimum_release_age_violations(&graph, &mra, "2026-05-25T17:04:21.482Z", &graph.times);
         assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn alias_uses_display_name_time_key() {
+        let mut graph = graph_with("demo-alias", "1.0.0", "2026-05-28T08:12:56.230Z");
+        graph.packages.get_mut("demo-alias@1.0.0").unwrap().alias_of = Some("demo".to_string());
+        let mra = MinimumReleaseAge {
+            minutes: 1,
+            exclude: BTreeSet::new().into_iter().collect(),
+            strict: false,
+        };
+        assert!(missing_time_entries(&graph, &mra, &graph.times).is_empty());
+        let violations =
+            minimum_release_age_violations(&graph, &mra, "2026-05-25T17:04:21.482Z", &graph.times);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].name, "demo");
     }
 }

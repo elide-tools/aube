@@ -573,7 +573,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             crate::dep_chain::set_active(&graph);
             aube_registry::slow_metadata::flush_summary();
 
-            if matches!(mode, FrozenMode::Frozen) {
+            if matches!(mode, FrozenMode::Frozen | FrozenMode::Prefer) {
                 lockfile_policy::verify_frozen_lockfile_policy(
                     &cwd,
                     &graph,
