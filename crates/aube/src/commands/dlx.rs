@@ -1,6 +1,10 @@
 use super::install::{FrozenMode, InstallOptions};
+use crate::commands::add::build_flags::parse_allow_build_value;
+use aube_manifest::AllowBuildRaw;
 use clap::{Args, CommandFactory};
 use miette::{Context, IntoDiagnostic, miette};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Args)]
 // dlx forwards everything after `<command>` to the bin it runs, including
@@ -37,6 +41,23 @@ pub struct DlxArgs {
     /// Overrides inferring from the command.
     #[arg(short = 'p', long = "package")]
     pub package: Vec<String>,
+    /// Allow named packages to run lifecycle scripts during the
+    /// transient install. Use `--allow-build=<pkg>`.
+    ///
+    /// Repeatable — pass once per package. The named package's
+    /// `preinstall` / `install` / `postinstall` scripts execute during
+    /// the transient install. Requires the equals form
+    /// (`--allow-build=<pkg>`); space-separated forms are rejected.
+    /// Mirrors pnpm's `pnpm dlx --allow-build=<pkg>` compatibility
+    /// surface while keeping dlx scripts skipped unless explicitly
+    /// approved.
+    #[arg(
+        long = "allow-build",
+        value_name = "PKG",
+        require_equals = true,
+        value_parser = parse_allow_build_value,
+    )]
+    pub allow_build: Vec<String>,
     #[command(flatten)]
     pub lockfile: crate::cli_args::LockfileArgs,
     #[command(flatten)]
@@ -65,6 +86,7 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
     let DlxArgs {
         params,
         package,
+        allow_build,
         shell_mode,
         lockfile: _,
         network: _,
@@ -144,26 +166,7 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
         .wrap_err("failed to create dlx scratch dir")?;
     let project_dir = tmp.path().to_path_buf();
 
-    // Minimal package.json. Version specs and dist-tags pass through as-is
-    // — the resolver handles them exactly as it would from a real manifest.
-    let mut deps: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    for spec in &install_specs {
-        let (mut name, value) = synthesize_dlx_dep(spec);
-        if deps.contains_key(&name) {
-            let mut suffix = 2usize;
-            while deps.contains_key(&format!("{name}-{suffix}")) {
-                suffix += 1;
-            }
-            name = format!("{name}-{suffix}");
-        }
-        deps.insert(name, serde_json::Value::String(value));
-    }
-    let manifest = serde_json::json!({
-        "name": "aube-dlx",
-        "version": "0.0.0",
-        "private": true,
-        "dependencies": deps,
-    });
+    let manifest = dlx_manifest(&install_specs, &allow_build);
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).into_diagnostic()?;
     aube_util::fs_atomic::atomic_write(&project_dir.join("package.json"), &manifest_bytes)
         .into_diagnostic()
@@ -181,7 +184,7 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
     // otherwise resolve to that workspace and install the wrong tree.
     let prev_cwd = {
         let _cwd_guard = CwdGuard::switch_to(&project_dir)?;
-        let mut opts = dlx_install_options();
+        let mut opts = dlx_install_options(&allow_build);
         opts.project_dir = Some(project_dir.clone());
         let install_result = super::install::run(opts).await;
         let prev = _cwd_guard.original.clone();
@@ -269,7 +272,48 @@ pub async fn run(args: DlxArgs) -> miette::Result<()> {
     Ok(())
 }
 
-fn dlx_install_options() -> InstallOptions {
+fn dlx_manifest(install_specs: &[String], allow_build: &[String]) -> serde_json::Value {
+    // Minimal package.json. Version specs and dist-tags pass through as-is
+    // — the resolver handles them exactly as it would from a real manifest.
+    let mut deps = serde_json::Map::new();
+    for spec in install_specs {
+        let (mut name, value) = synthesize_dlx_dep(spec);
+        if deps.contains_key(&name) {
+            let mut suffix = 2usize;
+            while deps.contains_key(&format!("{name}-{suffix}")) {
+                suffix += 1;
+            }
+            name = format!("{name}-{suffix}");
+        }
+        deps.insert(name, serde_json::Value::String(value));
+    }
+    let mut manifest = serde_json::Map::from_iter([
+        (
+            "name".to_string(),
+            serde_json::Value::String("aube-dlx".to_string()),
+        ),
+        (
+            "version".to_string(),
+            serde_json::Value::String("0.0.0".to_string()),
+        ),
+        ("private".to_string(), serde_json::Value::Bool(true)),
+        ("dependencies".to_string(), serde_json::Value::Object(deps)),
+    ]);
+    if !allow_build.is_empty() {
+        let allow_builds = serde_json::Map::from_iter(
+            allow_build
+                .iter()
+                .map(|name| (name.clone(), serde_json::Value::Bool(true))),
+        );
+        manifest.insert(
+            "pnpm".to_string(),
+            serde_json::json!({ "allowBuilds": allow_builds }),
+        );
+    }
+    serde_json::Value::Object(manifest)
+}
+
+fn dlx_install_options(allow_build: &[String]) -> InstallOptions {
     let mut opts = InstallOptions::with_mode(FrozenMode::No);
     // `dlx` executes bins from a throwaway project and deletes that project
     // immediately. Keeping package materialization inside the scratch tree is
@@ -284,16 +328,40 @@ fn dlx_install_options() -> InstallOptions {
             "false".to_string(),
         ));
     }
-    // Force ignore-scripts on transient dlx installs. User asked to
-    // run one bin. They did not ask postinstall scripts on fresh
-    // downloaded pkg to run. Without this, a user with
-    // `allowedBuildDependencies=["*"]` in ~/.npmrc (common for
-    // convenience) gets every dlx'd package running arbitrary
-    // postinstall code. That is how supply chain attacks land.
-    // pnpm dlx does the same, match it.
-    opts.cli_flags
-        .push(("ignore-scripts".to_string(), "true".to_string()));
+    if allow_build.is_empty() {
+        // Force ignore-scripts on transient dlx installs. User asked to
+        // run one bin. They did not ask postinstall scripts on fresh
+        // downloaded pkg to run. Without this, a user with
+        // `allowedBuildDependencies=["*"]` in ~/.npmrc (common for
+        // convenience) gets every dlx'd package running arbitrary
+        // postinstall code. That is how supply chain attacks land.
+        opts.ignore_scripts = true;
+        opts.cli_flags
+            .push(("ignore-scripts".to_string(), "true".to_string()));
+    } else {
+        // The isolated dlx allowlist should skip unapproved transitive
+        // builds, not fail the one-off command because the user's project
+        // has strictDepBuilds/paranoid enabled.
+        opts.cli_flags
+            .push(("strictDepBuilds".to_string(), "false".to_string()));
+        opts.cli_flags
+            .push(("paranoid".to_string(), "false".to_string()));
+        opts.build_policy_override = Some(Arc::new(dlx_build_policy(allow_build)));
+    }
     opts
+}
+
+fn dlx_build_policy(allow_build: &[String]) -> aube_scripts::BuildPolicy {
+    let allow_builds = BTreeMap::from_iter(
+        allow_build
+            .iter()
+            .map(|name| (name.clone(), AllowBuildRaw::Bool(true))),
+    );
+    let (policy, warnings) = aube_scripts::BuildPolicy::from_config(&allow_builds, &[], &[], false);
+    for warning in warnings {
+        crate::progress::safe_eprintln(&format!("warn: --allow-build: {warning}"));
+    }
+    policy
 }
 
 /// RAII guard that swaps the process cwd on construction and restores it
@@ -509,7 +577,7 @@ mod tests {
 
     #[test]
     fn dlx_install_disables_global_virtual_store() {
-        let opts = dlx_install_options();
+        let opts = dlx_install_options(&[]);
         let empty_workspace = std::collections::BTreeMap::new();
         let empty_env = Vec::new();
         let ctx = aube_settings::ResolveCtx {
@@ -525,6 +593,71 @@ mod tests {
             aube_settings::resolved::enable_global_virtual_store(&ctx),
             Some(false)
         );
+    }
+
+    #[test]
+    fn dlx_install_skips_scripts_by_default() {
+        let opts = dlx_install_options(&[]);
+        assert!(opts.ignore_scripts);
+        assert!(
+            opts.cli_flags
+                .iter()
+                .any(|(key, value)| { key == "ignore-scripts" && value == "true" })
+        );
+    }
+
+    #[test]
+    fn dlx_install_allows_scripts_when_builds_are_approved() {
+        let allow_build = vec!["esbuild".to_string()];
+        let opts = dlx_install_options(&allow_build);
+        assert!(!opts.ignore_scripts);
+        assert!(opts.build_policy_override.is_some());
+        assert!(
+            opts.cli_flags
+                .iter()
+                .any(|(key, value)| { key == "strictDepBuilds" && value == "false" })
+        );
+        assert!(
+            opts.cli_flags
+                .iter()
+                .any(|(key, value)| { key == "paranoid" && value == "false" })
+        );
+        assert!(
+            !opts
+                .cli_flags
+                .iter()
+                .any(|(key, _)| key == "ignore-scripts")
+        );
+    }
+
+    #[test]
+    fn dlx_build_policy_only_allows_explicit_approvals() {
+        let allow_build = vec!["esbuild".to_string()];
+        let policy = dlx_build_policy(&allow_build);
+        assert_eq!(
+            policy.decide("esbuild", "0.25.0"),
+            aube_scripts::AllowDecision::Allow
+        );
+        assert_eq!(
+            policy.decide("sharp", "0.33.0"),
+            aube_scripts::AllowDecision::Unspecified
+        );
+    }
+
+    #[test]
+    fn dlx_manifest_records_allow_build_approvals() {
+        let install_specs = vec!["vite".to_string()];
+        let allow_build = vec!["esbuild".to_string()];
+        let manifest = dlx_manifest(&install_specs, &allow_build);
+        assert_eq!(manifest["dependencies"]["vite"], "latest");
+        assert_eq!(manifest["pnpm"]["allowBuilds"]["esbuild"], true);
+    }
+
+    #[test]
+    fn dlx_manifest_omits_policy_when_no_builds_are_approved() {
+        let install_specs = vec!["vite".to_string()];
+        let manifest = dlx_manifest(&install_specs, &[]);
+        assert!(manifest.get("pnpm").is_none());
     }
 
     fn write_pkg_json(modules_dir: &std::path::Path, pkg_name: &str, pkg_json: serde_json::Value) {
