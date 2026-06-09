@@ -20,7 +20,11 @@ const versionsArg = args.get('versions') ?? '100'
 const versions = versionsArg === 'all' ? Infinity : Number(versionsArg)
 const out = resolve(args.get('out') ?? `crates/aube-resolver/data/primer-top${top}.json`)
 const namesFile = args.get('names')
-const namesUrl = args.get('names-url') ?? 'https://raw.githubusercontent.com/jdx/aube-primer-packages/main/data/packages.json'
+const namesUrl = args.get('names-url')
+const defaultNamesUrls = [
+  'https://raw.githubusercontent.com/jdx/aube-primer-packages/main/data/packages.json',
+  'https://raw.githubusercontent.com/endevco/aube-primer-packages/main/data/packages.json',
+]
 
 if (!Number.isInteger(top) || top < 1) throw new Error('--top must be a positive integer')
 if (versions !== Infinity && (!Number.isInteger(versions) || versions < 1)) {
@@ -29,7 +33,7 @@ if (versions !== Infinity && (!Number.isInteger(versions) || versions < 1)) {
 
 const names = namesFile
   ? parseNames(await readFile(namesFile, 'utf8'), namesFile)
-  : await fetchPopularNames(namesUrl)
+  : await fetchPopularNames(namesUrl ? [namesUrl] : defaultNamesUrls)
 if (!Array.isArray(names)) throw new Error('package-name source must be a JSON array')
 
 const primer = {}
@@ -200,10 +204,15 @@ function hasProvenance(attestations) {
   return typeof predicate === 'string' && /^https:\/\/slsa\.dev\/provenance\/v\d+$/.test(predicate)
 }
 
-async function fetchPopularNames(url) {
-  const { res, body } = await fetchBodyWithRetry(url, undefined, (res) => res.text())
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`)
-  return parseNames(body, url)
+async function fetchPopularNames(urls) {
+  const failures = []
+  for (const url of urls) {
+    const { res, body } = await fetchBodyWithRetry(url, undefined, (res) => res.text())
+    if (res.ok) return parseNames(body, url)
+    failures.push(`${url}: HTTP ${res.status}`)
+    if (urls.length > 1) console.error(`  package-name source unavailable: HTTP ${res.status}; trying next source`)
+  }
+  throw new Error(failures.join('; '))
 }
 
 // Wrap fetch and body reads to retry transient failures: socket resets /
