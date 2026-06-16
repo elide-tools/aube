@@ -594,17 +594,48 @@ snapshots:
 
     let graph = parse(&lockfile_path).unwrap();
     let url = "https://codeload.github.com/astro/node-expat/tar.gz/78e559baa908942097330f7967dfbf623ebc2529";
+    // Transitive remote-tarball deps are keyed under the canonical
+    // `name@url+<hash>` form — the same form `push_direct` uses for
+    // direct deps and a fresh resolve uses for all of them. The raw-URL
+    // key must NOT survive: the linker derives the parent's sibling
+    // symlink target via `shared_local_dep_path` (the canonical form),
+    // so a URL-keyed package would leave that symlink dangling
+    // (`Cannot find module 'node-expat'`).
+    let canonical =
+        crate::shared_local_dep_path("node-expat", url).expect("tarball url canonicalizes");
+    assert!(
+        canonical.starts_with("node-expat@url+"),
+        "unexpected canonical key: {canonical}"
+    );
+    assert!(
+        !graph.packages.contains_key(&format!("node-expat@{url}")),
+        "raw-URL key must be canonicalized away, got keys: {:?}",
+        graph.packages.keys().collect::<Vec<_>>()
+    );
     let pkg = graph
         .packages
-        .get(&format!("node-expat@{url}"))
-        .expect("transitive remote-tarball entry present");
+        .get(&canonical)
+        .expect("transitive remote-tarball entry present under canonical key");
     assert_eq!(pkg.name, "node-expat");
     // pnpm's `version:` field, not the URL.
     assert_eq!(pkg.version, "2.4.1");
-    // The URL drives the fetch path via `tarball_url`; dep-path
-    // still carries the URL so xml2json's snapshot reference
-    // resolves.
+    // The URL drives the fetch path via `tarball_url`.
     assert_eq!(pkg.tarball_url.as_deref(), Some(url));
+    // The parent records the dep by URL; that reference must canonicalize
+    // to the child's key so the sibling symlink resolves.
+    let parent = graph
+        .packages
+        .get("xml2json@0.12.0")
+        .expect("xml2json present");
+    let child_ref = parent
+        .dependencies
+        .get("node-expat")
+        .expect("node-expat dep recorded");
+    assert_eq!(
+        crate::shared_local_dep_path("node-expat", child_ref).as_deref(),
+        Some(canonical.as_str()),
+        "parent reference must canonicalize to the child's key"
+    );
 }
 
 #[test]
@@ -681,12 +712,382 @@ snapshots:
     // makes it all the way back onto `LockedPackage.tarball_url`.
     let reparsed = parse(&out_path).unwrap();
     let url = "https://codeload.github.com/astro/node-expat/tar.gz/78e559baa908942097330f7967dfbf623ebc2529";
+    // The written lockfile carries the URL key (pnpm parity, asserted
+    // above), but on re-parse it canonicalizes back to `name@url+<hash>`.
+    let canonical =
+        crate::shared_local_dep_path("node-expat", url).expect("tarball url canonicalizes");
     let pkg = reparsed
         .packages
-        .get(&format!("node-expat@{url}"))
-        .expect("URL-keyed entry survives round-trip");
+        .get(&canonical)
+        .expect("URL-keyed entry survives round-trip under canonical key");
     assert_eq!(pkg.version, "2.4.1");
     assert_eq!(pkg.tarball_url.as_deref(), Some(url));
+}
+
+/// Regression for the transitive remote-tarball "Cannot find module"
+/// crash. A *transitive* remote-tarball dep is recorded in the pnpm
+/// lockfile by its resolved URL — both as its own `packages:`/`snapshots:`
+/// key and inside its parent's `dependencies:` map. The linker derives
+/// each parent's sibling symlink target, and the graph hasher derives its
+/// child lookups, by canonicalizing that URL via `shared_local_dep_path`
+/// to the FS-safe `name@url+<hash>` form. The reader must therefore key
+/// the package under that same canonical form (mirroring `push_direct`
+/// and a fresh resolve). Before the fix it kept the raw URL key, so the
+/// package materialized at the escaped `https+++…` dir while every
+/// parent's symlink targeted `url+<hash>` — the link dangled and the
+/// child's content/engine taint never reached the parent's GVS hash.
+#[test]
+fn transitive_tarball_child_keyed_canonically_so_parent_symlink_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    let url =
+        "https://codeload.github.com/acme/tardep/tar.gz/9504d1f8f3293df7bfa4de72bd52df615f9f399c";
+    std::fs::write(
+        &lockfile_path,
+        format!(
+            r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      app:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+  app@1.0.0:
+    resolution: {{integrity: sha512-app==}}
+
+  tardep@{url}:
+    resolution: {{gitHosted: true, integrity: sha512-tardep==, tarball: {url}}}
+    version: 2.42.0
+
+snapshots:
+  app@1.0.0:
+    dependencies:
+      tardep: {url}
+
+  tardep@{url}: {{}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+
+    // 1. The transitive tarball is keyed under the canonical hashed form,
+    //    and the raw-URL key is gone.
+    let canonical = crate::shared_local_dep_path("tardep", url).expect("url canonicalizes");
+    assert!(canonical.starts_with("tardep@url+"), "got {canonical}");
+    assert!(
+        !graph.packages.contains_key(&format!("tardep@{url}")),
+        "raw-URL key leaked: {:?}",
+        graph.packages.keys().collect::<Vec<_>>()
+    );
+    assert!(graph.packages.contains_key(&canonical));
+
+    // 2. The structural invariant the linker + hasher rely on: every
+    //    child reference that canonicalizes resolves to a real package
+    //    key. Before the fix `app`'s `tardep: <url>` canonicalized to a
+    //    key that didn't exist, so the sibling symlink dangled.
+    for (key, pkg) in &graph.packages {
+        for (alias, tail) in &pkg.dependencies {
+            if let Some(child) = crate::shared_local_dep_path(alias, tail) {
+                assert!(
+                    graph.packages.contains_key(&child),
+                    "{key}'s dep {alias}@{tail} -> {child} is missing from the graph"
+                );
+            }
+        }
+    }
+
+    // 3. The hasher no longer skips the child: a change to the tarball's
+    //    content fingerprint must cascade into the parent's hash. Before
+    //    the fix the URL-keyed child was invisible to `app`'s deps-hash,
+    //    so its fingerprint never moved `app`'s GVS path.
+    let with_fp = crate::graph_hash::compute_graph_hashes_full(
+        &graph,
+        &|_| false,
+        None,
+        &|_, _| None,
+        &|dp| (dp == canonical.as_str()).then(|| "fp".to_string()),
+    );
+    let without_fp = crate::graph_hash::compute_graph_hashes_full(
+        &graph,
+        &|_| false,
+        None,
+        &|_, _| None,
+        &|_| None,
+    );
+    assert_ne!(
+        with_fp.node_hash["app@1.0.0"], without_fp.node_hash["app@1.0.0"],
+        "transitive tarball child fingerprint must cascade into the parent's graph hash"
+    );
+}
+
+/// Fresh-resolve companion to `url_dep_path_round_trips_with_pnpm_version_field`.
+///
+/// When the resolver promotes a hosted-git dep to a codeload tarball it
+/// stores the package under the *hashed* `name@url+<hash>` dep_path (not
+/// the bare URL), so the writer's `url_keyed` heuristic is false. pnpm
+/// still records these as `name@<codeload-url>` with a `version:` field
+/// and `resolution: {gitHosted: true, integrity, tarball}`. This drives
+/// a resolver-shaped graph through `write` and asserts that shape —
+/// without it a fresh `aube install` emits the `<url>.git#<sha>` /
+/// `type: git` form and drifts from pnpm.
+#[test]
+fn fresh_resolved_codeload_tarball_writes_pnpm_version_and_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let codeload = "https://codeload.github.com/xmppo/node-expat/tar.gz/78e559baa908942097330f7967dfbf623ebc2529".to_string();
+    let remote = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: codeload.clone(),
+        integrity: "sha512-nodeexpat==".to_string(),
+        git_hosted: true,
+    });
+    // The resolver keys the package by the hashed `name@url+<hash>` form.
+    let node_expat_dp = remote.dep_path("node-expat");
+    assert!(
+        node_expat_dp.starts_with("node-expat@url+"),
+        "sanity: resolver dep_path is the hashed url form, got {node_expat_dp}"
+    );
+    // The hashed tail is what the parent records as its dep value, and
+    // what must NOT leak into the written lockfile.
+    let node_expat_tail = node_expat_dp
+        .strip_prefix("node-expat@")
+        .unwrap()
+        .to_string();
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        node_expat_dp.clone(),
+        LockedPackage {
+            name: "node-expat".to_string(),
+            version: "2.4.3".to_string(),
+            dep_path: node_expat_dp.clone(),
+            local_source: Some(remote),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "xml2json@0.12.0".to_string(),
+        LockedPackage {
+            name: "xml2json".to_string(),
+            version: "0.12.0".to_string(),
+            integrity: Some("sha512-xml2json==".to_string()),
+            dep_path: "xml2json@0.12.0".to_string(),
+            dependencies: BTreeMap::from([("node-expat".to_string(), node_expat_tail.clone())]),
+            ..Default::default()
+        },
+    );
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "xml2json".to_string(),
+            dep_path: "xml2json@0.12.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^0.12.0".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let manifest = PackageJson {
+        name: Some("root".to_string()),
+        version: Some("0.0.0".to_string()),
+        dependencies: BTreeMap::from([("xml2json".to_string(), "^0.12.0".to_string())]),
+        ..PackageJson::default()
+    };
+
+    write(&lockfile_path, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    // Keyed by the bare codeload URL (pnpm parity), never the hashed
+    // form and never the `.git#<sha>` form.
+    assert!(
+        written.contains(&format!("node-expat@{codeload}:")),
+        "expected codeload-keyed entry, got:\n{written}"
+    );
+    assert!(
+        !written.contains(&node_expat_tail),
+        "internal hashed dep_path leaked into the lockfile:\n{written}"
+    );
+    assert!(
+        !written.contains(".git#"),
+        "git-url form must be promoted to codeload tarball:\n{written}"
+    );
+    // pnpm records the real semver next to the tarball resolution.
+    assert!(
+        written.contains("    version: 2.4.3"),
+        "missing `version:` on the codeload entry:\n{written}"
+    );
+    assert!(
+        written.contains(&format!(
+            "resolution: {{gitHosted: true, integrity: sha512-nodeexpat==, tarball: {codeload}}}"
+        )),
+        "missing/incorrect codeload resolution block:\n{written}"
+    );
+    // The parent references it by the bare codeload URL.
+    assert!(
+        written.contains(&format!("node-expat: {codeload}")),
+        "parent must reference the codeload URL:\n{written}"
+    );
+
+    // And it survives a re-parse onto `tarball_url` (drift-free). The
+    // written lockfile carries the codeload URL key (asserted above), but
+    // re-parse canonicalizes it back to the hashed `name@url+<hash>` form
+    // the resolver originally produced — so the round-trip graph matches a
+    // fresh resolve and the parent's sibling symlink resolves.
+    let reparsed = parse(&lockfile_path).unwrap();
+    let canonical =
+        crate::shared_local_dep_path("node-expat", &codeload).expect("codeload url canonicalizes");
+    assert_eq!(
+        canonical, node_expat_dp,
+        "re-parse must reproduce the resolver's hashed dep_path"
+    );
+    let pkg = reparsed
+        .packages
+        .get(&canonical)
+        .expect("codeload entry survives round-trip under canonical key");
+    assert_eq!(pkg.version, "2.4.3");
+    assert_eq!(pkg.tarball_url.as_deref(), Some(codeload.as_str()));
+}
+
+/// A git / remote-tarball dep that is *also* used as a peer must render
+/// its peer suffix as the resolved spec, never aube's internal FS-safe
+/// hashed dep_path. pnpm writes
+/// `request-promise-core@1.1.4(request@https://codeload.…/tar.gz/<sha>)`,
+/// not `(request@url+<hash>)` — the latter is only an in-memory key. The
+/// writer translates hashed→spec and the reader re-derives spec→hashed so
+/// a round-trip is a fixed point (a divergence would re-key every install
+/// and churn the lockfile).
+#[test]
+fn git_tarball_peer_suffix_renders_as_spec_and_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let codeload =
+        "https://codeload.github.com/owner/request/tar.gz/abcdef1234567890abcdef1234567890abcdef12"
+            .to_string();
+    let remote = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: codeload.clone(),
+        integrity: "sha512-request==".to_string(),
+        git_hosted: true,
+    });
+    // Resolver-internal keys: the tarball is hashed, registry packages that
+    // peer with it carry the hashed suffix.
+    let request_dp = remote.dep_path("request");
+    let request_tail = request_dp.strip_prefix("request@").unwrap().to_string();
+    assert!(
+        request_tail.starts_with("url+"),
+        "sanity: hashed tarball tail, got {request_tail}"
+    );
+    let core_key = format!("request-promise-core@1.1.4({request_dp})");
+    let rp_key = format!("request-promise@4.2.6({request_dp})");
+
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        request_dp.clone(),
+        LockedPackage {
+            name: "request".to_string(),
+            version: "2.88.2".to_string(),
+            dep_path: request_dp.clone(),
+            local_source: Some(remote),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        core_key.clone(),
+        LockedPackage {
+            name: "request-promise-core".to_string(),
+            version: "1.1.4".to_string(),
+            integrity: Some("sha512-core==".to_string()),
+            dep_path: core_key.clone(),
+            peer_dependencies: BTreeMap::from([("request".to_string(), "^2.34".to_string())]),
+            dependencies: BTreeMap::from([("request".to_string(), request_tail.clone())]),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        rp_key.clone(),
+        LockedPackage {
+            name: "request-promise".to_string(),
+            version: "4.2.6".to_string(),
+            integrity: Some("sha512-rp==".to_string()),
+            dep_path: rp_key.clone(),
+            peer_dependencies: BTreeMap::from([("request".to_string(), "^2.34".to_string())]),
+            dependencies: BTreeMap::from([
+                ("request".to_string(), request_tail.clone()),
+                // pnpm references the peer-bearing sibling by its
+                // contextualized (hashed, in-memory) tail.
+                (
+                    "request-promise-core".to_string(),
+                    format!("1.1.4({request_dp})"),
+                ),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let graph = LockfileGraph {
+        packages,
+        ..Default::default()
+    };
+    let manifest = PackageJson {
+        name: Some("root".to_string()),
+        version: Some("0.0.0".to_string()),
+        ..PackageJson::default()
+    };
+
+    write(&lockfile_path, &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&lockfile_path).unwrap();
+
+    // Snapshot keys + embedded dep values render the suffix as the spec.
+    assert!(
+        written.contains(&format!("request-promise-core@1.1.4(request@{codeload}):")),
+        "core snapshot key suffix not rendered as spec:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("request-promise@4.2.6(request@{codeload}):")),
+        "request-promise snapshot key suffix not rendered as spec:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("request-promise-core: 1.1.4(request@{codeload})")),
+        "embedded dep-value suffix not rendered as spec:\n{written}"
+    );
+    // The internal hashed form must never leak into the file.
+    assert!(
+        !written.contains(&request_tail),
+        "internal hashed dep_path leaked into the lockfile:\n{written}"
+    );
+
+    // Reader re-derives the hashed suffix: keys match a fresh resolve, so a
+    // re-install reads its own (or pnpm's) lockfile as a fixed point.
+    let reparsed = parse(&lockfile_path).unwrap();
+    assert!(
+        reparsed.packages.contains_key(&core_key),
+        "reader must normalize the spec suffix back to the hashed key; got keys: {:?}",
+        reparsed.packages.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        reparsed.packages.contains_key(&rp_key),
+        "reader must normalize request-promise's hashed key"
+    );
+    let rp = reparsed.packages.get(&rp_key).unwrap();
+    assert_eq!(
+        rp.dependencies
+            .get("request-promise-core")
+            .map(String::as_str),
+        Some(format!("1.1.4({request_dp})").as_str()),
+        "reader must normalize the embedded dep-value suffix: {:?}",
+        rp.dependencies
+    );
 }
 
 #[test]

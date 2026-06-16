@@ -1,5 +1,6 @@
 use super::dep_path::{
-    parse_dep_path, peerless_alias_target, rewrite_snapshot_alias_deps, version_to_dep_path,
+    parse_dep_path, peerless_alias_target, rewrite_peer_suffix, rewrite_snapshot_alias_deps,
+    version_to_dep_path,
 };
 use super::raw::{
     RawBinSpec, RawDepSpec, RawRuntimeVariant, local_source_from_resolution, parse_raw_lockfile,
@@ -726,6 +727,79 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
 
     for (k, v) in local_packages {
         packages.insert(k, v);
+    }
+
+    // Normalize git / remote-tarball references so a lockfile round-trip
+    // produces the same graph a fresh resolve does. pnpm (and aube's own
+    // writer) record these deps by their resolved URL, but aube's linker
+    // and graph hasher look them up under the FS-safe hashed form
+    // (`request@url+<hash>` / `request@git+<hash>`) — the same form
+    // `push_direct` already uses for *direct* git/tarball deps. Two
+    // independent rewrites are needed, and both run whenever a git/tarball
+    // dep is present (not only when a peer suffix exists):
+    //
+    //   1. Package keys. A *transitive* git/tarball package keyed by URL
+    //      (`<pkg>@https://codeload.…/<sha>`) has its own virtual-store
+    //      dir materialized at the escaped `https+++…` name, while every
+    //      parent's sibling symlink (and the hasher's child lookup, via
+    //      `shared_local_dep_path`) targets the `url+<hash>` name. The
+    //      symlink then dangles — Node throws `Cannot find module '<dep>'`
+    //      — and the child's content/engine taint never reaches the
+    //      parent's GVS hash. Re-key the head to the canonical hashed form.
+    //   2. Peer suffixes. `request-promise-core@1.1.4(request@https://…/<sha>)`
+    //      → `…(request@url+<hash>)`, the inverse of the writer's
+    //      hashed→spec pass. Without it a registry package that peers with
+    //      a git/tarball dep would re-key on the next install, busting the
+    //      warm path (and emitting a churned lockfile).
+    let spec_peer_to_hashed = |head: &str| -> Option<String> {
+        let (name, value) = parse_dep_path(head)?;
+        crate::shared_local_dep_path(&name, &value)
+    };
+    // Canonicalize a git/remote-tarball package's own `name@<url>` head to
+    // the hashed form, preserving any peer suffix verbatim (URLs aube keys
+    // never contain `(`, so the first `(` always starts the suffix).
+    let canonical_local_head = |key: &str, pkg: &LockedPackage| -> Option<String> {
+        let local @ (LocalSource::Git(_) | LocalSource::RemoteTarball(_)) =
+            pkg.local_source.as_ref()?
+        else {
+            return None;
+        };
+        let suffix = key.find('(').map_or("", |i| &key[i..]);
+        let new_key = format!("{}{suffix}", local.dep_path(&pkg.name));
+        (new_key != key).then_some(new_key)
+    };
+    let has_local_source = packages.values().any(|p| {
+        matches!(
+            p.local_source,
+            Some(LocalSource::Git(_) | LocalSource::RemoteTarball(_))
+        )
+    });
+    if has_local_source {
+        let rekeyed: BTreeMap<String, LockedPackage> = std::mem::take(&mut packages)
+            .into_iter()
+            .map(|(key, mut pkg)| {
+                let head = canonical_local_head(&key, &pkg).unwrap_or(key);
+                let new_key = rewrite_peer_suffix(&head, &spec_peer_to_hashed);
+                pkg.dep_path = new_key.clone();
+                pkg.dependencies = pkg
+                    .dependencies
+                    .into_iter()
+                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .collect();
+                pkg.optional_dependencies = pkg
+                    .optional_dependencies
+                    .into_iter()
+                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .collect();
+                (new_key, pkg)
+            })
+            .collect();
+        packages = rekeyed;
+        for deps in importers.values_mut() {
+            for dep in deps {
+                dep.dep_path = rewrite_peer_suffix(&dep.dep_path, &spec_peer_to_hashed);
+            }
+        }
     }
 
     let settings = raw

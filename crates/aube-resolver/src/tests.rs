@@ -3761,6 +3761,181 @@ fn peer_suffix_propagation_dedupes_nested_self_segments() {
     );
 }
 
+// A peer suffix must stop at the package that *supplies* the peer.
+// Real-world chain: `xml2json -> node-expat -> node-gyp -> tinyglobby ->
+// fdir`, where `fdir` declares an OPTIONAL `picomatch` peer and
+// `tinyglobby` lists `picomatch` in its own `dependencies`. pnpm tags
+// only `fdir@6.5.0(picomatch@4.0.4)`; every ancestor — including the
+// supplier `tinyglobby` — stays bare. The
+// `propagate_peer_suffixes_to_ancestors` post-pass used to leak
+// `(picomatch@4.0.4)` all the way up to `xml2json@0.12.0`; suppressing a
+// peer that the absorbing package supplies itself restores pnpm parity.
+#[test]
+fn peer_suffix_stops_at_supplier_of_the_peer() {
+    let xml2json = mk_locked("xml2json", "0.12.0", &[("node-expat", "2.4.3")], &[]);
+    let node_expat = mk_locked("node-expat", "2.4.3", &[("node-gyp", "12.3.0")], &[]);
+    let node_gyp = mk_locked("node-gyp", "12.3.0", &[("tinyglobby", "0.2.17")], &[]);
+    // tinyglobby supplies `picomatch` (resolving fdir's optional peer).
+    let tinyglobby = mk_locked(
+        "tinyglobby",
+        "0.2.17",
+        &[("fdir", "6.5.0"), ("picomatch", "4.0.4")],
+        &[],
+    );
+    // fdir only *declares* the optional peer — it doesn't supply it.
+    let mut fdir = mk_locked("fdir", "6.5.0", &[], &[("picomatch", "^3 || ^4")]);
+    fdir.peer_dependencies_meta.insert(
+        "picomatch".to_string(),
+        aube_lockfile::PeerDepMeta { optional: true },
+    );
+    let picomatch = mk_locked("picomatch", "4.0.4", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [xml2json, node_expat, node_gyp, tinyglobby, fdir, picomatch] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "xml2json".to_string(),
+            dep_path: "xml2json@0.12.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^0.12.0".to_string()),
+        }],
+    );
+
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default())
+        .expect("test graph should converge");
+
+    let keys: Vec<&String> = out.packages.keys().collect();
+    // Only fdir — the peer *declarer* — carries the suffix.
+    assert!(
+        out.packages.contains_key("fdir@6.5.0(picomatch@4.0.4)"),
+        "fdir keeps its own optional-peer suffix; got {keys:?}"
+    );
+    // The supplier and every ancestor above it stay bare (pnpm parity).
+    for bare in [
+        "tinyglobby@0.2.17",
+        "node-gyp@12.3.0",
+        "node-expat@2.4.3",
+        "xml2json@0.12.0",
+    ] {
+        assert!(
+            out.packages.contains_key(bare),
+            "{bare} must stay bare; got {keys:?}"
+        );
+    }
+    assert!(
+        !out.packages
+            .contains_key("tinyglobby@0.2.17(picomatch@4.0.4)"),
+        "tinyglobby supplies picomatch, so the suffix must stop there; got {keys:?}"
+    );
+    assert!(
+        !out.packages
+            .contains_key("xml2json@0.12.0(picomatch@4.0.4)"),
+        "xml2json must not inherit a transitive optional peer; got {keys:?}"
+    );
+}
+
+// A META-ONLY optional peer (declared in `peerDependenciesMeta` but absent
+// from `peerDependencies`, exactly how `follow-redirects` declares `debug`)
+// must NOT be eagerly bound from a distant ancestor's *regular* dependency.
+// pnpm treats such a peer as resolvable but then collapses the binding back
+// out via `dedupe-peer-dependents` whenever a peer-free path exists, so the
+// realistic lockfile keeps the whole chain bare:
+//   provider        (carries debug@3.2.7 as a plain dep)
+//     mid_a          (bare)
+//       mid_b        (bare)
+//         mid_c      (bare)
+//           axios    (bare)
+//             fr     (bare — follow-redirects; debug stays a transitive peer)
+// Binding `(debug@3.2.7)` onto that chain (as a since-reverted experiment did)
+// produced suffixed variants that aube's dedupe pass — which only collapses
+// *declared*-peer variants — never merged. The same subtree then hashed
+// differently per install scope (whole-workspace vs single-member), splitting
+// a shared global-virtual-store singleton in two and surfacing at runtime as a
+// duplicate-instance "Cannot find module". This test pins the bare shape so
+// the over-binding can't regress.
+#[test]
+fn meta_only_optional_peer_stays_bare_to_keep_singleton_shared() {
+    // provider carries debug as a plain (regular) dependency.
+    let provider = mk_locked(
+        "provider",
+        "1.0.0",
+        &[("mid_a", "1.0.0"), ("debug", "3.2.7")],
+        &[],
+    );
+    let mid_a = mk_locked("mid_a", "1.0.0", &[("mid_b", "1.0.0")], &[]);
+    let mid_b = mk_locked("mid_b", "1.0.0", &[("mid_c", "1.0.0")], &[]);
+    let mid_c = mk_locked("mid_c", "1.0.0", &[("axios", "1.0.0")], &[]);
+    let axios = mk_locked("axios", "1.0.0", &[("fr", "1.0.0")], &[]);
+    // fr = follow-redirects: debug ONLY in meta (optional), NOT in peer_deps.
+    let mut fr = mk_locked("fr", "1.0.0", &[], &[]);
+    fr.peer_dependencies_meta.insert(
+        "debug".to_string(),
+        aube_lockfile::PeerDepMeta { optional: true },
+    );
+    let debug = mk_locked("debug", "3.2.7", &[], &[]);
+
+    let mut packages = BTreeMap::new();
+    for p in [provider, mid_a, mid_b, mid_c, axios, fr, debug] {
+        packages.insert(p.dep_path.clone(), p);
+    }
+    let mut importers = BTreeMap::new();
+    importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "provider".to_string(),
+            dep_path: "provider@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("^1".to_string()),
+        }],
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let out = apply_peer_contexts(graph, &PeerContextOptions::default()).expect("should converge");
+    let mut keys: Vec<&String> = out.packages.keys().collect();
+    keys.sort();
+    // Expected: the meta-only optional `debug` peer is NOT folded into any
+    // dep_path, so every node on the chain has a single bare instance and the
+    // subtree hashes identically regardless of install scope.
+    for bare in [
+        "provider@1.0.0",
+        "mid_a@1.0.0",
+        "mid_b@1.0.0",
+        "mid_c@1.0.0",
+        "axios@1.0.0",
+        "fr@1.0.0",
+    ] {
+        assert!(
+            out.packages.contains_key(bare),
+            "{bare} must exist as the single bare instance; got {keys:#?}"
+        );
+    }
+    for suffixed in [
+        "fr@1.0.0(debug@3.2.7)",
+        "axios@1.0.0(debug@3.2.7)",
+        "mid_c@1.0.0(debug@3.2.7)",
+        "mid_b@1.0.0(debug@3.2.7)",
+        "mid_a@1.0.0(debug@3.2.7)",
+    ] {
+        assert!(
+            !out.packages.contains_key(suffixed),
+            "{suffixed} must NOT be created from a meta-only optional peer; got {keys:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // direct_dep_info
 // ---------------------------------------------------------------------------
