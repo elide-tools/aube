@@ -34,9 +34,17 @@ fn main() {
     // shims rewrite their argv to `run`/`dlx`, so a `usage` token there is
     // never a top-level command.
     if is_usage_invocation() {
-        let mut cmd = aube::command();
-        clap_usage::generate(&mut cmd, embedder.name, &mut std::io::stdout());
-        return;
+        #[cfg(feature = "standalone-usage")]
+        {
+            let mut cmd = aube::command();
+            clap_usage::generate(&mut cmd, embedder.name, &mut std::io::stdout());
+            return;
+        }
+        #[cfg(not(feature = "standalone-usage"))]
+        {
+            eprintln!("`aube usage` was built without the standalone-usage feature");
+            std::process::exit(2);
+        }
     }
 
     // The binary owns the single `std::process::exit`: `cli_main` returns the
