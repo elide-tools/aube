@@ -58,11 +58,11 @@ pub(crate) use settings::{ResolverConfigInputs, configure_resolver, finalize_loc
 pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
 
 use settings::{
-    check_unmet_peers, default_streaming_network_concurrency, maybe_cleanup_unused_catalogs,
-    resolve_git_shallow_hosts, resolve_link_concurrency, resolve_network_concurrency,
-    resolve_side_effects_cache, resolve_side_effects_cache_readonly,
-    resolve_strict_peer_dependencies, resolve_strict_store_pkg_content_check,
-    resolve_verify_store_integrity,
+    check_unmet_peers, default_lockfile_network_concurrency, default_streaming_network_concurrency,
+    maybe_cleanup_unused_catalogs, resolve_dependency_policy, resolve_git_shallow_hosts,
+    resolve_link_concurrency, resolve_network_concurrency, resolve_side_effects_cache,
+    resolve_side_effects_cache_readonly, resolve_strict_peer_dependencies,
+    resolve_strict_store_pkg_content_check, resolve_verify_store_integrity,
 };
 use startup::{
     apply_force_state_reset, merge_branch_lockfiles_if_needed, modules_cache_sweep_is_default,
@@ -153,6 +153,107 @@ impl InstallPhaseTimings {
             Err(e) => tracing::debug!("failed to write install phase timings: {e}"),
         }
     }
+}
+
+async fn validate_lockfile_trust_policy(
+    cwd: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    network_mode: aube_registry::NetworkMode,
+    policy: &aube_resolver::DependencyPolicy,
+) -> miette::Result<()> {
+    if policy.trust_policy != aube_resolver::TrustPolicy::NoDowngrade
+        || matches!(network_mode, aube_registry::NetworkMode::Offline)
+    {
+        return Ok(());
+    }
+
+    let client = std::sync::Arc::new(make_client(cwd).with_network_mode(network_mode));
+    let full_cache_dir = super::packument_full_cache_dir();
+    let concurrency = default_lockfile_network_concurrency().max(1);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut checks: tokio::task::JoinSet<Result<(), aube_resolver::Error>> =
+        tokio::task::JoinSet::new();
+
+    for dep_path in reachable_package_dep_paths(graph) {
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        if pkg.local_source.is_some() {
+            continue;
+        }
+        let name = pkg.registry_name().to_string();
+        let version = pkg.version.clone();
+        if !seen.insert((name.clone(), version.clone())) {
+            continue;
+        }
+
+        let client = client.clone();
+        let full_cache_dir = full_cache_dir.clone();
+        let exclude = policy.trust_policy_exclude.clone();
+        let ignore_after = policy.trust_policy_ignore_after;
+        let semaphore = semaphore.clone();
+        checks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.map_err(|e| {
+                aube_resolver::Error::Registry(name.clone(), format!("trust check cancelled: {e}"))
+            })?;
+            let packument = client
+                .fetch_packument_with_time_cached(&name, &full_cache_dir)
+                .await
+                .map_err(|e| aube_resolver::Error::Registry(name.clone(), e.to_string()))?;
+            let picked = packument.versions.get(&version).ok_or_else(|| {
+                aube_resolver::Error::Registry(
+                    name.clone(),
+                    format!("registry packument has no metadata for {name}@{version}"),
+                )
+            })?;
+            aube_resolver::check_no_downgrade(&packument, &version, picked, &exclude, ignore_after)
+                .map_err(|e| match e {
+                    aube_resolver::TrustCheckError::Downgrade(d) => {
+                        aube_resolver::Error::TrustDowngrade(Box::new(d))
+                    }
+                    aube_resolver::TrustCheckError::MissingTime(d) => {
+                        aube_resolver::Error::TrustCheckMissingTime(Box::new(d))
+                    }
+                })
+        });
+    }
+
+    while let Some(result) = checks.join_next().await {
+        let result = result.map_err(|e| miette!("trust-policy validation task failed: {e}"))?;
+        result.map_err(miette::Report::new)?;
+    }
+
+    Ok(())
+}
+
+fn reachable_package_dep_paths(
+    graph: &aube_lockfile::LockfileGraph,
+) -> std::collections::BTreeSet<String> {
+    let mut reachable = std::collections::BTreeSet::new();
+    let mut stack = graph
+        .importers
+        .values()
+        .flat_map(|deps| deps.iter().map(|dep| dep.dep_path.clone()))
+        .collect::<Vec<_>>();
+
+    while let Some(dep_path) = stack.pop() {
+        if !reachable.insert(dep_path.clone()) {
+            continue;
+        }
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        for (name, tail) in &pkg.dependencies {
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            {
+                stack.push(child);
+            }
+        }
+    }
+
+    reachable
 }
 
 pub async fn run(opts: InstallOptions) -> miette::Result<()> {
@@ -590,6 +691,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             if !shared_workspace_lockfile && has_workspace {
                 merge_member_lockfile_graphs(&cwd, &mut graph, &manifests);
             }
+            let dependency_policy = resolve_dependency_policy(&manifest, &settings_ctx);
             let graph = resolve::apply_lockfile_graph_platform_rules(
                 graph,
                 kind,
@@ -597,6 +699,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 &ws_config_shared,
                 &settings_ctx,
             )?;
+            validate_lockfile_trust_policy(&cwd, &graph, opts.network_mode, &dependency_policy)
+                .await?;
             let source_label = resolve::lockfile_source_label(kind);
             tracing::debug!(
                 "{source_label}: {} packages for {project_name}",
