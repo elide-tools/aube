@@ -5,7 +5,7 @@
 //! 1.5 JSON or SPDX 2.3 JSON. Pure read; does not touch `node_modules/` or
 //! take the project lock.
 
-use aube_lockfile::{LockedPackage, LockfileGraph};
+use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph};
 use clap::Args;
 use miette::{Context, IntoDiagnostic};
 use std::collections::BTreeMap;
@@ -56,7 +56,10 @@ pub async fn run(args: SbomArgs) -> miette::Result<()> {
     let closure = super::collect_dep_closure(&graph, filter, false);
 
     let json = match args.format {
-        SbomFormat::Cyclonedx => render_cyclonedx(&manifest, &closure)?,
+        SbomFormat::Cyclonedx => {
+            let dev_only = collect_dev_only_packages(&graph, graph.importers.values().flatten());
+            render_cyclonedx(&manifest, &closure, &dev_only)?
+        }
         SbomFormat::Spdx => render_spdx(&manifest, &graph, filter, &closure)?,
     };
 
@@ -68,6 +71,7 @@ pub async fn run(args: SbomArgs) -> miette::Result<()> {
 fn render_cyclonedx(
     manifest: &aube_manifest::PackageJson,
     closure: &BTreeMap<String, &LockedPackage>,
+    dev_only: &BTreeMap<String, bool>,
 ) -> miette::Result<String> {
     let root_name = manifest.name.clone().unwrap_or_else(|| "(unnamed)".into());
     let root_version = manifest.version.clone().unwrap_or_default();
@@ -81,6 +85,16 @@ fn render_cyclonedx(
         c.insert("name".into(), pkg.name.clone().into());
         c.insert("version".into(), pkg.version.clone().into());
         c.insert("purl".into(), purl(&pkg.name, &pkg.version).into());
+        if dev_only.get(dep_path).copied().unwrap_or(false) {
+            c.insert("scope".into(), "excluded".into());
+            c.insert(
+                "properties".into(),
+                serde_json::json!([{
+                    "name": "cdx:npm:package:development",
+                    "value": "true",
+                }]),
+            );
+        }
         components.push(serde_json::Value::Object(c));
     }
 
@@ -122,6 +136,36 @@ fn render_cyclonedx(
     serde_json::to_string_pretty(&bom)
         .into_diagnostic()
         .wrap_err("failed to serialize CycloneDX SBOM")
+}
+
+fn collect_dev_only_packages<'a>(
+    graph: &LockfileGraph,
+    roots: impl IntoIterator<Item = &'a DirectDep>,
+) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
+    let mut stack: Vec<(String, bool)> = roots
+        .into_iter()
+        .map(|d| (d.dep_path.clone(), matches!(d.dep_type, DepType::Dev)))
+        .collect();
+
+    while let Some((dep_path, dev_only)) = stack.pop() {
+        match out.get(&dep_path).copied() {
+            Some(false) => continue,
+            Some(true) if dev_only => continue,
+            _ => {
+                out.insert(dep_path.clone(), dev_only);
+            }
+        }
+
+        let Some(pkg) = graph.get_package(&dep_path) else {
+            continue;
+        };
+        for (name, version) in &pkg.dependencies {
+            stack.push((format!("{name}@{version}"), dev_only));
+        }
+    }
+
+    out
 }
 
 /// SPDX 2.3 JSON. See https://spdx.github.io/spdx-spec/v2.3/.
@@ -341,6 +385,94 @@ mod tests {
     #[test]
     fn sanitize_spdx_id_strips_unsafe() {
         assert_eq!(sanitize_spdx_id("@babel/core@7.0.0"), "-babel-core-7.0.0");
+    }
+
+    #[test]
+    fn collect_dev_only_packages_handles_cycles_and_runtime_downgrade() {
+        let mut graph = LockfileGraph::default();
+        graph.packages.insert(
+            "a@1.0.0".into(),
+            LockedPackage {
+                name: "a".into(),
+                version: "1.0.0".into(),
+                dep_path: "a@1.0.0".into(),
+                dependencies: BTreeMap::from([("b".into(), "1.0.0".into())]),
+                ..Default::default()
+            },
+        );
+        graph.packages.insert(
+            "b@1.0.0".into(),
+            LockedPackage {
+                name: "b".into(),
+                version: "1.0.0".into(),
+                dep_path: "b@1.0.0".into(),
+                dependencies: BTreeMap::from([("a".into(), "1.0.0".into())]),
+                ..Default::default()
+            },
+        );
+
+        let roots = vec![DirectDep {
+            name: "a".into(),
+            dep_path: "a@1.0.0".into(),
+            dep_type: DepType::Dev,
+            specifier: None,
+        }];
+        let dev_only = collect_dev_only_packages(&graph, &roots);
+        assert_eq!(dev_only.get("a@1.0.0"), Some(&true));
+        assert_eq!(dev_only.get("b@1.0.0"), Some(&true));
+
+        let roots = vec![
+            DirectDep {
+                name: "a".into(),
+                dep_path: "a@1.0.0".into(),
+                dep_type: DepType::Dev,
+                specifier: None,
+            },
+            DirectDep {
+                name: "b".into(),
+                dep_path: "b@1.0.0".into(),
+                dep_type: DepType::Production,
+                specifier: None,
+            },
+        ];
+        let runtime = collect_dev_only_packages(&graph, &roots);
+        assert_eq!(runtime.get("a@1.0.0"), Some(&false));
+        assert_eq!(runtime.get("b@1.0.0"), Some(&false));
+    }
+
+    #[test]
+    fn collect_dev_only_packages_uses_all_workspace_importers() {
+        let mut graph = LockfileGraph::default();
+        graph.packages.insert(
+            "shared@1.0.0".into(),
+            LockedPackage {
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                dep_path: "shared@1.0.0".into(),
+                ..Default::default()
+            },
+        );
+        graph.importers.insert(
+            ".".into(),
+            vec![DirectDep {
+                name: "shared".into(),
+                dep_path: "shared@1.0.0".into(),
+                dep_type: DepType::Dev,
+                specifier: None,
+            }],
+        );
+        graph.importers.insert(
+            "packages/app".into(),
+            vec![DirectDep {
+                name: "shared".into(),
+                dep_path: "shared@1.0.0".into(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+
+        let dev_only = collect_dev_only_packages(&graph, graph.importers.values().flatten());
+        assert_eq!(dev_only.get("shared@1.0.0"), Some(&false));
     }
 
     #[test]
