@@ -307,17 +307,14 @@ pub fn write(
         // Preserve optional-platform packages' filter metadata so
         // bun's platform-aware resolution still has what it needs
         // on the next install.
-        if !pkg.os.is_empty() {
-            let arr: Vec<Value> = pkg.os.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("os".to_string(), Value::Array(arr));
+        if let Some(v) = platform_list_value(&pkg.os) {
+            meta.insert("os".to_string(), v);
         }
-        if !pkg.cpu.is_empty() {
-            let arr: Vec<Value> = pkg.cpu.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("cpu".to_string(), Value::Array(arr));
+        if let Some(v) = platform_list_value(&pkg.cpu) {
+            meta.insert("cpu".to_string(), v);
         }
-        if !pkg.libc.is_empty() {
-            let arr: Vec<Value> = pkg.libc.iter().map(|s| Value::String(s.clone())).collect();
-            meta.insert("libc".to_string(), Value::Array(arr));
+        if let Some(v) = platform_list_value(&pkg.libc) {
+            meta.insert("libc".to_string(), v);
         }
         // Extras: anything bun wrote on the meta block that we don't
         // model on `LockedPackage` (e.g. `deprecated`,
@@ -662,6 +659,21 @@ fn format_bun_lockfile(
     out.push_str("  }\n");
     out.push_str("}\n");
     out
+}
+
+/// Collapse a platform filter list (`os`/`cpu`/`libc`) to the shape
+/// bun itself writes: `None` when empty, a bare string for exactly
+/// one entry, an array for more than one.
+fn platform_list_value(list: &crate::PlatformList) -> Option<serde_json::Value> {
+    match list.len() {
+        0 => None,
+        1 => Some(serde_json::Value::String(list[0].clone())),
+        _ => Some(serde_json::Value::Array(
+            list.iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )),
+    }
 }
 
 /// Serialize a JSON value inline in bun's spaced style — objects as
