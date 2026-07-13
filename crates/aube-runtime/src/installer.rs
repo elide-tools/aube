@@ -204,6 +204,11 @@ fn verify_runnable(node_bin: &Path) -> Result<(), Error> {
     };
     let output = std::process::Command::new(node_bin)
         .arg("--version")
+        // A NODE_OPTIONS the invoking shell/CI happens to export (e.g. an
+        // unrecognized flag, --require of a project-local module) can make
+        // node refuse to start even though the binary itself is fine; strip
+        // it so the probe reflects runnability, not the caller's env.
+        .env_remove("NODE_OPTIONS")
         .output()
         .map_err(|e| not_runnable(e.to_string()))?;
     if output.status.success() {
@@ -317,6 +322,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let node = fake_node(tmp.path(), "#!/bin/sh\necho v25.2.0\n");
         assert!(verify_runnable(&node).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_runnable_ignores_ambient_node_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Mimics real node's behavior of rejecting an unrecognized flag in
+        // NODE_OPTIONS (`node: --bogus-flag is not allowed in NODE_OPTIONS`,
+        // exit 9) so this test reproduces the failure mode against a probe
+        // that doesn't sanitize its environment.
+        let node = fake_node(
+            tmp.path(),
+            "#!/bin/sh\nif [ -n \"$NODE_OPTIONS\" ]; then echo \"node: $NODE_OPTIONS is not allowed in NODE_OPTIONS\" >&2; exit 9; fi\necho v25.2.0\n",
+        );
+        assert!(
+            verify_runnable(&node).is_ok(),
+            "an ambient NODE_OPTIONS (inherited from the invoking shell/CI \
+             environment) must not fail the runnability probe of an \
+             otherwise-working node"
+        );
     }
 
     #[cfg(unix)]
