@@ -141,12 +141,7 @@ async fn download_verify_extract(
     let staged_node = crate::discover::node_paths_in(&staging).1;
     let verify_result = tokio::task::spawn_blocking(move || verify_runnable(&staged_node))
         .await
-        .map_err(|e| {
-            Error::io(
-                "verify installed node",
-                std::io::Error::other(e.to_string()),
-            )
-        })?;
+        .map_err(|e| Error::io("verify installed node", std::io::Error::other(e)))?;
     if let Err(e) = verify_result {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
