@@ -182,7 +182,9 @@ impl CallbackReporter {
 
 impl InstallReporter for CallbackReporter {
     fn report(&self, event: InstallEvent) {
-        self.report_payload(&EventPayload::from(event));
+        if let Some(payload) = EventPayload::from_event(event) {
+            self.report_payload(&payload);
+        }
     }
 }
 
@@ -210,9 +212,12 @@ enum EventPayload {
     },
 }
 
-impl From<InstallEvent> for EventPayload {
-    fn from(event: InstallEvent) -> Self {
-        match event {
+impl EventPayload {
+    /// `None` for events this payload schema does not model; per-task events
+    /// are additive detail and are dropped rather than widening the wire
+    /// shape.
+    fn from_event(event: InstallEvent) -> Option<Self> {
+        Some(match event {
             InstallEvent::Phase(phase) => Self::Phase {
                 phase: match phase {
                     InstallPhase::Resolving => "resolving",
@@ -242,7 +247,8 @@ impl From<InstallEvent> for EventPayload {
                 code,
                 message,
             },
-        }
+            InstallEvent::TaskStarted { .. } | InstallEvent::TaskFinished { .. } => return None,
+        })
     }
 }
 

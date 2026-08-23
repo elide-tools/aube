@@ -31,6 +31,7 @@ pub(crate) use render::format_bytes;
 
 use crate::commands::install::{
     InstallEvent, InstallOutputMode, InstallPhase, InstallProgressSnapshot, InstallReporter,
+    InstallTaskUnit,
 };
 use ci::{CiState, format_duration};
 use clx::progress::{
@@ -49,6 +50,8 @@ use std::time::{Duration, Instant};
 /// bounded on installs that fan out hundreds of tarball fetches at
 /// once.
 const TTY_MAX_VISIBLE_FETCH_ROWS: usize = 5;
+/// Task id of the events-mode root every per-fetch task parents to.
+const EVENT_ROOT_TASK: u64 = 1;
 
 /// Fixed denominator clx's `{{progress_bar}}` is held at in TTY mode.
 /// We don't drive clx's progress_current/progress_total with raw
@@ -225,6 +228,10 @@ struct EventState {
     downloaded: AtomicUsize,
     downloaded_bytes: AtomicU64,
     estimated_bytes: AtomicU64,
+    /// Id of the root task every per-fetch task hangs off.
+    root_task: u64,
+    /// Monotonic id source for per-fetch tasks; starts past `root_task`.
+    next_task: AtomicU64,
 }
 
 impl EventState {
@@ -236,6 +243,10 @@ impl EventState {
             4 => Some(InstallPhase::Complete),
             _ => None,
         }
+    }
+
+    fn next_task_id(&self) -> u64 {
+        self.next_task.fetch_add(1, Ordering::Relaxed)
     }
 
     fn report_progress(&self) {
@@ -283,17 +294,26 @@ impl InstallProgress {
         match control.output_mode() {
             InstallOutputMode::Events => {
                 let reporter = control.reporter()?;
+                let state = Arc::new(EventState {
+                    reporter,
+                    phase: AtomicUsize::new(0),
+                    resolved: AtomicUsize::new(0),
+                    total: AtomicUsize::new(0),
+                    reused: AtomicUsize::new(0),
+                    downloaded: AtomicUsize::new(0),
+                    downloaded_bytes: AtomicU64::new(0),
+                    estimated_bytes: AtomicU64::new(0),
+                    root_task: EVENT_ROOT_TASK,
+                    next_task: AtomicU64::new(EVENT_ROOT_TASK + 1),
+                });
+                state.reporter.report(InstallEvent::TaskStarted {
+                    id: state.root_task,
+                    parent: None,
+                    label: "packages".to_string(),
+                    unit: InstallTaskUnit::Count,
+                });
                 return Some(Self {
-                    mode: Mode::Events(Arc::new(EventState {
-                        reporter,
-                        phase: AtomicUsize::new(0),
-                        resolved: AtomicUsize::new(0),
-                        total: AtomicUsize::new(0),
-                        reused: AtomicUsize::new(0),
-                        downloaded: AtomicUsize::new(0),
-                        downloaded_bytes: AtomicU64::new(0),
-                        estimated_bytes: AtomicU64::new(0),
-                    })),
+                    mode: Mode::Events(state),
                     unpacked_sizes: Arc::new(Mutex::new(HashMap::new())),
                 });
             }
@@ -972,10 +992,22 @@ impl InstallProgress {
                 inner: FetchRowInner::Ci(Arc::downgrade(s)),
                 completed: false,
             },
-            Mode::Events(s) => FetchRow {
-                inner: FetchRowInner::Events(Arc::downgrade(s)),
-                completed: false,
-            },
+            Mode::Events(s) => {
+                let id = s.next_task_id();
+                s.reporter.report(InstallEvent::TaskStarted {
+                    id,
+                    parent: Some(s.root_task),
+                    label: format!("{name}@{version}"),
+                    unit: InstallTaskUnit::Bytes,
+                });
+                FetchRow {
+                    inner: FetchRowInner::Events {
+                        state: Arc::downgrade(s),
+                        id,
+                    },
+                    completed: false,
+                }
+            }
         }
     }
 
@@ -1033,6 +1065,10 @@ impl InstallProgress {
                     s.reporter
                         .report(InstallEvent::Phase(InstallPhase::Complete));
                     s.report_progress();
+                    s.reporter.report(InstallEvent::TaskFinished {
+                        id: s.root_task,
+                        success: true,
+                    });
                 }
             }
         }
@@ -1234,7 +1270,10 @@ enum FetchRowInner {
     /// rows shouldn't prevent `CiState` from being dropped after the
     /// last `InstallProgress` clone is gone.
     Ci(Weak<CiState>),
-    Events(Weak<EventState>),
+    Events {
+        state: Weak<EventState>,
+        id: u64,
+    },
 }
 
 impl FetchRow {
@@ -1319,9 +1358,13 @@ impl FetchRow {
                     s.downloaded.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            FetchRowInner::Events(weak) => {
-                if let Some(s) = weak.upgrade() {
+            FetchRowInner::Events { state, id } => {
+                if let Some(s) = state.upgrade() {
                     s.downloaded.fetch_add(1, Ordering::Relaxed);
+                    s.reporter.report(InstallEvent::TaskFinished {
+                        id: *id,
+                        success: true,
+                    });
                     s.report_progress();
                 }
             }
@@ -1524,6 +1567,69 @@ mod tests {
                     && snapshot.downloaded == 1
                     && snapshot.downloaded_bytes == 512
         )));
+    }
+
+    #[tokio::test]
+    async fn event_mode_reports_per_fetch_tasks() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let control = crate::commands::install::InstallControl::events(reporter.clone());
+
+        crate::commands::install::control::scope(control, async {
+            let progress = InstallProgress::try_new().unwrap();
+            progress.set_phase("fetching");
+            drop(progress.start_fetch("left-pad", "1.3.0"));
+            drop(progress.start_fetch("is-odd", "3.0.1"));
+            progress.finish(true, TtyFinishBehavior::Preserve);
+        })
+        .await;
+
+        let events = reporter.0.lock().unwrap();
+
+        // Root task is announced before any fetch and parents them all.
+        let root = events
+            .iter()
+            .find_map(|event| match event {
+                InstallEvent::TaskStarted {
+                    id,
+                    parent: None,
+                    unit: InstallTaskUnit::Count,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .expect("root task");
+
+        let fetches: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                InstallEvent::TaskStarted {
+                    id,
+                    parent: Some(parent),
+                    label,
+                    unit: InstallTaskUnit::Bytes,
+                } if *parent == root => Some((*id, label.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fetches.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(),
+            vec!["left-pad@1.3.0", "is-odd@3.0.1"]
+        );
+        // Distinct ids, none colliding with the root.
+        assert_ne!(fetches[0].0, fetches[1].0);
+        assert!(fetches.iter().all(|(id, _)| *id != root));
+
+        // Every task opened is closed, root included.
+        for (id, _) in &fetches {
+            assert!(events.contains(&InstallEvent::TaskFinished {
+                id: *id,
+                success: true
+            }));
+        }
+        assert!(events.contains(&InstallEvent::TaskFinished {
+            id: root,
+            success: true
+        }));
     }
 
     #[test]

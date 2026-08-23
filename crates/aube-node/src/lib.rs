@@ -207,11 +207,10 @@ impl InstallReporter for NodeReporter {
             stats.reused = progress.reused as u64;
             stats.downloaded = progress.downloaded as u64;
         }
-        if let Some(callback) = &self.callback {
-            let _ = callback.call(
-                InstallEventPayload::from(event),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+        if let (Some(callback), Some(payload)) =
+            (&self.callback, InstallEventPayload::from_event(event))
+        {
+            let _ = callback.call(payload, ThreadsafeFunctionCallMode::NonBlocking);
         }
     }
 }
@@ -481,9 +480,12 @@ fn into_napi_error(env: &Env, failure: InstallFailure) -> NodeError {
     }
 }
 
-impl From<InstallEvent> for InstallEventPayload {
-    fn from(event: InstallEvent) -> Self {
-        match event {
+impl InstallEventPayload {
+    /// `None` for events this payload schema does not model; per-task events
+    /// are additive detail and are dropped rather than widening the N-API
+    /// object shape.
+    fn from_event(event: InstallEvent) -> Option<Self> {
+        Some(match event {
             InstallEvent::Phase(phase) => Self {
                 kind: "phase".to_string(),
                 phase: Some(phase_name(phase).to_string()),
@@ -528,7 +530,8 @@ impl From<InstallEvent> for InstallEventPayload {
                 downloaded_bytes: None,
                 estimated_bytes: None,
             },
-        }
+            InstallEvent::TaskStarted { .. } | InstallEvent::TaskFinished { .. } => return None,
+        })
     }
 }
 

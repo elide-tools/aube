@@ -24,6 +24,17 @@ pub enum InstallPhase {
     Complete,
 }
 
+/// Unit a task's position and total are measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallTaskUnit {
+    /// Byte counts (a tarball fetch).
+    Bytes,
+    /// A countable quantity of items (packages).
+    Count,
+    /// Unitless; the task is a labelled activity, not a measured one.
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOutputLevel {
     Info,
@@ -53,6 +64,20 @@ pub enum InstallEvent {
         level: InstallOutputLevel,
         code: Option<String>,
         message: String,
+    },
+    /// A named unit of work began. `parent` is `None` for a root task and
+    /// `Some(id)` for a child of an earlier `TaskStarted`. Ids are unique
+    /// for the lifetime of one install.
+    TaskStarted {
+        id: u64,
+        parent: Option<u64>,
+        label: String,
+        unit: InstallTaskUnit,
+    },
+    /// A task previously announced by `TaskStarted` ended.
+    TaskFinished {
+        id: u64,
+        success: bool,
     },
 }
 
