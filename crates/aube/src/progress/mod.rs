@@ -1495,6 +1495,9 @@ pub struct PausingWriterGuard {
 }
 
 #[cfg(feature = "install-tracing-subscriber")]
+use std::io::Write;
+
+#[cfg(feature = "install-tracing-subscriber")]
 impl Write for PausingWriterGuard {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
