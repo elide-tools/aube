@@ -59,6 +59,19 @@ pub async fn run(args: RuntimeArgs) -> miette::Result<()> {
 }
 
 async fn run_set(args: RuntimeSetArgs) -> miette::Result<()> {
+    // The only path that still provisions Node.js after
+    // `Embedder::runtime_switching = false` makes the resolver inert: an
+    // explicit `runtime set` would otherwise download a Node the host itself
+    // is supposed to own (and, for a host that *is* the Node runtime, does not
+    // want on disk at all).
+    if !aube_util::embedder().runtime_switching {
+        return Err(miette!(
+            code = aube_codes::errors::ERR_AUBE_RUNTIME_SWITCHING_DISABLED,
+            "{} does not provision Node.js runtimes — install `{}` through the host instead",
+            aube_util::prog(),
+            args.version,
+        ));
+    }
     if args.name != "node" {
         return Err(miette!(
             "{} only manages the `node` runtime (got `{}`); deno/bun pins are not supported",

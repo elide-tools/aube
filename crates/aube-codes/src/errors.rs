@@ -117,6 +117,7 @@ pub const ERR_AUBE_RUNTIME_EXTRACT_FAILED: &str = "ERR_AUBE_RUNTIME_EXTRACT_FAIL
 #[rustfmt::skip] pub const ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM: &str = "ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM";
 pub const ERR_AUBE_RUNTIME_IO: &str = "ERR_AUBE_RUNTIME_IO";
 pub const ERR_AUBE_RUNTIME_NOT_RUNNABLE: &str = "ERR_AUBE_RUNTIME_NOT_RUNNABLE";
+#[rustfmt::skip] pub const ERR_AUBE_RUNTIME_SWITCHING_DISABLED: &str = "ERR_AUBE_RUNTIME_SWITCHING_DISABLED";
 #[rustfmt::skip] pub const ERR_AUBE_SELF_UPDATE_UNSUPPORTED_PLATFORM: &str = "ERR_AUBE_SELF_UPDATE_UNSUPPORTED_PLATFORM";
 
 // ── misc / safety ──────────────────────────────────────────────────
@@ -648,6 +649,12 @@ pub const ALL: &[CodeMeta] = &[
         name: ERR_AUBE_RUNTIME_IO,
         category: category::ENGINE_CLI,
         description: "A filesystem operation in the runtime store failed (lock acquisition, staging, or publishing an install). Not a download failure — the message names the failing path.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_SWITCHING_DISABLED,
+        category: category::ENGINE_CLI,
+        description: "The embedding host owns Node.js provisioning (`Embedder::runtime_switching = false`), so aube refused to download, build, or install a Node.js version. Install the runtime through the host instead.",
         exit_code: None,
     },
     CodeMeta {

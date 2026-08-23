@@ -487,6 +487,12 @@
       "exit_code": null
     },
     {
+      "name": "ERR_AUBE_RUNTIME_SWITCHING_DISABLED",
+      "category": "Engine / CLI",
+      "description": "The embedding host owns Node.js provisioning (`Embedder::runtime_switching = false`), so aube refused to download, build, or install a Node.js version. Install the runtime through the host instead.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_RUNTIME_NOT_RUNNABLE",
       "category": "Engine / CLI",
       "description": "A downloaded Node.js binary extracted cleanly but failed a post-install `node --version` check, so the install was discarded instead of published. Typically missing shared libraries — musl builds require the host's libstdc++/libgcc (e.g. `apk add libstdc++`).",
