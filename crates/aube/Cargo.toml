@@ -79,12 +79,14 @@ sigstore-oidc = { workspace = true, optional = true }
 sigstore-types = { workspace = true, optional = true }
 ambient-id = { workspace = true, optional = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-# zlib-ng re-enabled at the binary level only: feature unification makes the
-# C backend win for the whole aube build (same perf as before), while library
-# crates stay on the pure-Rust backend so embedders don't inherit a cmake
-# build dependency. See the workspace flate2 entry.
-flate2 = { workspace = true, features = ["zlib-ng"] }
+tracing-subscriber = { workspace = true, optional = true }
+# zlib-ng behind the `zlib-ng` feature (on by default) rather than a bare
+# feature add: Cargo features are additive per *crate*, not per target, so a
+# `features = ["zlib-ng"]` here reaches every consumer of the aube library too
+# — a host that links its own zlib-rs/zlib-ng then gets duplicate `zng_*` /
+# `alloc_deflate` symbols at static link. Standalone aube keeps the C backend
+# via the default feature set. See the workspace flate2 entry.
+flate2 = { workspace = true }
 glob = { workspace = true }
 ignore = { workspace = true }
 node-semver = { workspace = true }
@@ -110,6 +112,8 @@ default = [
     "rustls",
     "hickory-dns",
     "workspace-yaml-preserve",
+    "zlib-ng",
+    "tracing-subscriber",
 ]
 # Include the interactive `aube config tui` browser. Builds that want the
 # smallest dependency graph can disable default features and omit this.
@@ -135,6 +139,15 @@ hickory-dns = ["reqwest/hickory-dns", "aube-registry/hickory-dns"]
 # Preserve comments and formatting when commands mutate existing workspace
 # YAML. Embedders can omit this to avoid yamlpatch's tree-sitter dependencies.
 workspace-yaml-preserve = ["aube-manifest/workspace-yaml-preserve"]
+# The C zlib-ng backend for flate2. Default for the aube binary; opt-in for
+# embedders, because feature unification makes it win for every consumer of
+# this crate — including a host that already links its own zlib, which then
+# hits duplicate-symbol errors at static link.
+zlib-ng = ["flate2/zlib-ng"]
+# Install a global `tracing` subscriber. Default for the standalone binary;
+# embedders leave it off so the host owns the single process-wide subscriber
+# and does not pay for tracing-subscriber's env-filter/json stack.
+tracing-subscriber = ["dep:tracing-subscriber"]
 
 [dev-dependencies]
 assert_cmd = "2"

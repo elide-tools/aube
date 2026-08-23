@@ -1385,9 +1385,11 @@ pub fn safe_eprintln(msg: &str) {
     }
 }
 
+#[cfg(feature = "tracing-subscriber")]
 #[derive(Clone, Copy, Default)]
 pub struct PausingWriter;
 
+#[cfg(feature = "tracing-subscriber")]
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PausingWriter {
     type Writer = PausingWriterGuard;
 
@@ -1399,10 +1401,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PausingWriter {
 /// Per-event writer guard returned by [`PausingWriter::make_writer`].
 /// Accumulates into `buf` and flushes once on drop. See `PausingWriter`
 /// for the full pause/write/resume protocol.
+#[cfg(feature = "tracing-subscriber")]
 pub struct PausingWriterGuard {
     buf: Vec<u8>,
 }
 
+#[cfg(feature = "tracing-subscriber")]
 impl Write for PausingWriterGuard {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
@@ -1414,6 +1418,7 @@ impl Write for PausingWriterGuard {
     }
 }
 
+#[cfg(feature = "tracing-subscriber")]
 impl Drop for PausingWriterGuard {
     fn drop(&mut self) {
         if self.buf.is_empty() {

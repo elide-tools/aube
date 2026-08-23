@@ -45,6 +45,7 @@ pub const PNPMFILE_CJS_NAME: &str = ".pnpmfile.cjs";
 /// fall back to a friendly `[pnpmfile] message` on stderr.
 static NDJSON_REPORTER: AtomicBool = AtomicBool::new(false);
 
+#[cfg_attr(not(feature = "tracing-subscriber"), allow(dead_code))]
 pub fn set_ndjson_reporter(on: bool) {
     NDJSON_REPORTER.store(on, Ordering::Relaxed);
 }

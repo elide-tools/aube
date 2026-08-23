@@ -1,6 +1,7 @@
 use super::{Cli, Commands, LogLevel, ReporterType};
 use miette::{Context, IntoDiagnostic, miette};
 use std::path::PathBuf;
+#[cfg(feature = "tracing-subscriber")]
 use tracing_subscriber::prelude::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -272,6 +273,28 @@ pub(crate) fn diag_config_from_flag(cli: &Cli) -> Option<Option<aube_util::diag:
 }
 
 pub(crate) fn init_logging(cli: &Cli, effective_level: LogLevel) {
+    install_tracing_subscriber(cli, effective_level);
+
+    let force_text = matches!(
+        effective_level,
+        LogLevel::Trace | LogLevel::Debug | LogLevel::Silent
+    ) || matches!(
+        cli.reporter,
+        Some(ReporterType::AppendOnly) | Some(ReporterType::Ndjson)
+    );
+    if force_text {
+        clx::progress::set_output(clx::progress::ProgressOutput::Text);
+    }
+}
+
+/// The standalone binary's global `tracing` subscriber. Compiled out for
+/// embedders (`--no-default-features`), which own the single process-wide
+/// subscriber themselves.
+#[cfg(not(feature = "tracing-subscriber"))]
+fn install_tracing_subscriber(_cli: &Cli, _effective_level: LogLevel) {}
+
+#[cfg(feature = "tracing-subscriber")]
+fn install_tracing_subscriber(cli: &Cli, effective_level: LogLevel) {
     let log_level = effective_level.filter();
     let env_filter = tracing_subscriber::EnvFilter::try_from_env("AUBE_LOG").unwrap_or_else(|_| {
         format!(
@@ -285,39 +308,30 @@ pub(crate) fn init_logging(cli: &Cli, effective_level: LogLevel) {
 
     let drop_timestamp = !matches!(effective_level, LogLevel::Debug | LogLevel::Trace);
     let registry = tracing_subscriber::registry().with(env_filter);
+    // `try_init`, not `init`: an embedding host may already own the global
+    // subscriber, and a duplicate registration must not abort the process.
     if matches!(cli.reporter, Some(ReporterType::Ndjson)) {
         crate::pnpmfile::set_ndjson_reporter(true);
-        registry
+        let _ = registry
             .with(
                 tracing_subscriber::fmt::layer()
                     .json()
                     .flatten_event(true)
                     .with_writer(crate::progress::PausingWriter),
             )
-            .init();
+            .try_init();
     } else if drop_timestamp {
-        registry
+        let _ = registry
             .with(
                 tracing_subscriber::fmt::layer()
                     .without_time()
                     .with_writer(crate::progress::PausingWriter),
             )
-            .init();
+            .try_init();
     } else {
-        registry
+        let _ = registry
             .with(tracing_subscriber::fmt::layer().with_writer(crate::progress::PausingWriter))
-            .init();
-    }
-
-    let force_text = matches!(
-        effective_level,
-        LogLevel::Trace | LogLevel::Debug | LogLevel::Silent
-    ) || matches!(
-        cli.reporter,
-        Some(ReporterType::AppendOnly) | Some(ReporterType::Ndjson)
-    );
-    if force_text {
-        clx::progress::set_output(clx::progress::ProgressOutput::Text);
+            .try_init();
     }
 }
 
