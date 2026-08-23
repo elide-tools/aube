@@ -116,6 +116,7 @@ pub const ERR_AUBE_RUNTIME_EXTRACT_FAILED: &str = "ERR_AUBE_RUNTIME_EXTRACT_FAIL
 #[rustfmt::skip] pub const ERR_AUBE_RUNTIME_MISE_INSTALL_FAILED: &str = "ERR_AUBE_RUNTIME_MISE_INSTALL_FAILED";
 #[rustfmt::skip] pub const ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM: &str = "ERR_AUBE_RUNTIME_UNSUPPORTED_PLATFORM";
 pub const ERR_AUBE_RUNTIME_IO: &str = "ERR_AUBE_RUNTIME_IO";
+pub const ERR_AUBE_RUNTIME_NOT_RUNNABLE: &str = "ERR_AUBE_RUNTIME_NOT_RUNNABLE";
 #[rustfmt::skip] pub const ERR_AUBE_SELF_UPDATE_UNSUPPORTED_PLATFORM: &str = "ERR_AUBE_SELF_UPDATE_UNSUPPORTED_PLATFORM";
 
 // ── misc / safety ──────────────────────────────────────────────────
@@ -647,6 +648,12 @@ pub const ALL: &[CodeMeta] = &[
         name: ERR_AUBE_RUNTIME_IO,
         category: category::ENGINE_CLI,
         description: "A filesystem operation in the runtime store failed (lock acquisition, staging, or publishing an install). Not a download failure — the message names the failing path.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: ERR_AUBE_RUNTIME_NOT_RUNNABLE,
+        category: category::ENGINE_CLI,
+        description: "A downloaded Node.js binary extracted cleanly but failed a post-install `node --version` check, so the install was discarded instead of published. Typically missing shared libraries — musl builds require the host's libstdc++/libgcc (e.g. `apk add libstdc++`).",
         exit_code: None,
     },
     CodeMeta {
