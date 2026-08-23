@@ -118,7 +118,17 @@ impl std::fmt::Debug for InstallControl {
 }
 
 impl Default for InstallControl {
+    /// The process-wide fallback registered by
+    /// [`set_default_install_control`], else a fresh human-output control.
     fn default() -> Self {
+        default_control()
+    }
+}
+
+impl InstallControl {
+    /// A fresh control that renders aube's own CLI output, ignoring any
+    /// process-wide registration.
+    pub fn human() -> Self {
         Self {
             output: InstallOutputMode::Human,
             reporter: None,
@@ -126,9 +136,7 @@ impl Default for InstallControl {
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
-}
 
-impl InstallControl {
     pub fn events(reporter: Arc<dyn InstallReporter>) -> Self {
         Self {
             output: InstallOutputMode::Events,
@@ -141,7 +149,7 @@ impl InstallControl {
     pub fn silent() -> Self {
         Self {
             output: InstallOutputMode::Silent,
-            ..Self::default()
+            ..Self::human()
         }
     }
 
@@ -263,12 +271,33 @@ tokio::task_local! {
     static ACTIVE: InstallControl;
 }
 
+/// Process-wide fallback control, for a host that drives aube through
+/// [`crate::cli_main`] rather than the [`crate::embed`] facade: `cli_main`
+/// builds `InstallOptions` from parsed argv, so there is no per-call seam to
+/// hand an [`InstallControl`] through. Set-once / first-wins, like the other
+/// process-global embedder registrations.
+static DEFAULT: std::sync::OnceLock<InstallControl> = std::sync::OnceLock::new();
+
+/// Register the process-wide fallback [`InstallControl`].
+///
+/// Every install that does not carry its own control — which is every install
+/// the CLI dispatches — then reports through it. Call before `cli_main`.
+pub fn set_default_install_control(control: InstallControl) {
+    let _ = DEFAULT.set(control);
+}
+
+fn default_control() -> InstallControl {
+    DEFAULT.get().cloned().unwrap_or_else(InstallControl::human)
+}
+
 pub(crate) async fn scope<F: Future>(control: InstallControl, future: F) -> F::Output {
     ACTIVE.scope(control, future).await
 }
 
 pub(crate) fn current() -> InstallControl {
-    ACTIVE.try_with(Clone::clone).unwrap_or_default()
+    ACTIVE
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| default_control())
 }
 
 pub(crate) fn check_cancelled() -> miette::Result<()> {
@@ -277,6 +306,17 @@ pub(crate) fn check_cancelled() -> miette::Result<()> {
 
 pub(crate) fn output(level: InstallOutputLevel, code: Option<&str>, message: impl Into<String>) {
     current().output(level, code, message);
+}
+
+/// Hand a rendered top-level diagnostic to `control`'s reporter. Used by
+/// `cli_main` so an embedded host in events mode sees the failure on its own
+/// output surface instead of on the process's stderr.
+pub(crate) fn report_error(control: &InstallControl, code: Option<String>, message: String) {
+    control.report(InstallEvent::Output {
+        level: InstallOutputLevel::Error,
+        code,
+        message,
+    });
 }
 
 pub(crate) fn complete(total: usize) {

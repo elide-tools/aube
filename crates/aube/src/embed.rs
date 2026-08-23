@@ -13,7 +13,7 @@ pub use crate::commands::install::{
     DepSelection, EmbedderInstallOverrides, FrozenMode, INSTALL_OUTPUT_CODE_LIFECYCLE_SCRIPT,
     InstallControl, InstallEvent, InstallOutputLevel, InstallOutputMode, InstallPhase,
     InstallProgressSnapshot, InstallPrompt, InstallPromptFuture, InstallPromptHandler,
-    InstallReporter,
+    InstallReporter, set_default_install_control,
 };
 pub use crate::runtime::{EmbedderRuntime, set_embedder_runtime};
 pub use aube_manifest::{Error as ManifestError, PackageJson, Workspaces};

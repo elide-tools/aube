@@ -277,6 +277,31 @@ fn is_allow_build_compat_error(error: &usage_rs::Error<'_, '_>) -> bool {
     )
 }
 
+/// Restores the process cwd (and aube's own cached cwd) when an invocation
+/// that chdir'd finishes. `cli_main` is a process entry point for standalone
+/// aube, but an embedding host calls it repeatedly in one process: a `-C dir`
+/// or `--workspace-root` run would otherwise leave the host's cwd moved.
+struct CwdRestoreGuard {
+    original: PathBuf,
+}
+
+impl CwdRestoreGuard {
+    fn capture() -> miette::Result<Self> {
+        Ok(Self {
+            original: std::env::current_dir()
+                .into_diagnostic()
+                .wrap_err("failed to read current directory")?,
+        })
+    }
+}
+
+impl Drop for CwdRestoreGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+        let _ = crate::dirs::set_cwd(&self.original);
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, usage_rs::ValueEnum, strum::EnumString)]
 #[strum(serialize_all = "kebab-case")]
 pub(crate) enum LogLevel {
@@ -298,6 +323,8 @@ pub(crate) enum ReporterType {
 }
 
 impl LogLevel {
+    /// Only the tracing-subscriber setup reads this.
+    #[cfg_attr(not(feature = "tracing-subscriber"), allow(dead_code))]
     fn filter(self) -> &'static str {
         match self {
             LogLevel::Trace => "trace",
@@ -668,6 +695,35 @@ pub fn cli_main_with_defaults(
     embedder: &'static aube_util::Embedder,
     defaults: Vec<(String, String)>,
 ) -> i32 {
+    cli_main_with_defaults_from_args(embedder, defaults, std::env::args_os())
+}
+
+/// Run aube with an explicit argv vector.
+///
+/// The embedding entry point for a host that wants in-process execution
+/// without temporarily rewriting the process argv or spawning a child. `args`
+/// includes argv0 (used for multicall/applet selection), exactly like
+/// `std::env::args_os()`.
+#[must_use]
+pub fn cli_main_from_args<I, T>(embedder: &'static aube_util::Embedder, args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    cli_main_with_defaults_from_args(embedder, Vec::new(), args)
+}
+
+/// [`cli_main_from_args`] plus embedder-supplied setting defaults.
+#[must_use]
+pub fn cli_main_with_defaults_from_args<I, T>(
+    embedder: &'static aube_util::Embedder,
+    defaults: Vec<(String, String)>,
+    args: I,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
     // Register the binary's embedder profile before anything reads branding,
     // and its setting defaults before anything resolves settings. Both are
     // idempotent — a no-op if already set (e.g. a test harness that
@@ -691,7 +747,7 @@ pub fn cli_main_with_defaults(
         aube_util::diag::flush();
         prev_hook(info);
     }));
-    let result = inner_main();
+    let result = inner_main_from(args.into_iter().map(Into::into).collect());
     aube_util::diag::flush();
     // Drain any in-flight slow-metadata group whose debounce window
     // hasn't fired yet. install pipelines also flush at end-of-resolve
@@ -708,7 +764,19 @@ pub fn cli_main_with_defaults(
     match result {
         Ok(code) => code,
         Err(report) => {
-            eprintln!("{report:?}");
+            let rendered = format!("{report:?}");
+            // A host that registered an events-mode control owns the output
+            // surface; writing straight to stderr would bypass it.
+            let control = commands::install::InstallControl::default();
+            if control.output_mode() == commands::install::InstallOutputMode::Events {
+                commands::install::control::report_error(
+                    &control,
+                    report.code().map(|code| code.to_string()),
+                    rendered,
+                );
+            } else {
+                eprintln!("{rendered}");
+            }
             report_exit_code(&report)
         }
     }
@@ -727,8 +795,7 @@ fn report_exit_code(report: &miette::Report) -> i32 {
     aube_codes::exit::EXIT_GENERIC
 }
 
-fn inner_main() -> miette::Result<i32> {
-    let mut argv: Vec<OsString> = std::env::args_os().collect();
+fn inner_main_from(mut argv: Vec<OsString>) -> miette::Result<i32> {
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("__complete_word__") {
         let name = argv
             .first()
@@ -934,10 +1001,27 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
     // progress UI.
     // `--reporter=silent` is equivalent to `--silent`; all other reporter
     // values leave the log level alone and only affect output routing.
+    // Unconditional: `-C`, `--workspace-root`, `install -w`, and `dlx` all
+    // chdir from different places, so capture once here and let the guard put
+    // the host's cwd back however the invocation ends.
+    let _cwd_restore = CwdRestoreGuard::capture()?;
+
     if let Some(dir) = &cli.dir {
-        std::env::set_current_dir(dir)
+        // Absolutize against the *current* cwd before chdir'ing: aube's cached
+        // cwd has to be recorded as an absolute path, and an embedding host may
+        // have moved the process cwd since startup.
+        let target_dir = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            std::env::current_dir()
+                .into_diagnostic()
+                .wrap_err("failed to read current directory")?
+                .join(dir)
+        };
+        std::env::set_current_dir(&target_dir)
             .into_diagnostic()
-            .wrap_err_with(|| format!("failed to change directory to {}", dir.display()))?;
+            .wrap_err_with(|| format!("failed to change directory to {}", target_dir.display()))?;
+        crate::dirs::set_cwd(&target_dir)?;
     }
 
     let print_top_level_version = should_print_top_level_version(&cli);
@@ -1088,7 +1172,13 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         Some(Commands::Import(args)) => commands::import::run(args).await?,
         Some(Commands::Init(args)) => commands::init::run(args).await?,
         Some(Commands::Install(args)) => {
-            run_install_command(args, effective_filter.clone(), cli.workspace_root).await?;
+            run_install_command(
+                args,
+                effective_filter.clone(),
+                cli.workspace_root,
+                cli.ignore_workspace,
+            )
+            .await?;
         }
         Some(Commands::InstallTest(args)) => {
             if let Some(code) = commands::install_test::run(args.into_inner()).await? {
@@ -1188,7 +1278,13 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
                     }
                 }
                 Some(Commands::Install(args)) => {
-                    run_install_command(args, nested_filter, nested.workspace_root).await?;
+                    run_install_command(
+                        args,
+                        nested_filter,
+                        nested.workspace_root,
+                        nested.ignore_workspace,
+                    )
+                    .await?;
                 }
                 Some(Commands::List(args)) => commands::list::run(args, nested_filter).await?,
                 Some(Commands::La(commands::list::LaArgs { mut args }))
@@ -1428,6 +1524,7 @@ async fn run_install_command(
     args: commands::install::InstallArgs,
     filter: aube_workspace::selector::EffectiveFilter,
     workspace_root_already: bool,
+    ignore_workspace: bool,
 ) -> miette::Result<()> {
     // `-w` on install is a short alias for the global
     // `--workspace-root` flag. Handle the chdir here when the global
@@ -1454,7 +1551,11 @@ async fn run_install_command(
     // means `aube install` from inside a member loads `.npmrc` /
     // workspace yaml from the workspace root, not the member; without
     // this the two diverged when both roots existed.
-    let cwd = crate::dirs::workspace_or_project_root()?;
+    let cwd = if ignore_workspace {
+        crate::dirs::project_root_or_cwd()?
+    } else {
+        crate::dirs::workspace_or_project_root()?
+    };
     let files = commands::FileSources::load(&cwd);
     let raw_ws = aube_manifest::workspace::load_raw(&cwd)
         .into_diagnostic()
@@ -1464,6 +1565,9 @@ async fn run_install_command(
     let ctx = files.ctx(&raw_ws, &env, &cli_flags);
     let yaml_prefer_frozen = aube_settings::resolved::prefer_frozen_lockfile(&ctx);
     let mut opts = args.into_options(global_frozen, yaml_prefer_frozen, cli_flags, env);
+    if ignore_workspace {
+        opts.project_dir = Some(cwd);
+    }
     opts.workspace_filter = filter;
     commands::install::run(opts).await?;
     Ok(())
