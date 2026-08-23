@@ -51,6 +51,11 @@ use std::path::PathBuf;
 #[usage(
     name = aube_util::prog(),
     name_spec = "aube",
+    // An embedder invoked as a host subcommand (`elide aube -- install`) needs
+    // its whole prefix in usage/error output; `bin_spec` keeps the portable
+    // spec (and `aube.usage.kdl`) on the standalone name.
+    bin = aube_util::command_prefix_display(),
+    bin_spec = "aube",
     about = "A fast Node.js package manager",
     view("aubr", root = "run", globals),
     view("aubx", root = "dlx", globals)
@@ -641,7 +646,8 @@ fn print_subcommand_help(name: &str) -> miette::Result<()> {
         .copied()
         .find(|command| command.name == name)
         .ok_or_else(|| miette::miette!("unknown subcommand {name:?}"))?;
-    let page = usage_rs::help::render(Cli::spec(), command, true)
+    let runtime_spec = Cli::runtime_app().spec();
+    let page = usage_rs::help::render(&runtime_spec, command, true)
         .ok_or_else(|| miette::miette!("failed to render help for {name:?}"))?;
     print!("{page}");
     Ok(())
@@ -1164,7 +1170,7 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
                 miette::miette!(
                     "{}",
                     usage_rs::render_failure(
-                        Cli::spec(),
+                        &Cli::runtime_app().spec(),
                         nested_refs.get(1..).unwrap_or_default(),
                         &error,
                     )
@@ -1361,7 +1367,9 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
                     .map(|m| m.scripts.contains_key(script))
                     .unwrap_or(false);
                 if !script_exists {
-                    if let Some(page) = usage_rs::help::render(Cli::spec(), Cli::command(), true) {
+                    if let Some(page) =
+                        usage_rs::help::render(&Cli::runtime_app().spec(), Cli::command(), true)
+                    {
                         print!("{page}");
                     }
                     eprintln!();
@@ -1382,7 +1390,9 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
             // Bare `aube` prints `--help` and exits 0, matching pnpm.
             // pnpm's bare invocation does not run an install; users who
             // want that behavior should type `aube install` explicitly.
-            if let Some(page) = usage_rs::help::render(Cli::spec(), Cli::command(), true) {
+            if let Some(page) =
+                usage_rs::help::render(&Cli::runtime_app().spec(), Cli::command(), true)
+            {
                 print!("{page}");
             }
         }
@@ -2112,6 +2122,31 @@ mod package_manager_guard_tests {
 mod cli_ordering_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// An embedder invoked as a host subcommand (`elide aube -- install`) sets
+    /// `Embedder::command_prefix`, which reaches usage output through
+    /// `#[usage(bin = aube_util::command_prefix_display())]`. Exercised through
+    /// the spec view directly: the active embedder is a process-global
+    /// `OnceLock`, so a unit test can't register a second profile.
+    #[test]
+    fn usage_output_can_display_an_embedded_command_prefix() {
+        let spec = Cli::app().bin("elide aube --").spec();
+        let install = Cli::command()
+            .subcommands
+            .iter()
+            .copied()
+            .find(|command| command.name == "install")
+            .expect("install subcommand");
+        let page = usage_rs::help::render(&spec, install, true).expect("help page");
+        assert!(
+            page.contains("elide aube -- install"),
+            "embedded usage prefix should be rendered, got:\n{page}"
+        );
+        assert!(
+            !page.contains("Usage: aube install"),
+            "the standalone bin name should not survive the override, got:\n{page}"
+        );
+    }
 
     /// Validate that aube's CLI commands and arguments are ordered:
     /// - Subcommands alphabetical by name
