@@ -2,6 +2,7 @@ use aube::embed::{Host, InstallControl, InstallOptions, NetworkMode};
 
 static TEST_HOST: Host = Host {
     name: "embed-diag-test",
+    command_prefix: &["aube"],
     display_name: "Embed Diagnostics Test",
     vendor: None,
     version: "1.0.0",
@@ -19,6 +20,7 @@ static TEST_HOST: Host = Host {
     runtime_switching: false,
     self_engines_check: false,
     self_update_enabled: false,
+    default_registry: None,
 };
 
 #[test]

@@ -116,9 +116,21 @@ pub(crate) fn load_npm_config(dir: &std::path::Path) -> NpmConfig {
     let mut config = NpmConfig::load(dir);
     if let Some(url) = registry_override() {
         config.registry = url;
+    } else if let Some(default_registry) = aube_util::embedder().default_registry
+        && is_public_npm_registry(&config.registry)
+    {
+        // Only re-default when nothing user- or project-level spoke: an
+        // `.npmrc` registry, a workspace mirror, or `--registry` all still win.
+        config.registry = aube_registry::config::normalize_registry_url_pub(default_registry);
     }
     config
 }
+
+fn is_public_npm_registry(url: &str) -> bool {
+    aube_registry::config::normalize_registry_url_pub(url) == PUBLIC_NPM_REGISTRY
+}
+
+const PUBLIC_NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 
 /// Record the global frozen-lockfile override snapshot. Called once per
 /// process from `async_main`.

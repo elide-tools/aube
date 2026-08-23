@@ -443,8 +443,10 @@ fn init_impl(host_json: *const c_char) -> Result<(), Failure> {
     let version = leak_string(input.version);
     let user_agent = leak_string(format!("{name}/{version}"));
     let self_names = Box::leak(vec![name].into_boxed_slice());
+    let command_prefix = Box::leak(vec![name].into_boxed_slice());
     let host = Box::leak(Box::new(embed::Host {
         name,
+        command_prefix,
         display_name: name,
         vendor: None,
         version,
@@ -462,6 +464,7 @@ fn init_impl(host_json: *const c_char) -> Result<(), Failure> {
         runtime_switching: false,
         self_engines_check: false,
         self_update_enabled: false,
+        default_registry: None,
     }));
     embed::initialize(host, input.defaults.into_iter().collect());
     let _ = HOST_INITIALIZED.set(());

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, Once};
 
 static TEST_HOST: Host = Host {
     name: "testhost",
+    command_prefix: &["aube"],
     display_name: "Test Host",
     vendor: None,
     version: "1.0.0",
@@ -21,6 +22,7 @@ static TEST_HOST: Host = Host {
     runtime_switching: false,
     self_engines_check: false,
     self_update_enabled: false,
+    default_registry: None,
 };
 static INIT: Once = Once::new();
 

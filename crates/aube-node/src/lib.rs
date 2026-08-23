@@ -29,6 +29,7 @@ struct InstallFailure {
 
 static NODE_HOST: embed::Host = embed::Host {
     name: "aube-node",
+    command_prefix: &["aube"],
     display_name: "aube Node-API",
     vendor: None,
     version: env!("CARGO_PKG_VERSION"),
@@ -46,6 +47,7 @@ static NODE_HOST: embed::Host = embed::Host {
     runtime_switching: false,
     self_engines_check: false,
     self_update_enabled: false,
+    default_registry: None,
 };
 
 /// Registration of the embedder profile and setting defaults. `configure` and

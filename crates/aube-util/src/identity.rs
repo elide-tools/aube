@@ -148,6 +148,14 @@ pub struct Embedder {
     /// embedder that owns its own upgrade path sets this `false` so those
     /// code paths never run. Embedder-fixed.
     pub self_update_enabled: bool,
+    /// Default npm registry URL used by an embedder when the user's config
+    /// still resolves to aube's public npmjs default. `None` preserves
+    /// standalone aube behavior.
+    ///
+    /// Distinct from an embedder setting default: the registry is not a
+    /// `settings.toml` knob, it comes off `NpmConfig`, so it cannot be
+    /// re-defaulted through `set_embedder_defaults`.
+    pub default_registry: Option<&'static str>,
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -173,6 +181,7 @@ pub const AUBE: Embedder = Embedder {
     runtime_switching: true,
     self_engines_check: true,
     self_update_enabled: true,
+    default_registry: None,
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
