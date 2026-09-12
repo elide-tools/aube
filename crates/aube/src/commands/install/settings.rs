@@ -2,6 +2,25 @@ use super::version_from_dep_path;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
+/// Curated manifest repairs shipped by Yarn and pnpm for standalone aube.
+///
+/// Keep these out of `packageExtensionsChecksum`: updates to bundled
+/// compatibility data must not invalidate an existing project lockfile.
+// Integer offsets keep the generated tables free of per-entry pointer
+// relocations, which otherwise add measurable work to every CLI startup.
+type BundledStringRef = (u32, u32);
+type BundledTableRef = (u32, u32);
+
+struct BundledPackageExtension {
+    selector: BundledStringRef,
+    dependencies: BundledTableRef,
+    optional_dependencies: BundledTableRef,
+    peer_dependencies: BundledTableRef,
+    peer_dependencies_meta: BundledTableRef,
+}
+
+include!(concat!(env!("OUT_DIR"), "/bundled_package_extensions.rs"));
+
 /// Accept pnpm's documented aliases (`highest`, `time-based`, `time`,
 /// `lowest-direct`). Unknown values fall back to `None` so the caller's
 /// `.npmrc` / default path still runs.
@@ -438,6 +457,13 @@ pub(crate) fn resolve_force_metadata_primer(ctx: &aube_settings::ResolveCtx<'_>)
     aube_settings::resolved::force_metadata_primer(ctx)
 }
 
+fn is_standalone_aube(embedder: &aube_util::Embedder) -> bool {
+    // `AUBE` is a `const`, so references to it are not guaranteed to have a
+    // single stable address. The command-safe program name is the canonical
+    // value-level distinction between standalone aube and another embedder.
+    embedder.name == aube_util::identity::AUBE.name
+}
+
 pub(crate) fn resolve_dependency_policy(
     manifest: &aube_manifest::PackageJson,
     ctx: &aube_settings::ResolveCtx<'_>,
@@ -446,27 +472,27 @@ pub(crate) fn resolve_dependency_policy(
 
     validate_package_extension_containers(manifest, ctx)?;
     let package_extensions = effective_package_extensions(manifest, ctx);
-    // User/project extensions first, then bundled ecosystem defaults
-    // (supplied by an embedder via `EngineContext::bundled_package_extensions`)
-    // appended LAST. `apply_package_extensions` iterates this Vec in order and
-    // `extend_missing` is first-write-wins per dependency key, so this ordering
-    // gives user extensions precedence over bundled ones for free. The bundled
-    // map is read from the `bundled_package_extensions` seam — NEVER from
-    // `effective_package_extensions`, which feeds the lockfile
+    // User/project extensions first, then standalone and embedder-supplied
+    // bundled ecosystem defaults appended LAST. `apply_package_extensions`
+    // iterates this Vec in order and `extend_missing` is first-write-wins per
+    // dependency key, so user extensions take precedence over bundled ones.
+    // Bundled data is NEVER routed through `effective_package_extensions`,
+    // which feeds the lockfile
     // `packageExtensionsChecksum`: routing bundled defaults through the
     // checksum would drift every existing lockfile on each bundled-list bump
     // and abort `--frozen-lockfile` under `enforce_package_extensions_checksum`.
     let mut extensions = parse_package_extensions(package_extensions)?;
-    if let Some(bundled) = aube_util::engine_context()
-        .bundled_package_extensions
-        .as_ref()
-    {
-        // Bundled extensions are embedder-supplied data, not user config.
-        // A malformed entry should warn and be skipped, not abort the install
-        // with an error naming a selector the user never wrote.
-        match parse_package_extensions(bundled.clone()) {
-            Ok(parsed) => extensions.extend(parsed),
-            Err(err) => tracing::warn!("ignoring malformed bundled package extension: {err}"),
+    if !aube_settings::resolved::ignore_compatibility_db(ctx) {
+        if is_standalone_aube(aube_util::embedder()) {
+            // Catalog order is significant when semver selectors overlap: the
+            // first matching extension wins per dependency key.
+            extensions.extend(standalone_bundled_package_extensions());
+        }
+        if let Some(bundled) = aube_util::engine_context().bundled_package_extensions {
+            // Bundled extensions are embedder-supplied data, not user config.
+            // A malformed entry should warn and be skipped, not abort the install
+            // with an error naming a selector the user never wrote.
+            extensions.extend(parse_bundled_package_extensions(bundled));
         }
     }
     policy.package_extensions = extensions;
@@ -834,35 +860,102 @@ fn json_string_map(map: BTreeMap<String, serde_json::Value>) -> BTreeMap<String,
 }
 
 fn parse_package_extensions(
-    raw: BTreeMap<String, serde_json::Value>,
+    raw: impl IntoIterator<Item = (String, serde_json::Value)>,
 ) -> miette::Result<Vec<aube_resolver::PackageExtension>> {
     raw.into_iter()
-        .map(|(selector, value)| {
-            let obj = value
-                .as_object()
-                .ok_or_else(|| invalid_package_extension(&selector, "entry must be an object"))?;
-            let dependencies_path = format!("{selector}.dependencies");
-            let optional_dependencies_path = format!("{selector}.optionalDependencies");
-            let peer_dependencies_path = format!("{selector}.peerDependencies");
-            let peer_dependencies_meta_path = format!("{selector}.peerDependenciesMeta");
-            Ok(aube_resolver::PackageExtension {
-                selector,
-                dependencies: read_json_string_map(obj.get("dependencies"), &dependencies_path)?,
-                optional_dependencies: read_json_string_map(
-                    obj.get("optionalDependencies"),
-                    &optional_dependencies_path,
-                )?,
-                peer_dependencies: read_json_string_map(
-                    obj.get("peerDependencies"),
-                    &peer_dependencies_path,
-                )?,
-                peer_dependencies_meta: read_peer_dependencies_meta(
-                    obj.get("peerDependenciesMeta"),
-                    &peer_dependencies_meta_path,
-                )?,
-            })
+        .map(|(selector, value)| parse_package_extension(selector, value))
+        .collect()
+}
+
+fn parse_bundled_package_extensions(
+    raw: impl IntoIterator<Item = (String, serde_json::Value)>,
+) -> Vec<aube_resolver::PackageExtension> {
+    raw.into_iter()
+        .filter_map(
+            |(selector, value)| match parse_package_extension(selector, value) {
+                Ok(extension) => Some(extension),
+                Err(err) => {
+                    tracing::warn!(
+                        code = aube_codes::warnings::WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION,
+                        error = %err,
+                        "ignoring malformed bundled package extension"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+fn standalone_bundled_package_extensions() -> Vec<aube_resolver::PackageExtension> {
+    STANDALONE_BUNDLED_PACKAGE_EXTENSIONS
+        .iter()
+        .map(|extension| aube_resolver::PackageExtension {
+            selector: bundled_string(extension.selector).to_owned(),
+            dependencies: bundled_string_map(extension.dependencies),
+            optional_dependencies: bundled_string_map(extension.optional_dependencies),
+            peer_dependencies: bundled_string_map(extension.peer_dependencies),
+            peer_dependencies_meta: bundled_peer_meta(extension.peer_dependencies_meta),
         })
         .collect()
+}
+
+fn bundled_string(reference: BundledStringRef) -> &'static str {
+    let start = reference.0 as usize;
+    &BUNDLED_STRINGS[start..start + reference.1 as usize]
+}
+
+fn bundled_string_map(reference: BundledTableRef) -> BTreeMap<String, String> {
+    let start = reference.0 as usize;
+    let mut map = BTreeMap::new();
+    for &(name, value) in &BUNDLED_STRING_PAIRS[start..start + reference.1 as usize] {
+        map.insert(
+            bundled_string(name).to_owned(),
+            bundled_string(value).to_owned(),
+        );
+    }
+    map
+}
+
+fn bundled_peer_meta(reference: BundledTableRef) -> BTreeMap<String, aube_registry::PeerDepMeta> {
+    let start = reference.0 as usize;
+    let mut map = BTreeMap::new();
+    for &(name, optional) in &BUNDLED_PEER_META[start..start + reference.1 as usize] {
+        map.insert(
+            bundled_string(name).to_owned(),
+            aube_registry::PeerDepMeta { optional },
+        );
+    }
+    map
+}
+
+fn parse_package_extension(
+    selector: String,
+    value: serde_json::Value,
+) -> miette::Result<aube_resolver::PackageExtension> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_package_extension(&selector, "entry must be an object"))?;
+    let dependencies_path = format!("{selector}.dependencies");
+    let optional_dependencies_path = format!("{selector}.optionalDependencies");
+    let peer_dependencies_path = format!("{selector}.peerDependencies");
+    let peer_dependencies_meta_path = format!("{selector}.peerDependenciesMeta");
+    Ok(aube_resolver::PackageExtension {
+        selector,
+        dependencies: read_json_string_map(obj.get("dependencies"), &dependencies_path)?,
+        optional_dependencies: read_json_string_map(
+            obj.get("optionalDependencies"),
+            &optional_dependencies_path,
+        )?,
+        peer_dependencies: read_json_string_map(
+            obj.get("peerDependencies"),
+            &peer_dependencies_path,
+        )?,
+        peer_dependencies_meta: read_peer_dependencies_meta(
+            obj.get("peerDependenciesMeta"),
+            &peer_dependencies_meta_path,
+        )?,
+    })
 }
 
 fn read_json_string_map(
@@ -1283,6 +1376,106 @@ fn compile_peer_patterns(field: &str, raw: &[String]) -> Vec<glob::Pattern> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod bundled_compat_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_detection_uses_embedder_value_not_const_address() {
+        assert!(is_standalone_aube(&aube_util::identity::AUBE));
+        let embedded = aube_util::Embedder {
+            name: "embedded-aube",
+            ..aube_util::identity::AUBE
+        };
+        assert!(!is_standalone_aube(&embedded));
+    }
+
+    #[test]
+    fn catalog_matches_curated_upstreams_and_preserves_order() {
+        let extensions = standalone_bundled_package_extensions();
+
+        assert_eq!(extensions.len(), 161);
+        let extension = |selector: &str| {
+            extensions
+                .iter()
+                .find(|extension| extension.selector == selector)
+                .unwrap_or_else(|| panic!("missing bundled selector {selector}"))
+        };
+        assert_eq!(
+            extension("@angular/build@*").dependencies["tslib"],
+            "^2.3.0"
+        );
+        assert_eq!(
+            extension("@nuxt/vite-builder@>=4.5.0").dependencies["unplugin"],
+            "^3.3.0"
+        );
+        let selector_position = |selector: &str| {
+            extensions
+                .iter()
+                .position(|extension| extension.selector == selector)
+                .unwrap_or_else(|| panic!("missing bundled selector {selector}"))
+        };
+        assert!(
+            selector_position("consolidate@<=0.16.0") < selector_position("consolidate@<0.16.0")
+        );
+    }
+
+    #[test]
+    fn catalog_does_not_inject_type_only_or_singleton_runtimes() {
+        // These are the bare runtime targets the reverted scanner rules
+        // injected. Their `@types/*` counterparts are legitimate packages and
+        // intentionally remain allowed in curated repairs.
+        let extensions = standalone_bundled_package_extensions();
+        for target in ["estree", "typescript", "react", "eslint"] {
+            for extension in &extensions {
+                assert!(
+                    !extension.dependencies.contains_key(target),
+                    "{} must not inject {target}",
+                    extension.selector
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bundled_entry_does_not_discard_valid_entries() {
+        let raw = vec![
+            ("broken@*".to_string(), serde_json::Value::Null),
+            (
+                "valid@*".to_string(),
+                serde_json::json!({"dependencies": {"left-pad": "^1.3.0"}}),
+            ),
+        ];
+
+        let parsed = parse_bundled_package_extensions(raw);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].selector, "valid@*");
+        assert_eq!(parsed[0].dependencies["left-pad"], "^1.3.0");
+    }
+
+    #[test]
+    fn ignore_compatibility_db_skips_bundled_but_keeps_project_extensions() {
+        let npmrc = [("ignoreCompatibilityDb".to_string(), "true".to_string())];
+        let workspace = BTreeMap::new();
+        let ctx = aube_settings::ResolveCtx::files_only(&npmrc, &workspace);
+        let manifest = serde_json::from_value(serde_json::json!({
+            "pnpm": {
+                "packageExtensions": {
+                    "project-extension@*": {"dependencies": {"left-pad": "^1.3.0"}}
+                }
+            }
+        }))
+        .expect("test manifest should parse");
+
+        let policy =
+            resolve_dependency_policy(&manifest, &ctx).expect("test policy should resolve");
+
+        assert_eq!(policy.package_extensions.len(), 1);
+        assert_eq!(policy.package_extensions[0].selector, "project-extension@*");
+    }
 }
 
 #[cfg(test)]

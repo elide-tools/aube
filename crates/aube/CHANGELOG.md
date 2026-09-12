@@ -7,6 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.14](https://github.com/aubepkg/aube/compare/v2.2.13...v2.2.14) - 2026-09-11
+
+### Fixed
+
+- *(audit)* match GHSA IDs in URLs ([#1517](https://github.com/aubepkg/aube/pull/1517))
+
+## [2.2.13](https://github.com/aubepkg/aube/compare/v2.2.12...v2.2.13) - 2026-09-09
+
+### Other
+
+- improve guides, references, and site design ([#1503](https://github.com/aubepkg/aube/pull/1503))
+
+## [2.2.12](https://github.com/jdx/aube/compare/v2.2.11...v2.2.12) - 2026-09-05
+
+### Fixed
+
+- inline coderabbit configuration after repository transfer ([#1498](https://github.com/jdx/aube/pull/1498))
+
+## [2.2.11](https://github.com/aubepkg/aube/compare/v2.2.9...v2.2.11) - 2026-09-05
+
+### Fixed
+
+- *(config)* redact credentials from command output ([#1483](https://github.com/aubepkg/aube/pull/1483))
+- *(config)* preserve comments and order in config.toml ([#1480](https://github.com/aubepkg/aube/pull/1480))
+
+### Other
+
+- release v2.2.10 ([#1479](https://github.com/aubepkg/aube/pull/1479))
+
+## [2.2.10](https://github.com/aubepkg/aube/compare/v2.2.9...v2.2.10) - 2026-09-05
+
+### Fixed
+
+- *(config)* redact credentials from command output ([#1483](https://github.com/aubepkg/aube/pull/1483))
+- *(config)* preserve comments and order in config.toml ([#1480](https://github.com/aubepkg/aube/pull/1480))
+
+## [2.2.9](https://github.com/jdx/aube/compare/v2.2.8...v2.2.9) - 2026-09-04
+
+### Fixed
+
+- *(release)* create arm64 target before mounting ([#1478](https://github.com/jdx/aube/pull/1478))
+
+## [2.2.8](https://github.com/aubepkg/aube/compare/v2.2.7...v2.2.8) - 2026-09-04
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [2.2.7](https://github.com/jdx/aube/compare/v2.2.6...v2.2.7) - 2026-09-03
+
+### Fixed
+
+- *(release)* remove mbx check from arm64 image ([#1473](https://github.com/jdx/aube/pull/1473))
+
+## [2.2.6](https://github.com/jdx/aube/compare/v2.2.5...v2.2.6) - 2026-09-03
+
+### Fixed
+
+- *(release)* restore focal arm64 build image ([#1470](https://github.com/jdx/aube/pull/1470))
+
+## [2.2.5](https://github.com/aubepkg/aube/compare/v2.2.4...v2.2.5) - 2026-09-03
+
+### Other
+
+- move routine workflows to GitHub-hosted runners ([#1469](https://github.com/aubepkg/aube/pull/1469))
+- move project to aubepkg and aube.sh ([#1460](https://github.com/aubepkg/aube/pull/1460))
+- fix prose and content in docs and cli help ([#1455](https://github.com/aubepkg/aube/pull/1455))
+- *(store)* direct-write Linux CAS under install lock ([#1430](https://github.com/aubepkg/aube/pull/1430))
+- refresh benchmarks for v2.2.4 ([#1434](https://github.com/aubepkg/aube/pull/1434))
+
+## [2.2.4](https://github.com/jdx/aube/compare/v2.2.3...v2.2.4) - 2026-08-31
+
+### Fixed
+
+- *(install)* trust locked packages without revalidation ([#1418](https://github.com/jdx/aube/pull/1418))
+
+### Other
+
+- refresh benchmarks for v2.2.3 ([#1417](https://github.com/jdx/aube/pull/1417))
+
+## [2.2.3](https://github.com/jdx/aube/compare/v2.2.2...v2.2.3) - 2026-08-29
+
+### Fixed
+
+- *(release)* mount cached arm64 build target ([#1412](https://github.com/jdx/aube/pull/1412))
+
+## [2.2.2](https://github.com/jdx/aube/compare/v2.2.1...v2.2.2) - 2026-08-29
+
+### Fixed
+
+- *(release)* mount writable home for arm64 pgo builds ([#1409](https://github.com/jdx/aube/pull/1409))
+
+## [2.2.1](https://github.com/jdx/aube/compare/v2.2.0...v2.2.1) - 2026-08-29
+
+### Fixed
+
+- *(install)* repair stale cached node-gyp ([#1407](https://github.com/jdx/aube/pull/1407))
+- *(install)* verify the already-linked shortcut against the expected target ([#1406](https://github.com/jdx/aube/pull/1406))
+- *(install)* refresh bin shims after dependency builds ([#1404](https://github.com/jdx/aube/pull/1404))
+- *(resolver)* match pnpm importer peer semantics ([#1399](https://github.com/jdx/aube/pull/1399))
+
+### Other
+
+- *(install)* validate trustPolicy from compact trust histories ([#1403](https://github.com/jdx/aube/pull/1403))
+- *(install)* cut freshness and repeat-install overhead on large repos ([#1400](https://github.com/jdx/aube/pull/1400))
+- refresh benchmarks for v2.2.0 ([#1384](https://github.com/jdx/aube/pull/1384))
+- *(sponsors)* replace 37signals with omacom foundation ([#1380](https://github.com/jdx/aube/pull/1380))
+
+## [2.2.0](https://github.com/jdx/aube/compare/v2.1.0...v2.2.0) - 2026-08-25
+
+### Added
+
+- *(embed)* expose node-gyp bootstrap ([#1365](https://github.com/jdx/aube/pull/1365))
+
+### Fixed
+
+- *(install)* bundle curated package extensions ([#1369](https://github.com/jdx/aube/pull/1369))
+
+### Other
+
+- refresh benchmarks for v2.1.0 ([#1372](https://github.com/jdx/aube/pull/1372))
+
+## [2.1.0](https://github.com/jdx/aube/compare/v2.0.1...v2.1.0) - 2026-08-23
+
+### Added
+
+- *(run)* echo the script command line before running it ([#1358](https://github.com/jdx/aube/pull/1358))
+
+### Fixed
+
+- *(install)* apply global virtual store flags in ci ([#1355](https://github.com/jdx/aube/pull/1355))
+
+### Other
+
+- *(run)* exec final aubr script shell on unix ([#1360](https://github.com/jdx/aube/pull/1360))
+- *(run)* reuse manifest and settings contexts ([#1359](https://github.com/jdx/aube/pull/1359))
+- *(run)* exec plain script command lines without a shell ([#1363](https://github.com/jdx/aube/pull/1363))
+- *(run)* only rewrite node-gyp shims when they change ([#1361](https://github.com/jdx/aube/pull/1361))
+- *(run)* defer aubr install runtime startup ([#1357](https://github.com/jdx/aube/pull/1357))
+- refresh benchmarks for v2.0.1 ([#1350](https://github.com/jdx/aube/pull/1350))
+
 ## [2.0.1](https://github.com/jdx/aube/compare/v1.41.0...v2.0.1) - 2026-08-23
 
 ### Added

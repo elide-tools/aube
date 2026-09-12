@@ -30,9 +30,6 @@ pub(crate) fn format_virtual_store_display_prefix(
 /// Windows callers must also inspect the reparse-point attribute before
 /// traversing a path.
 pub(crate) fn is_link_or_junction_metadata(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -41,7 +38,7 @@ pub(crate) fn is_link_or_junction_metadata(metadata: &std::fs::Metadata) -> bool
             return true;
         }
     }
-    false
+    metadata.file_type().is_symlink()
 }
 
 /// Remove an existing file/dir/symlink at the given path, if present.

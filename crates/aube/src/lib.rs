@@ -72,7 +72,7 @@ pub(crate) struct Cli {
     )]
     dir: Option<std::path::PathBuf>,
 
-    /// Scope command execution to workspace packages matching PATTERN.
+    /// Scope command execution to workspace packages matching a selector.
     ///
     /// Supports exact names (`my-pkg`), globs (`@scope/*`, `*-plugin`),
     /// paths (`./packages/api`), graph selectors (`pkg...`, `...pkg`),
@@ -80,8 +80,9 @@ pub(crate) struct Cli {
     /// Repeatable; matches are OR-ed.
     ///
     /// Currently honored by `run`, `test`, `start`, `stop`, `restart`,
-    /// `install`, `exec`, `list`, `publish`, `deploy`, `add`, `remove`,
-    /// `update`, `why`, and implicit-script invocations.
+    /// `install`, `exec`, `list`, `outdated`, `publish`, `deploy`, `add`,
+    /// `remove`, `update`, `query`, `rebuild`, `why`, and implicit-script
+    /// invocations.
     #[usage(short = 'F', long, global, value_name = "WORKSPACE")]
     filter: Vec<String>,
 
@@ -98,10 +99,10 @@ pub(crate) struct Cli {
     verbose: bool,
 
     /// Print version and check for updates.
-    ///
-    /// Manual flag so we can run the async update notifier alongside
-    /// the version print — clap's auto `Action::Version` exits inside
-    /// `parse_from`, before the tokio runtime is built.
+    //
+    // Manual flag so the async update notifier can run alongside the
+    // version print — an auto-generated version action would exit inside
+    // argument parsing, before the tokio runtime is built.
     #[usage(short = 'V', long = "version", global)]
     version: bool,
 
@@ -175,8 +176,7 @@ pub(crate) struct Cli {
     /// Disable colored output.
     ///
     /// Overrides `FORCE_COLOR` / `CLICOLOR_FORCE` and sets `NO_COLOR=1`
-    /// so downstream libraries (miette, clx, child processes) all see
-    /// the same choice.
+    /// so child processes see the same choice.
     #[usage(long, global)]
     no_color: bool,
 
@@ -184,9 +184,8 @@ pub(crate) struct Cli {
     ///
     /// `default` renders the progress UI when stderr is a TTY;
     /// `append-only` disables the progress UI in favor of plain
-    /// line-at-a-time logs; `ndjson` swaps the tracing fmt layer for
-    /// the JSON formatter (one JSON object per log event on stderr)
-    /// and is what tooling wrappers should consume; `silent`
+    /// line-at-a-time logs; `ndjson` emits one JSON object per log
+    /// event on stderr and is what tooling wrappers should consume; `silent`
     /// suppresses all non-error output (alias for `--loglevel silent`).
     #[usage(long, global, value_name = "NAME", value_enum)]
     reporter: Option<ReporterType>,
@@ -431,7 +430,7 @@ enum Commands {
     /// `--lockfile` / `-l` also deletes lockfiles. A `clean` script in
     /// the root `package.json` overrides the built-in.
     Clean(commands::clean::CleanArgs),
-    /// Generate shell completions (bash, zsh, fish)
+    /// Generate shell completions (bash, zsh, fish, powershell)
     Completion(commands::completion::CompletionArgs),
     /// Read and write settings in `.npmrc`
     #[usage(alias = "c")]
@@ -465,7 +464,7 @@ enum Commands {
     /// Alias for `config get` (hidden; prefer `config get`)
     #[usage(hide)]
     Get(commands::config::GetArgs),
-    /// Print packages whose install scripts were skipped by `pnpm.allowBuilds`
+    /// Print packages whose install scripts were skipped by the `allowBuilds` allowlist
     IgnoredBuilds(commands::ignored_builds::IgnoredBuildsArgs),
     /// Convert a supported lockfile into aube-lock.yaml
     Import(commands::import::ImportArgs),
@@ -509,7 +508,7 @@ enum Commands {
     Pack(commands::pack::PackArgs),
     /// Extract a package into an edit directory so it can be patched
     Patch(commands::patch::PatchArgs),
-    /// Generate a `.patch` file from a `aube patch` edit directory
+    /// Generate a `.patch` file from an `aube patch` edit directory
     PatchCommit(commands::patch_commit::PatchCommitArgs),
     /// Remove patch entries from `pnpm.patchedDependencies`
     PatchRemove(commands::patch_remove::PatchRemoveArgs),
@@ -568,6 +567,7 @@ enum Commands {
     /// Show the companies sponsoring aube and the jdx.dev open source tools
     Sponsors(commands::sponsors::SponsorsArgs),
     /// Stage packages for publishing (not implemented — use `npm stage`)
+    #[usage(hide)]
     Stage(commands::npm_fallback::StageArgs),
     /// Start a package (shortcut for `run start`)
     Start(commands::run::StartArgs),
@@ -609,8 +609,7 @@ enum Commands {
 }
 
 /// Library entry point. An embedder calls this with its own `&'static
-/// Embedder` (and optional setting defaults); the `aube` binary passes
-/// `&aube_util::AUBE` and no defaults, reproducing standalone behavior.
+/// Embedder` (and optional setting defaults).
 /// This is the whole embedding API: register-then-run in one call, so a host
 /// never has to separately wire identity and defaults.
 ///
@@ -619,7 +618,7 @@ enum Commands {
 /// hands back the code the binary's `main` should exit with. Returning rather
 /// than calling `std::process::exit` keeps it embed-safe: a host that drives
 /// it in-process is not hard-killed by a non-zero result or an error. The
-/// standalone binary does `std::process::exit(cli_main(..))`.
+/// standalone binary uses [`standalone_main`] to opt into process replacement.
 ///
 /// `#[must_use]`: the `i32` is the exit code, not a side effect. An
 /// embedder migrating off the old `process::exit` entrypoint that drops
@@ -629,6 +628,19 @@ enum Commands {
 #[must_use]
 pub fn cli_main(embedder: &'static aube_util::Embedder) -> i32 {
     cli_main_with_defaults(embedder, Vec::new())
+}
+
+/// Standalone binary entrypoint. May replace the process for `aubr` scripts;
+/// embedding hosts must use [`cli_main`] or [`cli_main_from_args`] instead.
+#[doc(hidden)]
+#[must_use]
+pub fn standalone_main() -> i32 {
+    cli_main_impl(
+        &aube_util::identity::AUBE,
+        Vec::new(),
+        std::env::args_os().collect(),
+        true,
+    )
 }
 
 /// The root command metadata for the embeddable command layer.
@@ -724,6 +736,20 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
+    cli_main_impl(
+        embedder,
+        defaults,
+        args.into_iter().map(Into::into).collect(),
+        false,
+    )
+}
+
+fn cli_main_impl(
+    embedder: &'static aube_util::Embedder,
+    defaults: Vec<(String, String)>,
+    args: Vec<OsString>,
+    allow_process_replacement: bool,
+) -> i32 {
     // Register the binary's embedder profile before anything reads branding,
     // and its setting defaults before anything resolves settings. Both are
     // idempotent — a no-op if already set (e.g. a test harness that
@@ -747,7 +773,7 @@ where
         aube_util::diag::flush();
         prev_hook(info);
     }));
-    let result = inner_main_from(args.into_iter().map(Into::into).collect());
+    let result = inner_main_from(args, allow_process_replacement);
     aube_util::diag::flush();
     // Drain any in-flight slow-metadata group whose debounce window
     // hasn't fired yet. install pipelines also flush at end-of-resolve
@@ -795,7 +821,13 @@ fn report_exit_code(report: &miette::Report) -> i32 {
     aube_codes::exit::EXIT_GENERIC
 }
 
-fn inner_main_from(mut argv: Vec<OsString>) -> miette::Result<i32> {
+fn inner_main_from(
+    mut argv: Vec<OsString>,
+    allow_process_replacement: bool,
+) -> miette::Result<i32> {
+    let invoked_as_aubr = argv
+        .first()
+        .is_some_and(|arg| crate::tool_shims::stem_of_argv0(arg) == "aubr");
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("__complete_word__") {
         let name = argv
             .first()
@@ -974,14 +1006,32 @@ fn inner_main_from(mut argv: Vec<OsString>) -> miette::Result<i32> {
         .unwrap_or(4);
     let workers = parse_env("AUBE_TOKIO_WORKERS", cpu_count.min(8));
     let blocking = parse_env("AUBE_TOKIO_BLOCKING", 128);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
+    // Every aubr invocation starts on the lightweight runtime. If its
+    // synchronous freshness probe finds that dependencies need installing,
+    // auto_install lazily creates a multi-thread runtime for that work only.
+    let current_thread_run = aubr_uses_current_thread(invoked_as_aubr, &cli);
+    let replace_process = allow_process_replacement && invoked_as_aubr;
+    let mut runtime_builder = if current_thread_run {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(workers);
+        builder
+    };
+    let runtime = runtime_builder
         .max_blocking_threads(blocking)
         .enable_all()
         .build()
         .into_diagnostic()
         .wrap_err("failed to build tokio runtime")?;
-    let exit_code = runtime.block_on(async_main(cli))?;
+    let exit_code = if current_thread_run {
+        runtime.block_on(commands::with_lazy_install_runtime(
+            commands::LazyInstallRuntime::new(workers, blocking),
+            async_main(cli, replace_process),
+        ))?
+    } else {
+        runtime.block_on(async_main(cli, replace_process))?
+    };
     drop(runtime);
     // Return the command's exit code rather than terminating here: a
     // non-zero result (e.g. `run`/`exec` propagating a child's status)
@@ -992,7 +1042,11 @@ fn inner_main_from(mut argv: Vec<OsString>) -> miette::Result<i32> {
     Ok(exit_code.unwrap_or(0))
 }
 
-async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
+fn aubr_uses_current_thread(invoked_as_aubr: bool, cli: &Cli) -> bool {
+    invoked_as_aubr && matches!(cli.command.as_ref(), Some(Commands::Run(_)))
+}
+
+async fn async_main(cli: Cli, replace_process: bool) -> miette::Result<Option<i32>> {
     // Default log level is `warn` so routine install output doesn't collide
     // with the clx progress display. `-v` / `--verbose` and `--loglevel debug`
     // turn on debug logging, and in that mode we also force clx into Text
@@ -1102,7 +1156,8 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
 
     match cli.command {
         Some(Commands::NodeGypBootstrap { project_dir }) => {
-            commands::install::node_gyp_bootstrap::print_bootstrapped_binary(&project_dir).await?
+            let binary = embed::bootstrap_node_gyp(&project_dir).await?;
+            println!("{}", binary.display());
         }
         Some(Commands::Access(args)) => commands::access::run(args).await?,
         Some(Commands::Activate(args)) => commands::activate::run(args)?,
@@ -1377,7 +1432,13 @@ async fn async_main(cli: Cli) -> miette::Result<Option<i32>> {
         }
         Some(Commands::Root(args)) => commands::root::run(args).await?,
         Some(Commands::Run(args)) => {
-            if let Some(code) = commands::run::run(args, effective_filter.clone()).await? {
+            if let Some(code) = commands::run::run_with_process_replacement(
+                args,
+                effective_filter.clone(),
+                replace_process,
+            )
+            .await?
+            {
                 return Ok(Some(code));
             }
         }
@@ -1576,6 +1637,18 @@ async fn run_install_command(
 #[cfg(test)]
 mod cli_spec_tests {
     use super::*;
+
+    #[test]
+    fn every_aubr_run_uses_current_thread_runtime() {
+        let aubr = Cli::try_parse_test_from(["aubr", "--no-install", "build"])
+            .expect("aubr --no-install should parse");
+        assert!(aubr_uses_current_thread(true, &aubr));
+
+        let installing =
+            Cli::try_parse_test_from(["aubr", "build"]).expect("aubr script should parse");
+        assert!(aubr_uses_current_thread(true, &installing));
+        assert!(!aubr_uses_current_thread(false, &aubr));
+    }
 
     #[test]
     fn install_accepts_subcommand_registry_flag() {

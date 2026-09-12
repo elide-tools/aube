@@ -100,6 +100,7 @@ is_ci = "1"
 ci_info = "0.14"
 pluralizer = "0.5"
 toml = { workspace = true }
+toml_edit = { workspace = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "std"], optional = true }
 crossterm = { version = "0.29", optional = true }
@@ -153,6 +154,9 @@ tracing-subscriber = ["dep:tracing-subscriber"]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+[build-dependencies]
+serde_json = { workspace = true }
 
 [[test]]
 name = "e2e"

@@ -589,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "workspace-yaml-preserve")]
     fn prune_preserves_comments_when_dropping_one_entry() {
         // Cleanup of an unused catalog entry must keep `# ...`
         // annotations on the catalog entries that survive — the whole

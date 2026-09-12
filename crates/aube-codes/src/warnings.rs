@@ -35,6 +35,8 @@ pub const WARN_AUBE_STORE_PRUNE_ENTRY_DISAPPEARED: &str = "WARN_AUBE_STORE_PRUNE
 // ── settings / config validation ────────────────────────────────────
 pub const WARN_AUBE_INVALID_CONCURRENCY: &str = "WARN_AUBE_INVALID_CONCURRENCY";
 pub const WARN_AUBE_INVALID_TRUST_POLICY: &str = "WARN_AUBE_INVALID_TRUST_POLICY";
+pub const WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION: &str =
+    "WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION";
 pub const WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE: &str =
     "WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE";
 pub const WARN_AUBE_OVERRIDE_MISSING_DEP: &str = "WARN_AUBE_OVERRIDE_MISSING_DEP";
@@ -246,7 +248,7 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_LTHASH_MISMATCH,
         category: category::INSTALL_LIFECYCLE,
-        description: "Incremental and full LtHash digests disagreed — homomorphic invariant broken. Real bug signal.",
+        description: "aube's incremental install digest disagreed with a full recomputation. This indicates a bug in aube — please report it at https://github.com/aubepkg/aube/discussions.",
         exit_code: None,
     },
     CodeMeta {
@@ -264,13 +266,13 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_GVS_MODE_CHANGED,
         category: category::INSTALL_LIFECYCLE,
-        description: "Switching between gvs-on and gvs-off; removing `node_modules` and reinstalling from scratch.",
+        description: "The global virtual store was switched on or off since the last install, so aube is removing `node_modules` and reinstalling from scratch.",
         exit_code: None,
     },
     CodeMeta {
         name: WARN_AUBE_GVS_CROSS_VOLUME,
         category: category::INSTALL_LIFECYCLE,
-        description: "`cacheDir` (global virtual store) and `storeDir` are on different volumes, so linking falls back to per-file copy.",
+        description: "The global virtual store (`globalVirtualStoreDir`, by default under `cacheDir`) and `storeDir` are on different volumes, so linking falls back to per-file copy.",
         exit_code: None,
     },
     CodeMeta {
@@ -290,6 +292,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_INVALID_TRUST_POLICY,
         category: category::SETTINGS_CONFIG,
         description: "A `trustPolicyExclude` entry was malformed and skipped.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION,
+        category: category::SETTINGS_CONFIG,
+        description: "A bundled package-extension entry was malformed and skipped.",
         exit_code: None,
     },
     CodeMeta {

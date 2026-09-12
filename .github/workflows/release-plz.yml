@@ -10,6 +10,7 @@ permissions:
   contents: read
 
 env:
+  MBX_DISABLE: "1"
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -21,7 +22,8 @@ jobs:
   # no-op.
   release-plz-release:
     name: release-plz release
-    runs-on: namespace-profile-endev-linux-amd64;overrides.cache-tag=aube-rust-linux
+    # Release and release-PR jobs must never restore or save persistent caches.
+    runs-on: ubuntu-latest
     # Two commits landing on main in quick succession must not double-publish.
     concurrency:
       group: release-plz-release-${{ github.ref }}
@@ -127,6 +129,9 @@ jobs:
       AUBE_GH_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
       CERTIFICATES_P12: ${{ secrets.CERTIFICATES_P12 }}
       CERTIFICATES_P12_PASS: ${{ secrets.CERTIFICATES_P12_PASS }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
   # Build + codesign the C ABI libraries and attach them (plus aube.h)
   # to the draft release. Must complete before `publish-release`:
@@ -153,22 +158,48 @@ jobs:
       CERTIFICATES_P12: ${{ secrets.CERTIFICATES_P12 }}
       CERTIFICATES_P12_PASS: ${{ secrets.CERTIFICATES_P12_PASS }}
 
+  # The packslip is this release's signed inventory: every CLI archive's
+  # digest, the executables inside it, and the workflow identity that signed
+  # for all of it, so an installer can check a download against
+  # github.com/jdx/aube's identity rather than a key this project would have
+  # to hold. `upload-assets` already attests each archive's build provenance
+  # with actions/attest-build-provenance, so `attest: link` only links those
+  # statements instead of attesting a second time. The FFI libraries stay out
+  # — nothing installs a binary directly from them the way it does from these
+  # archives. See https://packslip.dev.
+  packslip:
+    name: Publish the packslip
+    needs: [release-plz-release, upload-assets]
+    if: ${{ needs.release-plz-release.outputs.tag != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: jdx/packslip@a0d434ad57571c62dbd0ab5095b4eff607a71fd3 # v1.1.1
+        with:
+          tag: ${{ needs.release-plz-release.outputs.tag }}
+          download: aube-*.tar.gz aube-*.zip
+          bin: aube aubr aubx
+          attest: link
+          token: ${{ secrets.AUBE_GH_TOKEN }}
+
   # Flip the draft release to non-draft once *every* asset uploaded
-  # cleanly. With immutable GitHub releases enabled, a published
-  # release can't have its assets replaced — so if any matrix target
-  # failed, we leave the draft in place rather than ship a release
-  # with missing platform binaries (downstream npm / COPR / PPA jobs
-  # would also fail trying to fetch the holes). To recover: manually
+  # cleanly and Communiqué has written the final notes. With immutable
+  # GitHub releases enabled, a published release can't have its assets
+  # replaced — so if any matrix target failed, we leave the draft in
+  # place rather than ship a release with missing platform binaries
+  # (downstream npm / COPR / PPA jobs would also fail trying to fetch
+  # the holes). To recover: manually
   # re-run `release.yml` (CLI binaries) or `ffi.yml` (C ABI libraries)
-  # via workflow_dispatch with the tag input, which fills in the
-  # missing assets, then either flip the draft by hand
-  # (`gh release edit $TAG --draft=false`) or workflow_dispatch the
-  # whole release-plz workflow again so this job runs.
+  # via workflow_dispatch with the tag input, which fills in the missing
+  # assets, then retry the failed jobs here. A manual publish should only
+  # happen after confirming the Communiqué notes are present too.
   publish-release:
     name: Publish release
-    needs: [release-plz-release, upload-assets, upload-ffi-assets]
+    needs: [release-plz-release, upload-assets, upload-ffi-assets, enhance-release, packslip]
     if: ${{ needs.release-plz-release.outputs.tag != '' }}
-    runs-on: namespace-profile-endev-linux-amd64
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -184,9 +215,9 @@ jobs:
   # the broken release-note generation is visible and actionable.
   enhance-release:
     name: Enhance release notes
-    needs: [release-plz-release, publish-release]
+    needs: release-plz-release
     if: ${{ needs.release-plz-release.outputs.tag != '' }}
-    runs-on: namespace-profile-endev-linux-amd64
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -195,9 +226,10 @@ jobs:
           ref: refs/tags/${{ needs.release-plz-release.outputs.tag }}
           submodules: recursive
           persist-credentials: false
-      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           install_args: communique
+          cache: false
       - name: Enhance GitHub release with communique
         env:
           GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
@@ -227,9 +259,9 @@ jobs:
 
           ## 💚 Sponsor aube
 
-          aube is maintained by [@jdx](https://github.com/jdx), an open source developer for [**entire.io**](https://entire.io), the title sponsor of the [jdx.dev](https://jdx.dev) open source tools including [mise](https://mise.jdx.dev/). Work on aube is funded by sponsors.
+          aube is built and maintained by [@jdx](https://github.com/jdx), an open source developer at [**entire.io**](https://entire.io/), the title sponsor of his open source work.
 
-          If aube is saving your team install time or CI minutes, please consider [sponsoring at jdx.dev](https://jdx.dev/sponsors.html). Individual and company sponsorships are what keep the project fast, free, and independent.
+          If aube saves your team install time or CI minutes, please consider becoming an [individual or company sponsor](https://jdx.dev/sponsors.html). Your support funds ongoing development and helps keep aube fast, free, and independent.
           EOF
           } > /tmp/release-notes.md
           gh release edit "$TAG" --notes-file /tmp/release-notes.md
@@ -249,7 +281,7 @@ jobs:
   # an out-of-date `aube.usage.kdl`.
   release-plz-pr:
     name: release-plz PR
-    runs-on: namespace-profile-endev-linux-amd64;overrides.cache-tag=aube-rust-linux
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
@@ -268,12 +300,29 @@ jobs:
       # of silently re-resolving `"latest"` pins and rewriting mise.lock.
       # release-plz refuses to run against a dirty tree, and intentional
       # lockfile bumps should land via their own PR.
-      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          cache: false
         env:
           MISE_LOCKED: "1"
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
         with:
           tool: release-plz
+      # `release-plz update` shells out to `cargo package` inside temp
+      # checkouts of the commits it diffs against the published crates. On
+      # PATH `cargo` is mise's command wrapper, which mise.toml routes to mbx
+      # — and in those checkouts mise reads *that commit's* mise.toml, so it
+      # looks for the mbx version pinned back then, which was never installed
+      # on this runner. cargo then dies with "mbx" couldn't exec process and
+      # release-plz fails with "failed to determine next versions". Put the
+      # real cargo ahead of the wrapper. Steps that go through `mise run` keep
+      # using mbx: mise prepends its own wrapper dir there.
+      - name: Put the real cargo ahead of the mbx wrapper
+        run: |
+          # Rust is managed by rustup, not mise. Keep the lookup separate so
+          # a failure stops this step instead of being masked by dirname.
+          cargo_path=$(rustup which cargo)
+          dirname "$cargo_path" >> "$GITHUB_PATH"
       - name: Configure git identity
         run: |
           git config user.name "release-plz[bot]"

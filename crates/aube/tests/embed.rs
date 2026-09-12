@@ -270,7 +270,7 @@ async fn facade_warm_install_registers_the_host_virtual_store() {
     assert!(std::fs::read_dir(projects_dir).unwrap().next().is_some());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[tokio::test]
 async fn facade_install_preserves_non_utf8_storage_paths() {
     use std::os::unix::ffi::OsStringExt;

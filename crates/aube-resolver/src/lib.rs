@@ -35,7 +35,8 @@ pub use primer::{
 pub use semver_util::{PickResult, pick_version_for_add};
 pub use trust::{
     MissingTimeDetails as MissingTrustTimeDetails, PriorTrustEvidence, TrustCheckError,
-    TrustDowngradeDetails, check_no_downgrade, evidence_for, strongest_prior_evidence,
+    TrustDowngradeDetails, check_no_downgrade, check_no_downgrade_history, evidence_for,
+    strongest_prior_evidence,
 };
 pub use trust::{PackageVersionPolicy, TrustEvidence, TrustExcludeParseError, TrustExcludeRules};
 pub use types::{
@@ -111,13 +112,11 @@ pub struct Resolver {
     /// map). Defaults to the sibling `packuments-full-v1/` directory
     /// next to `packument_cache_dir`.
     packument_full_cache_dir: Option<std::path::PathBuf>,
-    /// When true (pnpm's default), a package's declared `peerDependencies`
-    /// are enqueued like regular transitives and — if not already
-    /// satisfied by the importer — hoisted to the importer's direct deps.
-    /// When false, peers neither get auto-installed as transitives nor
-    /// hoisted; unmet peers still surface as warnings via
-    /// `detect_unmet_peers`, but the user is on the hook for adding them
-    /// explicitly to `package.json`.
+    /// When true (pnpm's default), required `peerDependencies` are enqueued
+    /// during resolution. An importer's own peers become direct dependencies;
+    /// dependency peers remain contextual to the packages that require them.
+    /// When false, peers are not auto-installed and unmet dependency peers
+    /// still surface through `detect_unmet_peers`.
     auto_install_peers: bool,
     /// pnpm's `exclude-links-from-lockfile`. Round-tripped through the
     /// lockfile's `settings:` header; when true, the pnpm writer omits

@@ -2,7 +2,7 @@
 // (src/lib.rs) so the command layer can also be embedded as a library.
 // What belongs here is binary-level / aube-specific policy the library
 // must not impose on embedders: the global-allocator choice, the `main`
-// that forwards to `aube::cli_main`, and the aube-specific `usage`
+// that forwards to `aube::standalone_main`, and the aube-specific `usage`
 // (usage.jdx.dev KDL) command, which is aube's own tooling rather than
 // part of the embeddable command layer. The `aubr` / `aubx` multicall
 // shims `include!` this file, so all three bins stay byte-identical in
@@ -29,16 +29,15 @@ fn main() {
     // `mise render` and the CLI docs build). It's aube-specific tooling, not
     // part of the embeddable command layer — a downstream embedder ships its
     // own top-level usage/completions — so it's intercepted here in the binary
-    // before `cli_main` rather than carried as a subcommand in the lib. Only
+    // before `standalone_main` rather than carried as a subcommand in the lib. Only
     // the standalone `aube` invocation reaches it: multicall shims rewrite
     // argv before clap, so their `usage` tokens belong to the wrapped tool.
-    // The binary owns the single `std::process::exit`: `cli_main` returns the
-    // code so the library stays embed-safe (a host driving it in-process is
-    // never hard-killed), and the standalone binary terminates with it here.
+    // Standalone execution may replace the process for `aubr` scripts;
+    // otherwise the binary exits with the returned code.
     let code = if is_usage_invocation() {
         print_usage_spec(embedder)
     } else {
-        aube::cli_main(embedder)
+        aube::standalone_main()
     };
     std::process::exit(code);
 }
