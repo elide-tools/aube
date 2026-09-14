@@ -85,8 +85,11 @@ impl InstallOptions {
         let mut options = Self::new(project_dir.clone());
         options.frozen_mode =
             FrozenMode::from_override(None, aube_settings::resolved::prefer_frozen_lockfile(&ctx));
+        let mut startup = crate::startup::load_startup_settings_at(&project_dir);
+        // Hosts own their executable; strict checks cannot rely on CLI self-switching.
+        startup.manage_package_manager_versions = false;
         crate::startup::enforce_package_manager_guardrails_at(
-            &crate::startup::load_startup_settings_at(&project_dir),
+            &startup,
             &project_dir,
             crate::startup::PackageManagerGuardMode::Error,
         )?;

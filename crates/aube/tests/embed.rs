@@ -610,3 +610,20 @@ fn project_settings_preserve_lockfile_and_package_manager_policy() {
     .unwrap();
     assert!(InstallOptions::from_project_settings(project.path()).is_err());
 }
+
+#[test]
+fn host_version_constraints_do_not_depend_on_cli_self_switching() {
+    initialize_test_host();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","packageManager":"testhost@2.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "package-manager-strict-version=true\nmanage-package-manager-versions=true\n",
+    )
+    .unwrap();
+    assert!(InstallOptions::from_project_settings(project.path()).is_err());
+}
