@@ -986,7 +986,8 @@ mod tests {
         std::fs::create_dir_all(&bin_dir).unwrap();
         let hidden_modules = tmp.path().join("node_modules/.aube/node_modules");
         std::fs::create_dir_all(&hidden_modules).unwrap();
-        let target = std::path::Path::new("/bin/echo");
+        // Some echo implementations reject a caller-supplied argv[0].
+        let target = std::path::Path::new("/bin/sh");
         aube_linker::create_bin_shim(
             &bin_dir,
             "native-echo",
@@ -1004,7 +1005,10 @@ mod tests {
             tmp.path(),
             &shim,
             "native-echo",
-            &["launched-directly".to_string()],
+            &[
+                "-c".to_string(),
+                "printf '%s\\n' launched-directly".to_string(),
+            ],
             &[],
             false,
         );
