@@ -118,11 +118,15 @@ pub(crate) fn startup_cwd(cli: &Cli) -> miette::Result<PathBuf> {
 
 pub(crate) fn load_startup_settings() -> miette::Result<StartupSettings> {
     let cwd = std::env::current_dir().into_diagnostic()?;
-    let files = crate::commands::FileSources::load(&cwd);
+    Ok(load_startup_settings_at(&cwd))
+}
+
+pub(crate) fn load_startup_settings_at(cwd: &std::path::Path) -> StartupSettings {
+    let files = crate::commands::FileSources::load(cwd);
     let empty_ws = std::collections::BTreeMap::new();
     let env = aube_settings::values::capture_env();
     let ctx = files.ctx(&empty_ws, &env, &[]);
-    Ok(StartupSettings {
+    StartupSettings {
         loglevel: aube_settings::values::string_from_env("loglevel", &env)
             .or_else(|| {
                 aube_settings::values::string_from_npmrc("loglevel", &files.project_aube_config)
@@ -139,7 +143,7 @@ pub(crate) fn load_startup_settings() -> miette::Result<StartupSettings> {
         package_manager_strict_version: aube_settings::resolved::package_manager_strict_version(
             &ctx,
         ),
-    })
+    }
 }
 
 pub(crate) fn resolve_loglevel(cli: &Cli, configured: Option<&str>) -> LogLevel {
@@ -345,14 +349,22 @@ pub(crate) fn enforce_package_manager_guardrails(
     settings: &StartupSettings,
     command: Option<&Commands>,
 ) -> miette::Result<PackageManagerGuard> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    enforce_package_manager_guardrails_at(settings, &cwd, package_manager_guard_mode(command))
+}
+
+pub(crate) fn enforce_package_manager_guardrails_at(
+    settings: &StartupSettings,
+    cwd: &std::path::Path,
+    mode: PackageManagerGuardMode,
+) -> miette::Result<PackageManagerGuard> {
     if settings.package_manager_strict == PackageManagerStrictMode::Off {
         return Ok(PackageManagerGuard::Ok);
     }
 
-    let cwd = std::env::current_dir().into_diagnostic()?;
-    let Some(root) = crate::dirs::find_workspace_root(&cwd)
+    let Some(root) = crate::dirs::find_workspace_root(cwd)
         .filter(|root| root.join("package.json").is_file())
-        .or_else(|| crate::dirs::find_project_root(&cwd))
+        .or_else(|| crate::dirs::find_project_root(cwd))
     else {
         return Ok(PackageManagerGuard::Ok);
     };
@@ -406,7 +418,7 @@ pub(crate) fn enforce_package_manager_guardrails(
         let other = name;
         {
             let mode = match settings.package_manager_strict {
-                PackageManagerStrictMode::Error => package_manager_guard_mode(command),
+                PackageManagerStrictMode::Error => mode,
                 _ => PackageManagerGuardMode::WarnAndSkipAutoInstall,
             };
             match mode {

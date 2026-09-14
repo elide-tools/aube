@@ -200,6 +200,7 @@ async fn facade_install_accepts_host_storage_overrides() {
             use_global_virtual_store: Some(false),
             cache_dir: Some(host_cache.clone()),
             store_dir: Some(host_store.clone()),
+            ..Default::default()
         },
     )
     .await
@@ -220,6 +221,7 @@ async fn facade_install_accepts_host_storage_overrides() {
             use_global_virtual_store: Some(false),
             cache_dir: Some(host_cache),
             store_dir: Some(replacement_store),
+            ..Default::default()
         },
     )
     .await
@@ -245,6 +247,7 @@ async fn facade_warm_install_registers_the_host_virtual_store() {
         use_global_virtual_store: Some(true),
         cache_dir: Some(host_cache.clone()),
         store_dir: Some(host_store),
+        ..Default::default()
     };
 
     let mut options = InstallOptions::new(project.path());
@@ -301,6 +304,7 @@ async fn facade_install_preserves_non_utf8_storage_paths() {
             use_global_virtual_store: Some(false),
             cache_dir: Some(host_cache.clone()),
             store_dir: Some(host_store.clone()),
+            ..Default::default()
         },
     )
     .await
@@ -358,6 +362,7 @@ async fn facade_add_honors_host_storage_and_materialization_overrides() {
             use_global_virtual_store: Some(false),
             cache_dir: Some(host_cache.clone()),
             store_dir: Some(host_store.clone()),
+            ..Default::default()
         },
     )
     .await
@@ -521,4 +526,87 @@ fn facade_discovers_confined_workspace_packages() {
                 .unwrap(),
         ]
     );
+}
+
+#[tokio::test]
+async fn facade_install_keeps_layout_overrides_across_fresh_installs() {
+    initialize_test_host();
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("app");
+    let dependency = root.path().join("dependency");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&dependency).unwrap();
+    std::fs::write(
+        dependency.join("package.json"),
+        r#"{"name":"local","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(dependency.join("index.js"), "module.exports = 42;\n").unwrap();
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"app","dependencies":{"local":"file:../dependency"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".npmrc"),
+        "modules-dir=wrong-modules\nlockfile-dir=wrong-locks\n",
+    )
+    .unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    for _ in 0..2 {
+        let mut options = InstallOptions::from_project_settings(&project).unwrap();
+        options.ignore_scripts = true;
+        options.force = true;
+        options.frozen_mode = aube::embed::FrozenMode::No;
+        options.control = InstallControl::silent();
+        aube::embed::install_with_overrides(
+            options,
+            aube::embed::EmbedderInstallOverrides {
+                modules_dir: Some("vendor".into()),
+                lockfile_dir: Some("locks".into()),
+                use_global_virtual_store: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("vendor/local/index.js")).unwrap(),
+            "module.exports = 42;\n"
+        );
+        assert!(project.join("locks/testhost-lock.yaml").is_file());
+        assert!(!project.join("wrong-modules").exists());
+        assert!(!project.join("wrong-locks").exists());
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+    }
+}
+
+#[test]
+fn project_settings_preserve_lockfile_and_package_manager_policy() {
+    initialize_test_host();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "prefer-frozen-lockfile=false\n",
+    )
+    .unwrap();
+    assert_eq!(
+        InstallOptions::from_project_settings(project.path())
+            .unwrap()
+            .frozen_mode,
+        aube::embed::FrozenMode::No
+    );
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"app","packageManager":"unsupported@1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "package-manager-strict=error\n",
+    )
+    .unwrap();
+    assert!(InstallOptions::from_project_settings(project.path()).is_err());
 }

@@ -66,6 +66,34 @@ pub struct InstallOptions {
 }
 
 impl InstallOptions {
+    /// Construct a single-project install using its lockfile settings and CI policy.
+    ///
+    /// This validates package-manager constraints without changing the process cwd
+    /// or switching the embedding host's executable.
+    ///
+    /// # Errors
+    /// Returns an error for invalid project configuration or package-manager constraints.
+    pub fn from_project_settings(project_dir: impl Into<PathBuf>) -> Result<Self> {
+        use miette::{Context, IntoDiagnostic};
+        let project_dir = project_dir.into();
+        let files = crate::commands::FileSources::load(&project_dir);
+        let raw = aube_manifest::workspace::load_raw(&project_dir)
+            .into_diagnostic()
+            .wrap_err("failed to load workspace config")?;
+        let env = aube_settings::values::capture_env();
+        let ctx = files.ctx(&raw, &env, &[]);
+        let mut options = Self::new(project_dir.clone());
+        options.frozen_mode =
+            FrozenMode::from_override(None, aube_settings::resolved::prefer_frozen_lockfile(&ctx));
+        crate::startup::enforce_package_manager_guardrails_at(
+            &crate::startup::load_startup_settings_at(&project_dir),
+            &project_dir,
+            crate::startup::PackageManagerGuardMode::Error,
+        )?;
+        crate::startup::raise_nofile_limit();
+        Ok(options)
+    }
+
     /// Construct an install with normal non-CI lockfile behavior.
     pub fn new(project_dir: impl Into<PathBuf>) -> Self {
         Self {

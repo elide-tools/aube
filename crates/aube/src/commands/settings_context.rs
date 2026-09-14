@@ -103,6 +103,9 @@ pub(crate) fn skip_auto_install_on_package_manager_mismatch() -> bool {
 }
 
 pub(crate) fn registry_override() -> Option<String> {
+    if let Ok(Some(url)) = EMBEDDER_INSTALL_OVERRIDES.try_with(|o| o.registry.clone()) {
+        return Some(aube_registry::config::normalize_registry_url_pub(&url));
+    }
     REGISTRY_OVERRIDE
         .read()
         .expect("registry lock poisoned")
@@ -383,7 +386,10 @@ pub(crate) fn with_settings_ctx_and_cli<T>(
     // builds a ResolveCtx (the typical path hits this 5+ times per
     // `aube run`).
     let env = aube_settings::values::process_env();
-    let ctx = files.ctx(&raw_workspace, env, cli);
+    let mut scoped_cli = Vec::new();
+    let _ = EMBEDDER_INSTALL_OVERRIDES.try_with(|o| o.append_to(&mut scoped_cli));
+    scoped_cli.extend_from_slice(cli);
+    let ctx = files.ctx(&raw_workspace, env, &scoped_cli);
     f(&ctx)
 }
 
@@ -838,5 +844,30 @@ mod package_manager_mismatch_tests {
     #[test]
     fn skip_auto_install_defaults_off() {
         assert!(!skip_auto_install_on_package_manager_mismatch());
+    }
+}
+
+#[cfg(test)]
+mod embedder_override_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registry_overrides_are_isolated_between_invocations() {
+        async fn check(url: &str) {
+            scope_embedder_install_overrides(
+                install::EmbedderInstallOverrides {
+                    registry: Some(url.to_string()),
+                    ..Default::default()
+                },
+                async {
+                    tokio::task::yield_now().await;
+                    assert_eq!(registry_override().as_deref(), Some(url));
+                },
+            )
+            .await;
+        }
+        let before = registry_override();
+        tokio::join!(check("https://one.invalid/"), check("https://two.invalid/"));
+        assert_eq!(registry_override(), before);
     }
 }

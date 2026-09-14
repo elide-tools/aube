@@ -340,10 +340,25 @@ pub struct EmbedderInstallOverrides {
     pub cache_dir: Option<std::path::PathBuf>,
     /// Root of the content-addressable package store.
     pub store_dir: Option<std::path::PathBuf>,
+    /// Registry URL for this invocation, ahead of project and user config.
+    pub registry: Option<String>,
+    /// Lockfile directory; relative paths resolve against the project directory.
+    pub lockfile_dir: Option<String>,
+    /// Modules directory; relative paths resolve against the project directory.
+    pub modules_dir: Option<String>,
 }
 
 impl EmbedderInstallOverrides {
     pub(crate) fn append_to(&self, settings: &mut Vec<(String, String)>) {
+        for (name, value) in [
+            ("registry", &self.registry),
+            ("lockfileDir", &self.lockfile_dir),
+            ("modulesDir", &self.modules_dir),
+        ] {
+            if let Some(value) = value {
+                settings.push((name.to_string(), value.clone()));
+            }
+        }
         if let Some(enabled) = self.use_global_virtual_store {
             settings.push(("enableGlobalVirtualStore".to_string(), enabled.to_string()));
         }
@@ -568,6 +583,7 @@ mod embedder_override_tests {
             use_global_virtual_store: Some(false),
             cache_dir: Some(cache_dir.clone()),
             store_dir: Some(store_dir.clone()),
+            ..Default::default()
         };
         let mut cli = Vec::new();
         overrides.append_to(&mut cli);
