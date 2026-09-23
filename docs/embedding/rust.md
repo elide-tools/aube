@@ -60,6 +60,43 @@ the lowest precedence, so users can still override them through normal aube
 configuration sources. `Host` fields, by contrast, are decisions of the
 embedding application and are not user-configurable.
 
+## Forward aube's private argv
+
+Lifecycle scripts reach back for the tools that ran them, and both paths land
+on `std::env::current_exe()` — your binary, not aube's. Aube writes shims that
+re-enter itself through it, marked with a private first argument. Intercept
+those two before your own argument parser sees them:
+
+```rust
+fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        // `node-gyp` shims: bootstrap aube's cached node-gyp and print its path.
+        Some("__node-gyp-bootstrap") => {
+            let dir = args.get(2).map_or_else(|| ".".into(), std::path::PathBuf::from);
+            match runtime.block_on(embed::bootstrap_node_gyp(&dir)) {
+                Ok(path) => println!("{}", path.display()),
+                Err(err) => { eprintln!("{err:?}"); return 1.into(); }
+            }
+            return 0.into();
+        }
+        // `npm_execpath`: a package script re-invoking its package manager.
+        Some(embed::CLI_TRAMPOLINE_ARG) => return (aube::cli_main(&HOST) as u8).into(),
+        _ => {}
+    }
+    // ... your own CLI
+}
+```
+
+`cli_main` strips the `__aube-cli` token itself, so forward the argv unchanged.
+
+Dispatch both. The shims fall back to a `node-gyp` on `PATH` only when
+`AUBE_NODE_GYP_EXE` is *absent*, and aube always sets it — so a host that
+exports the shims without answering `__node-gyp-bootstrap` turns a native-addon
+build into a hard failure rather than a fallback. Skipping `__aube-cli` is
+milder but the same shape: a package that runs `${npm_execpath} run verify`
+lands in your CLI, which is the misrouting the token exists to prevent.
+
 ## Install a project
 
 Always select the project directory explicitly. `InstallControl::silent()` is
@@ -243,3 +280,48 @@ messages and rendered diagnostics may evolve.
 `aube_resolver::ResolutionMode` includes `LowestDirect` and is
 `#[non_exhaustive]`. Downstream matches need a wildcard arm so future
 resolution modes can be added without another source-breaking enum change.
+
+## Binding installed commands to Node
+
+An embedding tool manager can make installed Node CLIs independent of the
+caller's selected Node with `EmbedderRuntime::bind_bins_to`:
+
+```rust
+use aube::embed::{EmbedderInstallOverrides, EmbedderRuntime, InstallOptions};
+
+let mut options = InstallOptions::new("/tools/my-cli");
+// Use the same runtime for approved install scripts and native-addon builds.
+options.runtime = Some(
+    EmbedderRuntime::selector("/runtimes/node/25/bin")
+        .bind_bins_to("/runtimes/node/25/bin/node"),
+);
+let overrides = EmbedderInstallOverrides {
+    use_global_virtual_store: Some(false),
+    ..Default::default()
+};
+aube::embed::install_with_overrides(options, overrides).await?;
+```
+
+The same runtime builder works with `AddToProjectOptions::runtime`. Node-backed commands invoke
+that executable directly; their inherited `PATH` is unchanged. Commands they
+spawn through `PATH` can therefore use the project's Node, while internal
+workers using `process.execPath` use the application's Node. Native executables
+and scripts using other interpreters keep their existing launch behavior.
+
+The executable path must be absolute UTF-8 without NUL or newlines. Aube keeps
+it as written rather than resolving symlinks: `/runtimes/node/25/bin/node` can
+follow a host-managed major-version symlink. A missing executable fails instead
+of silently falling back to Node on `PATH`. Changing or removing the binding
+regenerates launchers on the next install, including frozen installs.
+
+Runtime-bound installs disable the global virtual store, even if enabled in
+settings or overrides, so their launchers cannot retarget another project's
+commands. Package contents can still share the content-addressable store.
+
+The host owns runtime selection, installation, compatibility, retention, and
+lockfile policy. Use an exact runtime path for reproducible pins; moving a
+symlink can require rebuilding native addons. This API does not enable automatic
+runtime binding for standalone aube installs. It provides the launcher support
+for a host such as mise to do so. Simple Node shebang flags are preserved;
+quoted shebang arguments and environment assignments currently produce an error
+when binding.

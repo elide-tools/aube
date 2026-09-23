@@ -43,6 +43,13 @@ pub trait ScriptOutputReporter: Send + Sync + 'static {
     fn report(&self, stream: ScriptOutputStream, line: String);
 }
 
+/// Env var naming the executable that can dispatch aube's CLI — the running
+/// program, whether that is aube itself or a host that embedded it. Aube's
+/// `npm_execpath` shim reads it rather than baking a path into the cached
+/// file, so a host that moves or upgrades keeps working. Set on every
+/// lifecycle script, exactly like `AUBE_NODE_GYP_EXE`.
+pub const CLI_EXE_ENV: &str = "AUBE_CLI_EXE";
+
 /// Settings that affect every package-script shell aube spawns.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptSettings {
@@ -161,6 +168,9 @@ struct ScriptSettingsState {
     settings: ScriptSettings,
     node_bin_dir_precedes_project_bins: bool,
     output_reporter: Option<std::sync::Arc<dyn ScriptOutputReporter>>,
+    /// The npm-compatible executable exported as `npm_execpath`. See
+    /// [`set_pm_execpath`].
+    pm_execpath: Option<PathBuf>,
 }
 
 static SCRIPT_SETTINGS: std::sync::OnceLock<std::sync::RwLock<ScriptSettingsState>> =
@@ -257,6 +267,30 @@ pub fn set_output_reporter(reporter: Option<std::sync::Arc<dyn ScriptOutputRepor
     match script_settings_lock().write() {
         Ok(mut guard) => guard.output_reporter = reporter,
         Err(poisoned) => poisoned.into_inner().output_reporter = reporter,
+    }
+}
+
+/// Register the npm-compatible executable exported as `npm_execpath` — what
+/// a lifecycle script re-invokes to reach *this* package manager
+/// (`${npm_execpath} run build`).
+///
+/// Unset (the default) names aube's own binary when aube is the running
+/// program, and leaves `npm_execpath` unset under an embedder: the running
+/// executable is then the host's, and its CLI is not aube's. Pass a shim that
+/// re-enters aube to restore the variable there.
+pub fn set_pm_execpath(path: Option<PathBuf>) {
+    if INSTALL_SCRIPT_SETTINGS
+        .try_with(|slot| match slot.write() {
+            Ok(mut guard) => guard.pm_execpath = path.clone(),
+            Err(poisoned) => poisoned.into_inner().pm_execpath = path.clone(),
+        })
+        .is_ok()
+    {
+        return;
+    }
+    match script_settings_lock().write() {
+        Ok(mut guard) => guard.pm_execpath = path,
+        Err(poisoned) => poisoned.into_inner().pm_execpath = path,
     }
 }
 
@@ -757,6 +791,21 @@ fn node_arch() -> &'static str {
     }
 }
 
+/// Resolve `npm_execpath` from the three inputs that decide it: the
+/// registered override ([`set_pm_execpath`]), whether a host embeds aube, and
+/// this process's own executable.
+///
+/// A host's override always wins. Failing that, only a standalone aube can
+/// name itself — embedded, the running executable answers to the host's CLI,
+/// so there is nothing to name and the variable stays unset.
+fn pm_execpath_for(
+    registered: Option<PathBuf>,
+    embedded: bool,
+    aube_exe: Option<PathBuf>,
+) -> Option<PathBuf> {
+    registered.or_else(|| (!embedded).then_some(aube_exe).flatten())
+}
+
 fn apply_script_settings_env(cmd: &mut tokio::process::Command, settings: &ScriptSettings) {
     // Strip credentials that aube itself owns before we spawn any
     // lifecycle script. AUBE_AUTH_TOKEN is aube's own registry login
@@ -772,12 +821,41 @@ fn apply_script_settings_env(cmd: &mut tokio::process::Command, settings: &Scrip
     cmd.env("npm_config_user_agent", aube_user_agent());
     // `npm_execpath`: the package-manager binary that drove the script.
     // Tools (and pnpm's own `$npm_execpath run …` postinstalls) read it
-    // to re-invoke the *same* PM. `current_exe()` is the aube binary;
-    // ignore the rare resolution failure rather than abort the script.
-    // Reused below for `AUBE_NODE_GYP_EXE` (same binary), so resolve once.
+    // to re-invoke the *same* PM. Standalone, that is `current_exe()` —
+    // the aube binary; ignore the rare resolution failure rather than
+    // abort the script. Embedded, `current_exe()` is the *host* binary,
+    // whose CLI is its own, so a `${npm_execpath} run …` would land in
+    // the host's command surface: the caller supplies a shim that
+    // re-enters aube instead, and `None` leaves the variable unset (no
+    // reachable aube CLI) rather than naming a program that would
+    // misparse the command. `current_exe()` is still resolved here for
+    // `AUBE_CLI_EXE` / `AUBE_NODE_GYP_EXE`, so resolve it once.
+    //
+    // The removal is unconditional and comes first: a non-jailed spawn
+    // inherits this process's environment, so an aube running inside
+    // someone else's npm lifecycle would otherwise pass that outer
+    // manager's `npm_execpath` straight through to its own scripts — a
+    // stale path aube never chose, exactly where "unset" is the answer.
     let aube_exe = std::env::current_exe().ok();
+    let pm_execpath = pm_execpath_for(
+        script_settings_state().pm_execpath,
+        aube_util::is_embedded(),
+        aube_exe.clone(),
+    );
+    cmd.env_remove("npm_execpath");
+    if let Some(execpath) = pm_execpath.as_deref() {
+        cmd.env("npm_execpath", execpath);
+    }
+    // `AUBE_CLI_EXE`: the executable that dispatches aube's CLI behind the
+    // private `__aube-cli` argv token — the running program, whether that
+    // is aube itself or an embedding host. The `npm_execpath` shim above
+    // reads it instead of baking a path into the cached file. Cleared
+    // first for the same reason as `npm_execpath`: should `current_exe()`
+    // fail, an inherited value would point the shim at whatever binary
+    // ran somewhere further up, not at this process.
+    cmd.env_remove(CLI_EXE_ENV);
     if let Some(exe) = aube_exe.as_deref() {
-        cmd.env("npm_execpath", exe);
+        cmd.env(CLI_EXE_ENV, exe);
     }
     // `npm_node_execpath` / `NODE`: the node binaries scripts should use
     // — the switched runtime's node, or the ambient `node` on PATH. `NODE`
@@ -1535,6 +1613,10 @@ pub fn has_dep_lifecycle_work(package_dir: &Path, manifest: &PackageJson) -> boo
 /// driver writes shims there via `link_dep_bins`; `rebuild` mirrors
 /// the same pass.
 ///
+/// `<package_dir>/node_modules/.bin` is prepended ahead of it, for the
+/// dependencies that live inside the package itself: bundled deps, and
+/// under `nodeLinker=hoisted` any dep a version conflict nested there.
+///
 /// For the `install` hook specifically, if the manifest leaves both
 /// `install` and `preinstall` empty but the package has a top-level
 /// `binding.gyp`, this falls back to running `node-gyp rebuild` — the
@@ -1571,8 +1653,25 @@ pub async fn run_dep_hook(
             _ => return Ok(false),
         },
     };
+    // Most-local-first, the way Node resolves and `@npmcli/run-script`
+    // builds `PATH`: the package's *own* nested `node_modules/.bin`,
+    // then the `.bin` of the directory the package sits in.
+    //
+    // The nested one matters under `nodeLinker=hoisted`. A version
+    // conflict places the losing copy at
+    // `<requester>/node_modules/<dep>`, so its bin is written to
+    // `<requester>/node_modules/.bin` — one level *below* the `.bin`
+    // that holds the requester's siblings. Without this entry the
+    // requester's own install script couldn't see the dependency it
+    // forced to nest. Nested `node_modules` is always literally
+    // `node_modules` (Node looks for nothing else), so `modules_dir`
+    // doesn't apply here.
+    let nested_bin_dir = package_dir.join("node_modules").join(".bin");
     let dep_bin_dir = dep_modules_dir.join(".bin");
-    let mut bin_dirs: Vec<&Path> = Vec::with_capacity(tool_bin_dirs.len() + 1);
+    let mut bin_dirs: Vec<&Path> = Vec::with_capacity(tool_bin_dirs.len() + 2);
+    if nested_bin_dir != dep_bin_dir {
+        bin_dirs.push(&nested_bin_dir);
+    }
     bin_dirs.push(&dep_bin_dir);
     bin_dirs.extend(tool_bin_dirs.iter().copied());
     run_script(
@@ -1683,6 +1782,79 @@ mod spawn_program_tests {
             );
         })
         .await;
+    }
+
+    /// A dep's own nested `node_modules/.bin` must beat the `.bin` of the
+    /// directory the dep sits in. Under `nodeLinker=hoisted` a version
+    /// conflict places the losing copy at `<requester>/node_modules/<dep>`,
+    /// so the requester's install script has to look inside itself first
+    /// — otherwise it silently runs whichever version won the hoist.
+    /// Reproduced with `bcrypt`, whose `install` picked up
+    /// `node-pre-gyp@2` from the root instead of its own `^1.0.5`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dep_hook_prefers_the_packages_own_nested_bin() {
+        // `tempfile` is not a dep of this crate; std::env::temp_dir plus
+        // nanos is enough, matching `aborting_script_kills_grandchildren`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aube-test-nested-bin-{nanos}"));
+        let root = root.as_path();
+        let package_dir = root.join("node_modules/requester");
+        let marker = root.join("which-ran.txt");
+
+        // Sibling `.bin` (the hoist winner) and the requester's own nested
+        // `.bin` (the copy it actually declares) both offer `tool`.
+        for (bin_dir, tag) in [
+            (root.join("node_modules/.bin"), "sibling"),
+            (package_dir.join("node_modules/.bin"), "nested"),
+        ] {
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let tool = bin_dir.join("tool");
+            std::fs::write(
+                &tool,
+                format!("#!/bin/sh\nprintf {tag} > \"{}\"\n", marker.display()),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&tool, perms).unwrap();
+        }
+
+        let mut scripts = std::collections::BTreeMap::new();
+        scripts.insert("postinstall".to_string(), "tool".to_string());
+        let manifest = PackageJson {
+            name: Some("requester".to_string()),
+            version: Some("1.0.0".to_string()),
+            scripts,
+            ..PackageJson::default()
+        };
+
+        let ran = run_dep_hook(
+            &package_dir,
+            // What `dep_modules_dir_for` yields for this package: the
+            // `node_modules/` the package itself sits in.
+            &root.join("node_modules"),
+            root,
+            "node_modules",
+            &manifest,
+            LifecycleHook::PostInstall,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let which_ran = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(ran, "postinstall is defined, so it should have run");
+        assert_eq!(
+            which_ran.unwrap(),
+            "nested",
+            "the package's own nested `.bin` must win over its siblings'"
+        );
     }
 
     #[cfg(unix)]
@@ -1873,6 +2045,61 @@ mod jail_tests {
         // Node ignores the proxy vars unless this flag is set (Node 24+);
         // it must be the plain env var, not `--use-env-proxy`.
         assert_eq!(env("NODE_USE_ENV_PROXY").as_deref(), Some("1"));
+    }
+
+    /// Standalone: the running binary *is* the package manager, so a
+    /// script's `${npm_execpath} run …` reaches aube's own CLI.
+    #[test]
+    fn npm_execpath_defaults_to_the_running_binary() {
+        let env = proxy_env(ScriptSettings::default());
+        assert!(!aube_util::is_embedded());
+        assert_eq!(
+            env("npm_execpath").map(PathBuf::from),
+            std::env::current_exe().ok()
+        );
+    }
+
+    /// Embedded, the caller hands over a shim that re-enters aube through
+    /// the host — the host's own binary would parse `run verify-build` as
+    /// one of *its* commands. Set inside an install scope, which is also
+    /// what keeps it out of the sibling tests above.
+    #[tokio::test]
+    async fn pm_execpath_overrides_the_running_binary() {
+        scope(async {
+            set_pm_execpath(Some(PathBuf::from("/cache/aube/tools/pm-exec/aube")));
+            let env = proxy_env(ScriptSettings::default());
+            assert_eq!(
+                env("npm_execpath").as_deref(),
+                Some("/cache/aube/tools/pm-exec/aube")
+            );
+        })
+        .await;
+    }
+
+    /// The decision table `apply_script_settings_env` stamps from. The
+    /// embedded-with-no-override row is the one that cannot be reached from
+    /// a test process (registering a host profile is once-per-process), and
+    /// it is the row that matters: nothing to name means nothing stamped.
+    #[test]
+    fn pm_execpath_resolution_table() {
+        let exe = Some(PathBuf::from("/usr/bin/aube"));
+        let shim = Some(PathBuf::from("/cache/aube/tools/pm-exec/aube"));
+        assert_eq!(pm_execpath_for(None, false, exe.clone()), exe);
+        assert_eq!(pm_execpath_for(None, true, exe.clone()), None);
+        assert_eq!(pm_execpath_for(shim.clone(), true, exe.clone()), shim);
+        assert_eq!(pm_execpath_for(shim.clone(), false, exe), shim);
+        assert_eq!(pm_execpath_for(None, false, None), None);
+    }
+
+    /// The shim resolves the dispatching executable from the environment
+    /// rather than baking it in, so every script has to carry it.
+    #[test]
+    fn cli_exe_is_stamped_for_the_shim() {
+        let env = proxy_env(ScriptSettings::default());
+        assert_eq!(
+            env(CLI_EXE_ENV).map(PathBuf::from),
+            std::env::current_exe().ok()
+        );
     }
 
     #[test]

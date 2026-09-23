@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0](https://github.com/aubepkg/aube/compare/v2.2.17...v2.3.0) - 2026-09-22
+
+### Added
+
+- *(linker)* bind installed CLIs to a host-managed Node runtime ([#1576](https://github.com/aubepkg/aube/pull/1576))
+
+### Fixed
+
+- *(lockfile)* keep patch hashes in aube-lock.yaml on re-resolve ([#1577](https://github.com/aubepkg/aube/pull/1577))
+- *(scripts)* give lifecycle scripts a working npm_execpath when embedded ([#1565](https://github.com/aubepkg/aube/pull/1565))
+- *(dlx)* deliver termination signals to the tool in shell mode ([#1562](https://github.com/aubepkg/aube/pull/1562))
+- *(install)* restore the terminal on Ctrl-C and on panic ([#1560](https://github.com/aubepkg/aube/pull/1560))
+- *(install)* restore terminal state when an install fails ([#1559](https://github.com/aubepkg/aube/pull/1559))
+- *(install)* honor ignoreScripts from env, .npmrc, and workspace yaml ([#1552](https://github.com/aubepkg/aube/pull/1552))
+- *(rebuild)* relink the full bin surface, not just dependency bins ([#1550](https://github.com/aubepkg/aube/pull/1550))
+- *(install)* link transitive dep bins in hoisted node_modules/.bin ([#1548](https://github.com/aubepkg/aube/pull/1548))
+
+## [2.2.17](https://github.com/aubepkg/aube/compare/v2.2.16...v2.2.17) - 2026-09-15
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [2.2.16](https://github.com/aubepkg/aube/compare/v2.2.15...v2.2.16) - 2026-09-13
+
+### Fixed
+
+- *(add)* install local tarballs by manifest name ([#1532](https://github.com/aubepkg/aube/pull/1532))
+
+## [2.2.15](https://github.com/aubepkg/aube/compare/v2.2.14...v2.2.15) - 2026-09-12
+
+### Fixed
+
+- *(add)* distinguish unavailable embedded confirmations ([#1530](https://github.com/aubepkg/aube/pull/1530))
+
 ## [2.2.14](https://github.com/aubepkg/aube/compare/v2.2.13...v2.2.14) - 2026-09-11
 
 ### Fixed

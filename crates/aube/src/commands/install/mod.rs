@@ -37,12 +37,13 @@ pub(crate) use resolve::check_patch_drift;
 use advisory::resolve_osv_routing_settings;
 pub use args::{EmbedderInstallOverrides, InstallArgs, InstallOptions};
 pub(crate) use bin_linking::{
-    LinkDepBinsInput, ManagedBinLinks, PkgJsonCache, dep_modules_dir_for, link_dep_bins,
-    materialized_pkg_dir, remove_managed_bin_links, remove_unclaimed_preserved_bin_links,
+    LinkAllBinsInput, PreservedBinLinks, dep_modules_dir_for, link_all_bins, materialized_pkg_dir,
+    remove_managed_bin_links, remove_unclaimed_preserved_bin_links,
 };
 pub use control::{
     INSTALL_OUTPUT_CODE_LIFECYCLE_SCRIPT, InstallControl, InstallEvent, InstallOutputLevel,
-    InstallOutputMode, InstallPhase, InstallProgressSnapshot, InstallPrompt, InstallPromptFuture,
+    InstallOutputMode, InstallPhase, InstallProgressSnapshot, InstallPrompt, InstallPromptDecision,
+    InstallPromptDecisionFuture, InstallPromptDecisionHandler, InstallPromptFuture,
     InstallPromptHandler, InstallReporter, InstallTaskUnit, set_default_install_control,
 };
 pub use dep_selection::DepSelection;
@@ -97,10 +98,10 @@ use startup::{
     warn_accepted_noop_install_settings,
 };
 use summary::print_already_up_to_date;
+pub(crate) use workspace::{WorkspaceInstallPlan, discover_workspace_plan};
 use workspace::{
-    discover_workspace_plan, filter_graph_to_importers, filter_graph_to_workspace_selection,
-    importer_project_dir, merge_member_lockfile_graphs, per_project_write_selection,
-    write_per_project_lockfiles,
+    filter_graph_to_importers, filter_graph_to_workspace_selection, importer_project_dir,
+    merge_member_lockfile_graphs, per_project_write_selection, write_per_project_lockfiles,
 };
 
 #[cfg(test)]
@@ -304,7 +305,20 @@ async fn run_scoped(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Re
     .await
 }
 
-async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+    // An embedding host (mise, or a wrapper) can describe how Node is
+    // invoked for lifecycle scripts. Seed it into the scoped runtime slot
+    // before `ensure` runs — `ensure` returns early when the slot is set,
+    // so aube skips its own runtime resolution and scripts invoke the
+    // host's Node. A per-call runtime wins over the process-wide one.
+    crate::runtime::seed_install_embedder_runtime(opts.embedder_runtime.as_ref());
+    if let Some(node) = crate::runtime::bin_node_executable() {
+        aube_linker::sys::validate_node_executable(&node).into_diagnostic()?;
+        // Launchers are runtime-specific and must not mutate another project's
+        // dependency bins in the shared global virtual store.
+        opts.cli_flags
+            .push(("enableGlobalVirtualStore".into(), "false".into()));
+    }
     opts.control.check_cancelled()?;
     aube_scripts::set_output_reporter(opts.control.script_output_reporter());
     let mode = opts.mode;
@@ -366,6 +380,17 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
         .into_diagnostic()
         .wrap_err("failed to load workspace config")?;
     let settings_ctx = files.ctx(&raw_workspace, &opts.env_snapshot, &opts.cli_flags);
+    // `ignoreScripts` also resolves from the env / `.npmrc` / workspace-yaml
+    // chain, not just `--ignore-scripts`. Fold it in here, the one choke
+    // point every entry point passes through (`install`, `ci`, `add`,
+    // `remove`, `update`, `dlx`, `deploy`, and the `aube run`
+    // auto-install — that last one has no command line of its own to
+    // carry a flag). `||` rather than assignment: the flag is a clap
+    // `bool` with no negative form, so an explicit `--ignore-scripts` (or
+    // an embedder passing `ignoreScripts: true`) must not be overridden
+    // by a lower-precedence `ignore-scripts=false`.
+    opts.ignore_scripts =
+        opts.ignore_scripts || aube_settings::resolved::ignore_scripts(&settings_ctx);
 
     // Yaml-only workspace roots (`pnpm-workspace.yaml` only, no root
     // `package.json`) install with a synthesized empty manifest so
@@ -401,12 +426,6 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
     let lockfile_parse_options = aube_lockfile::ParseOptions {
         strict_store_integrity: strict_store_integrity_setting,
     };
-    // An embedding host (mise, or a wrapper) can describe how Node is
-    // invoked for lifecycle scripts. Seed it into the scoped runtime slot
-    // before `ensure` runs — `ensure` returns early when the slot is set,
-    // so aube skips its own runtime resolution and scripts invoke the
-    // host's Node. A per-call runtime wins over the process-wide one.
-    crate::runtime::seed_install_embedder_runtime(opts.embedder_runtime.as_ref());
     if !opts.dry_run {
         crate::runtime::ensure(
             &cwd,
@@ -1679,15 +1698,19 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
             ) {
                 graph.overlay_metadata_from(&prior);
             }
-            // A pnpm lockfile's patchedDependencies block describes the
+            // A pnpm-format lockfile's patchedDependencies block describes the
             // resolution that produced that lockfile; it is not authoritative
             // after manifest/workspace drift forced a fresh resolve. Replace
             // the metadata overlaid above with the current declarations so a
             // deleted patch from the stale lockfile is neither read during
-            // materialization nor written back. This also prevents pnpm 11's
-            // hash-only scalar entries from being mistaken for file paths.
-            if matches!(write_kind, aube_lockfile::LockfileKind::Pnpm) {
-                graph.patched_dependencies = crate::patches::read_patched_dependencies(&cwd)?;
+            // materialization nor written back. Values are content hashes
+            // computed against the project root; the linker never reads them
+            // as paths because every key is also a current declaration.
+            if matches!(
+                write_kind,
+                aube_lockfile::LockfileKind::Pnpm | aube_lockfile::LockfileKind::Aube
+            ) {
+                graph.patched_dependencies = crate::patches::read_patched_dependency_hashes(&cwd)?;
             }
             tracing::debug!("Resolved {} packages", graph.packages.len());
             // Seed the chain index for diagnostic enrichment. Any

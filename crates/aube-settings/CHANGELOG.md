@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0](https://github.com/aubepkg/aube/compare/aube-settings-v2.2.17...aube-settings-v2.3.0) - 2026-09-22
+
+### Fixed
+
+- *(install)* honor ignoreScripts from env, .npmrc, and workspace yaml ([#1552](https://github.com/aubepkg/aube/pull/1552))
+
+## [2.2.17](https://github.com/aubepkg/aube/compare/aube-settings-v2.2.16...aube-settings-v2.2.17) - 2026-09-15
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [2.2.15](https://github.com/aubepkg/aube/compare/aube-settings-v2.2.14...aube-settings-v2.2.15) - 2026-09-12
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [2.2.13](https://github.com/aubepkg/aube/compare/aube-settings-v2.2.12...aube-settings-v2.2.13) - 2026-09-09
 
 ### Other

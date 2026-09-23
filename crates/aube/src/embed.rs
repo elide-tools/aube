@@ -6,6 +6,7 @@
 //! projects may run concurrently; operations targeting the same workspace
 //! are serialized by the project lock.
 
+use miette::IntoDiagnostic;
 use std::path::{Path, PathBuf};
 
 pub use crate::commands::add::AddToProjectOptions;
@@ -13,9 +14,11 @@ pub use crate::commands::install::node_gyp_bootstrap::bootstrap_node_gyp;
 pub use crate::commands::install::{
     DepSelection, EmbedderInstallOverrides, FrozenMode, INSTALL_OUTPUT_CODE_LIFECYCLE_SCRIPT,
     InstallControl, InstallEvent, InstallOutputLevel, InstallOutputMode, InstallPhase,
-    InstallProgressSnapshot, InstallPrompt, InstallPromptFuture, InstallPromptHandler,
-    InstallReporter, InstallTaskUnit, set_default_install_control,
+    InstallProgressSnapshot, InstallPrompt, InstallPromptDecision, InstallPromptDecisionFuture,
+    InstallPromptDecisionHandler, InstallPromptFuture, InstallPromptHandler, InstallReporter,
+    InstallTaskUnit, set_default_install_control,
 };
+pub use crate::commands::pm_execpath::CLI_TRAMPOLINE_ARG;
 pub use crate::runtime::{EmbedderRuntime, set_embedder_runtime};
 pub use aube_manifest::{Error as ManifestError, PackageJson, Workspaces};
 pub use aube_registry::NetworkMode;
@@ -185,6 +188,13 @@ pub async fn install_with_overrides(
     // env-driven AUBE_DIAG_* surface here so embedded installs can produce a
     // low-overhead trace without requiring host-specific plumbing.
     aube_util::diag::init();
+    if let Some(node) = options
+        .runtime
+        .as_ref()
+        .and_then(EmbedderRuntime::bin_node_executable)
+    {
+        aube_linker::sys::validate_node_executable(node).into_diagnostic()?;
+    }
     let mut command_options =
         crate::commands::install::InstallOptions::with_mode(options.frozen_mode);
     command_options.project_dir = Some(options.project_dir);
@@ -244,6 +254,13 @@ pub async fn add_with_overrides(
 ) -> Result<()> {
     // See install_with_overrides: embedded adds bypass CLI diagnostic init.
     aube_util::diag::init();
+    if let Some(node) = options
+        .runtime
+        .as_ref()
+        .and_then(EmbedderRuntime::bin_node_executable)
+    {
+        aube_linker::sys::validate_node_executable(node).into_diagnostic()?;
+    }
     let result = crate::commands::scope_embedder_install_overrides(
         overrides.clone(),
         crate::commands::add::add_to_project_with_overrides(

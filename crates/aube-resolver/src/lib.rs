@@ -22,7 +22,7 @@ mod types;
 
 pub use direct_dep_info::{AgeGatedUpdate, DirectDepInfo};
 pub use error::{AgeGateDetails, CatalogDetails, Error, ExoticSubdepDetails, NoMatchDetails};
-pub use local_source::resolve_exec_script_path;
+pub use local_source::{read_local_package_name, resolve_exec_script_path};
 pub use package_ext::is_deprecation_allowed;
 pub use peer_context::{
     PeerContextOptions, UnmetPeer, apply_peer_contexts, detect_unmet_peers,
@@ -34,11 +34,14 @@ pub use primer::{
 };
 pub use semver_util::{PickResult, pick_version_for_add};
 pub use trust::{
+    ExoticSubdepAllowlist, ExoticSubdepAllowlistParseError, PackageVersionPolicy, TrustEvidence,
+    TrustExcludeParseError, TrustExcludeRules,
+};
+pub use trust::{
     MissingTimeDetails as MissingTrustTimeDetails, PriorTrustEvidence, TrustCheckError,
     TrustDowngradeDetails, check_no_downgrade, check_no_downgrade_history, evidence_for,
     strongest_prior_evidence,
 };
-pub use trust::{PackageVersionPolicy, TrustEvidence, TrustExcludeParseError, TrustExcludeRules};
 pub use types::{
     DependencyPolicy, MinimumReleaseAge, PackageExtension, ReadPackageHook, ResolutionMode,
     ResolvedPackage, TrustPolicy,

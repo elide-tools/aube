@@ -1,4 +1,4 @@
-min_version = "2026.8.16"
+min_version = "2026.9.7"
 
 [env]
 _.path = ["./bin"]
@@ -8,8 +8,7 @@ experimental = true
 cargo.binstall_native = true
 
 [tools]
-actionlint = "latest"
-mr-boxington = "1.8.3"
+mr-boxington = "1.14.0"
 usage = "6.6.1"
 communique = "latest"
 "github:bnjbvr/cargo-machete" = "latest"
@@ -48,7 +47,7 @@ run = "hk fix --all --slow"
 # replacement for `cargo clippy --fix` that skips the full re-check compile
 # between fix rounds, so repeated runs are faster. Pinned through mise's cargo
 # backend (the repo's convention for compiled cargo tools, matching
-# cargo-audit/cargo-deny in CI), so a contributor gets it with no manual
+# cargo-deny in CI), so a contributor gets it with no manual
 # install. No `cargo clippy --fix` fallback — cargo-fixit is the only path.
 # Modeled on `cargo fix` 1.89: add `--all-targets` to also fix tests/benches,
 # and `--allow-dirty`/`--allow-staged` to run on a dirty tree.
@@ -143,7 +142,7 @@ run = [
 # because the install benchmark uses --offline, and it is outside the
 # measurement on purpose — nothing tak times ever touches the registry.
 [tasks."perf:build"]
-run = "mbx build --release"
+run = "cargo build --release"
 
 [tasks.perf]
 dir = "{{config_root}}"

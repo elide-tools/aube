@@ -22,7 +22,7 @@ pub mod libc;
 // Convenience re-exports so consumers can reference `aube_util::Embedder`
 // / `aube_util::embedder()` without naming the module.
 pub use identity::{
-    AUBE, Embedder, cmd, command_prefix, command_prefix_display, embedder, prog,
+    AUBE, Embedder, cmd, command_prefix, command_prefix_display, embedder, is_embedded, prog,
     recursive_command_args, set_embedder,
 };
 

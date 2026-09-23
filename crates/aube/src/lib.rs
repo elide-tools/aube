@@ -44,6 +44,7 @@ use startup::{
 #[cfg(test)]
 use startup::{PackageManagerGuardMode, PackageManagerStrictMode, package_manager_guard_mode};
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(usage_rs::Cli)]
@@ -764,12 +765,17 @@ fn cli_main_impl(
     // against `aube_codes::exit::EXIT_TABLE` to pick a bespoke exit code.
     // Codes outside the table fall through to `EXIT_GENERIC` (1).
     //
-    // Chain a panic hook that flushes the diag buffer before the
-    // default hook prints the panic. Without this, a debug-build panic
-    // (release uses `panic = "abort"` so the hook would not run anyway)
-    // would lose the BufWriter's 64 KiB tail and any unflushed events.
+    // Chain a panic hook that puts the terminal back and flushes the diag
+    // buffer before the default hook prints the panic. Without the flush a
+    // panic would lose the BufWriter's 64 KiB tail and any unflushed events;
+    // without the restore it would print over a hidden cursor and leave it
+    // that way. The hook runs under `panic = "abort"` too — abort happens
+    // after the hook — which is the only reason a release build gets either.
+    // Destructors are what abort skips, so the renderer's own teardown can't
+    // be relied on here.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        progress::restore_terminal_now();
         aube_util::diag::flush();
         prev_hook(info);
     }));
@@ -790,6 +796,7 @@ fn cli_main_impl(
     match result {
         Ok(code) => code,
         Err(report) => {
+            restore_terminal_after_failure();
             let rendered = format!("{report:?}");
             // A host that registered an events-mode control owns the output
             // surface; writing straight to stderr would bypass it.
@@ -805,6 +812,26 @@ fn cli_main_impl(
             }
             report_exit_code(&report)
         }
+    }
+}
+
+/// Retire any clx progress display still live on the way out of a failing
+/// command, so the cursor the renderer hid comes back before the diagnostic
+/// lands.
+///
+/// <https://github.com/aubepkg/aube/discussions/1557>
+///
+/// `InstallProgress` tears its own bar down when it drops, which covers the
+/// install pipeline. This is the catch-all for the standalone
+/// `ProgressJobBuilder` jobs elsewhere in the CLI — the Node runtime
+/// download bar has no completion hook on the failure path, for instance.
+/// Gated on an interactive stderr and on a job actually having been
+/// registered, so a piped or redirected stderr never gains a stray escape;
+/// `stop_clear` on an already-stopped session emits nothing but the cursor
+/// restore.
+fn restore_terminal_after_failure() {
+    if std::io::stderr().is_terminal() && clx::progress::job_count() > 0 {
+        clx::progress::stop_clear();
     }
 }
 
@@ -825,6 +852,17 @@ fn inner_main_from(
     mut argv: Vec<OsString>,
     allow_process_replacement: bool,
 ) -> miette::Result<i32> {
+    // An embedding host's executable is what lifecycle scripts see as
+    // `npm_execpath` (through aube's shim) — and its own CLI is not aube's.
+    // The shim marks the invocation with a private token the host forwards
+    // here verbatim; drop it so everything below parses the aube command
+    // line the script actually wrote. Standalone aube accepts it too: one
+    // code path, and a shim pointed at a real aube binary still works.
+    if argv.get(1).and_then(|arg| arg.to_str())
+        == Some(crate::commands::pm_execpath::CLI_TRAMPOLINE_ARG)
+    {
+        argv.remove(1);
+    }
     let invoked_as_aubr = argv
         .first()
         .is_some_and(|arg| crate::tool_shims::stem_of_argv0(arg) == "aubr");

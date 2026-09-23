@@ -48,21 +48,9 @@ BATS tests use the project's mise-managed Node and `rush` for parallel runs.
 Use `mise run test:bats` for the full shell suite. Supply specific `.bats` files
 for a focused run. The registry helper installs Verdaccio if it is unavailable.
 
-Release validation also includes `cargo audit --deny warnings` and
-`cargo deny check bans licenses sources`.
-
-### Cargo build cache
-
-The project uses [mbx](https://mr-boxington.jdx.dev) through mise's Cargo
-wrapper. To diagnose a wrapper failure, run the exact same Cargo check with
-`MBX_DISABLE=1`; do not omit flags or weaken the check. For example:
-
-```sh
-MBX_DISABLE=1 cargo clippy --all-targets -- -D warnings
-```
-
-If only the bypass succeeds, see the
-[build-cache reporting instructions](https://github.com/aubepkg/aube/blob/main/CONTRIBUTING.md#mbx-build-cache).
+Release validation also includes
+`cargo deny --locked check advisories bans licenses sources`, which covers RustSec
+advisories as well as license, ban, and source policy.
 
 ## Work on documentation
 
