@@ -16,6 +16,8 @@ mod finalize;
 mod frozen;
 mod git_prepare;
 mod gvs;
+mod hidden_lockfile;
+mod index_remap;
 mod layout;
 mod lifecycle;
 mod link;
@@ -32,7 +34,9 @@ mod sweep;
 mod unreviewed_builds;
 mod workspace;
 
-pub(crate) use resolve::check_patch_drift;
+pub(crate) use resolve::{
+    check_patch_drift, lockfile_needs_peer_pass, lockfile_peer_context_options,
+};
 
 use advisory::resolve_osv_routing_settings;
 pub use args::{EmbedderInstallOverrides, InstallArgs, InstallOptions};
@@ -48,12 +52,10 @@ pub use control::{
 };
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
-use fetch::{
-    fetch_packages_with_root, import_local_source, remap_indices_to_contextualized,
-    strip_peer_context_suffix, version_from_dep_path,
-};
+use fetch::{fetch_packages_with_root, import_local_source, version_from_dep_path};
 pub use frozen::{FrozenMode, FrozenOverride, GlobalVirtualStoreFlags};
 pub(crate) use gvs::detect_existing_global_virtual_store;
+use index_remap::{remap_indices_to_contextualized, strip_peer_context_suffix};
 pub(crate) use lifecycle::{
     JailBuildPolicy, build_policy_from_manifest_sources, build_policy_from_sources,
     run_dep_lifecycle_scripts,
@@ -612,13 +614,15 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     // doesn't bypass the format-preserving write logic. Skipped when
     // `lockfile=false` — no lockfile is read and no format is
     // preserved, so the install always writes nothing (see below).
+    let selected_lockfile = super::selected_lockfile_kind_with_ctx(&settings_ctx)?;
     let source_kind_before = if lockfile_enabled {
-        aube_lockfile::detect_existing_lockfile_kind(&lockfile_dir)
+        aube_lockfile::detect_existing_lockfile_kind_selecting(&lockfile_dir, selected_lockfile)
     } else {
         None
     };
-    let write_kind =
-        source_kind_before.unwrap_or_else(|| super::default_lockfile_kind(&settings_ctx));
+    let write_kind = source_kind_before
+        .or(selected_lockfile)
+        .unwrap_or_else(|| super::default_lockfile_kind(&settings_ctx));
 
     // Hand any parseable lockfile to the resolver as `existing` so
     // unchanged specs reuse their already-pinned versions and only
@@ -651,18 +655,22 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     // full re-resolve without surfacing the actionable diagnostic.
     // `NotFound` is the one error we treat as expected — it just means
     // the lockfile is absent, which the downstream arms already handle.
-    let lockfile_pre_parse = resolve::pre_parse_lockfile(
+    let mut lockfile_pre_parse = resolve::pre_parse_lockfile(
         lockfile_enabled,
         mode,
         &lockfile_dir,
         &lockfile_importer_key,
         &manifest,
         lockfile_parse_options,
+        selected_lockfile,
     )?;
     let lockfile_conflict_marker_warning_emitted = lockfile_pre_parse.is_none()
         && lockfile_enabled
         && matches!(mode, FrozenMode::Fix | FrozenMode::Prefer)
-        && aube_lockfile::active_lockfile_has_conflict_markers(&lockfile_dir);
+        && aube_lockfile::active_lockfile_has_conflict_markers_selecting(
+            &lockfile_dir,
+            selected_lockfile,
+        );
     let existing_for_resolver: Option<&aube_lockfile::LockfileGraph> =
         lockfile_pre_parse.as_ref().map(|(g, _)| g);
 
@@ -687,6 +695,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 lockfile_importer_key: &lockfile_importer_key,
                 manifest: &manifest,
                 parse_options: lockfile_parse_options,
+                selected: selected_lockfile,
                 manifests: &manifests,
                 ws_config: &ws_config_shared,
                 workspace_catalogs: &workspace_catalogs,
@@ -742,6 +751,54 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         .await?;
         return Ok(());
     }
+
+    // pnpm's hidden lockfile: with no project lockfile on disk, seed
+    // the install from the copy the previous install left in the
+    // modules dir. It takes the same path an on-disk lockfile would
+    // (fresh → reused as-is, drifted → handed to the resolver as
+    // `existing`), and the project lockfile is written afterwards.
+    // Per-project lockfiles (`sharedWorkspaceLockfile=false`) have no
+    // single graph to mirror, so they neither read nor write it.
+    let hidden_lockfile_path = {
+        let path = hidden_lockfile::path(&cwd, &modules_dir_name);
+        if lockfile_enabled && (shared_workspace_lockfile || !has_workspace) {
+            Some(path)
+        } else {
+            hidden_lockfile::remove(&path);
+            None
+        }
+    };
+    let seeded_from_hidden_lockfile = match &hidden_lockfile_path {
+        Some(path)
+            if source_kind_before.is_none()
+                && hidden_lockfile::seed_allowed(mode, opts.strict_no_lockfile) =>
+        {
+            lockfile_pre_parse = hidden_lockfile::read(path, lockfile_parse_options)
+                .map(|graph| (graph, aube_lockfile::LockfileKind::Aube));
+            lockfile_pre_parse.is_some()
+        }
+        _ => false,
+    };
+    // The auto-CI frozen default only freezes an existing lockfile
+    // (pnpm's `frozenLockfileIfExists`); a hidden-lockfile seed is
+    // treated like a prefer-frozen install.
+    let mode = if seeded_from_hidden_lockfile {
+        tracing::debug!(
+            "no lockfile found; seeding install from hidden lockfile {}",
+            hidden_lockfile_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        match mode {
+            FrozenMode::Frozen => FrozenMode::Prefer,
+            other => other,
+        }
+    } else {
+        mode
+    };
+    let existing_for_resolver: Option<&aube_lockfile::LockfileGraph> =
+        lockfile_pre_parse.as_ref().map(|(g, _)| g);
 
     let planned_gvs =
         gvs::planned_global_virtual_store(use_global_virtual_store_override, &opts.env_snapshot);
@@ -833,6 +890,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         lockfile_importer_key: &lockfile_importer_key,
         manifest: &manifest,
         parse_options: lockfile_parse_options,
+        selected: selected_lockfile,
         manifests: &manifests,
         ws_config: &ws_config_shared,
         workspace_catalogs: &workspace_catalogs,
@@ -863,6 +921,13 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     // frozen-lockfile path or when the prewarm short-circuits.
     let mut prewarm_graph_hashes: Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>> =
         None;
+    // Global virtual-store entries the prewarm placed itself, with the
+    // hashes it named them under. The link phase trusts their dependency
+    // links wherever its own hashes give the same name.
+    let prewarm_placed: Option<(
+        std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>,
+        Vec<String>,
+    )>;
     // The cold-install lockfile write runs on a `spawn_blocking` task so it
     // overlaps `filter_graph` + the link phase (see
     // `lockfile_write_overlap`). The handle escapes the resolve match arm
@@ -871,6 +936,9 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     // (lockfile-matched fast path, killswitch disabled, `lockfile=false`,
     // or after the rare catch-up integrity rewrite joined it early).
     let mut lockfile_write_handle: Option<lockfile_write_overlap::LockfileWriteHandle> = None;
+    // Hidden-lockfile refresh on the lockfile-reuse path, overlapped with
+    // fetch + link the same way and joined alongside the lockfile write.
+    let mut hidden_lockfile_write_handle: Option<tokio::task::JoinHandle<()>> = None;
     let (graph, package_indices, cached_count, fetch_count) = match lockfile_result {
         Ok((mut graph, kind)) => {
             // Under `sharedWorkspaceLockfile=false` the project's own
@@ -883,7 +951,62 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             // projects, and the cold resolve path (which already
             // produces every importer).
             if !shared_workspace_lockfile && has_workspace {
-                merge_member_lockfile_graphs(&cwd, &mut graph, &manifests);
+                merge_member_lockfile_graphs(&cwd, &mut graph, &manifests)?;
+            }
+            // Both writes below take the full graph, before the
+            // host-only platform filter trims it for the linker.
+            if seeded_from_hidden_lockfile {
+                // The graph came from the hidden lockfile and nothing is
+                // on disk yet: write the project lockfile the way a
+                // resolve would. The hidden copy is already current.
+                let local_pnpmfile = if opts.ignore_pnpmfile {
+                    None
+                } else {
+                    crate::pnpmfile::detect(
+                        &cwd,
+                        opts.pnpmfile.as_deref(),
+                        ws_config_shared.pnpmfile_path.as_deref(),
+                    )
+                };
+                settings::stamp_pnpm_config_checksums(
+                    &mut graph,
+                    write_kind,
+                    &manifest,
+                    &settings_ctx,
+                    local_pnpmfile.as_deref(),
+                )
+                .await;
+                let write_inputs = lockfile_write_overlap::LockfileWriteInputs {
+                    graph: graph.clone(),
+                    manifest: manifest.clone(),
+                    manifests: manifests.clone(),
+                    lockfile_dir: lockfile_dir.clone(),
+                    lockfile_importer_key: lockfile_importer_key.clone(),
+                    cwd: cwd.clone(),
+                    write_kind,
+                    shared_workspace_lockfile,
+                    has_workspace,
+                    per_project_write_selection: per_project_write_selection.clone(),
+                    hidden_lockfile: None,
+                };
+                lockfile_write_handle = Some(lockfile_write_overlap::spawn(write_inputs));
+            } else if let Some(path) = hidden_lockfile_path.clone() {
+                // npm / yarn / bun graphs only get their peer contexts
+                // in the platform pass below, after the host filter, so
+                // there's no full peer-correct graph to mirror. Drop
+                // any older copy instead of letting it go stale.
+                if matches!(
+                    kind,
+                    aube_lockfile::LockfileKind::Aube | aube_lockfile::LockfileKind::Pnpm
+                ) {
+                    let hidden_graph = graph.clone();
+                    let hidden_manifest = manifest.clone();
+                    hidden_lockfile_write_handle = Some(tokio::task::spawn_blocking(move || {
+                        hidden_lockfile::write(&path, &hidden_graph, &hidden_manifest);
+                    }));
+                } else {
+                    hidden_lockfile::remove(&path);
+                }
             }
             let graph = resolve::apply_lockfile_graph_platform_rules(
                 graph,
@@ -978,6 +1101,8 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             // shortcut below cannot classify an entry without it. The
             // prewarm and link phases reuse the same hashes.
             let lock_virtual_store_plan = plan_virtual_store(VirtualStorePlanInputs {
+                cwd: &cwd,
+                reuse_existing_entries: !explicit_store_dir_override,
                 graph: &lock_materialize_graph,
                 store: &store,
                 link_strategy: lock_strategy,
@@ -1021,8 +1146,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 &packument_cache_dir,
                 Some(lock_materialize_tx),
                 /*already_linked_shortcut=*/
-                (!(has_workspace || explicit_store_dir_override))
-                    .then_some(&lock_virtual_store_plan),
+                (!explicit_store_dir_override).then_some(&lock_virtual_store_plan),
                 &lock_project_local_dep_paths,
                 virtual_store_dir_max_length,
                 opts.ignore_scripts,
@@ -1048,7 +1172,8 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             };
             // Materializer stats roll into link via GVS-already-linked
             // fast path. Errors abort install.
-            let _ = lock_materialize_handle.await.into_diagnostic()??;
+            let prewarm = lock_materialize_handle.await.into_diagnostic()??;
+            prewarm_placed = prewarm.graph_hashes.map(|hashes| (hashes, prewarm.placed));
             tracing::debug!(
                 "phase:fetch {:.1?} ({fetched} packages)",
                 phase_start.elapsed()
@@ -1081,6 +1206,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                             &lockfile_importer_key,
                             &manifest,
                             lockfile_parse_options,
+                            selected_lockfile,
                         )
                         .ok()
                         .map(|(g, _)| g.packages.len())
@@ -1695,6 +1821,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 &lockfile_importer_key,
                 &manifest,
                 lockfile_parse_options,
+                selected_lockfile,
             ) {
                 graph.overlay_metadata_from(&prior);
             }
@@ -1792,6 +1919,8 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             // classify already-linked packages the same way the linker
             // will.
             let materialize_virtual_store_plan = plan_virtual_store(VirtualStorePlanInputs {
+                cwd: &cwd,
+                reuse_existing_entries: !explicit_store_dir_override,
                 graph: &materialize_graph_arc,
                 store: &store,
                 link_strategy: materialize_strategy,
@@ -1850,8 +1979,14 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 aube_util::diag::Category::Install,
                 "phase_materialize_await",
             );
-            let (prewarm_stats, prewarm_hashes_from_task) =
-                materialize_handle.await.into_diagnostic()??;
+            let materialize::PrewarmOutcome {
+                stats: prewarm_stats,
+                graph_hashes: prewarm_hashes_from_task,
+                placed,
+            } = materialize_handle.await.into_diagnostic()??;
+            prewarm_placed = prewarm_hashes_from_task
+                .clone()
+                .map(|hashes| (hashes, placed));
             drop(_diag_mat_wait);
             aube_util::diag::instant(
                 aube_util::diag::Category::Install,
@@ -1875,8 +2010,8 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             // linker can find each variant by the dep_path on its
             // `LockedPackage`. Multiple contextualized variants of the
             // same canonical package share a single set of files, so
-            // cloning the PackageIndex is cheap relative to re-extraction.
-            let mut indices = remap_indices_to_contextualized(&canonical_indices, &graph);
+            // only additional placements need to clone the PackageIndex.
+            let mut indices = remap_indices_to_contextualized(canonical_indices, &graph);
             apply_computed_integrities(&mut graph, &computed_integrities);
 
             // Write the lockfile in whatever format the project was already
@@ -1965,6 +2100,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                         shared_workspace_lockfile,
                         has_workspace,
                         per_project_write_selection: per_project_write_selection.clone(),
+                        hidden_lockfile: hidden_lockfile_path.clone(),
                     };
                     lockfile_write_handle = Some(lockfile_write_overlap::spawn(write_inputs));
                 } else {
@@ -1982,6 +2118,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                         shared_workspace_lockfile,
                         has_workspace,
                         per_project_write_selection.as_ref(),
+                        hidden_lockfile_path.as_deref(),
                     )?;
                 }
             } else {
@@ -2088,8 +2225,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                         &packument_cache_dir,
                         /*materialize_tx=*/ None,
                         /*already_linked_shortcut=*/
-                        (!(has_workspace || explicit_store_dir_override))
-                            .then_some(&materialize_virtual_store_plan),
+                        (!explicit_store_dir_override).then_some(&materialize_virtual_store_plan),
                         &project_local_dep_paths,
                         virtual_store_dir_max_length,
                         opts.ignore_scripts,
@@ -2126,6 +2262,9 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                             )
                             .into_diagnostic()
                             .wrap_err("failed to write lockfile with computed integrity")?;
+                            if let Some(path) = &hidden_lockfile_path {
+                                hidden_lockfile::write(path, lock_graph, &manifest);
+                            }
                         } else {
                             write_per_project_lockfiles(
                                 &cwd,
@@ -2265,6 +2404,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         current_subtree_hashes,
         patch_hashes,
         managed_bin_links,
+        gvs_dep_link_targets,
     } = link::run_link_phase(link::LinkPhaseInput {
         cwd: &cwd,
         settings_ctx: &settings_ctx,
@@ -2277,6 +2417,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         build_policy: &build_policy,
         node_version: node_version.as_deref(),
         prewarm_graph_hashes: prewarm_graph_hashes.as_ref(),
+        prewarm_placed: prewarm_placed.as_ref(),
         aube_dir: &aube_dir,
         modules_dir_name: &modules_dir_name,
         virtual_store_dir_max_length,
@@ -2297,6 +2438,11 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     if let Some(handle) = lockfile_write_handle.take() {
         lockfile_write_overlap::join(handle).await?;
     }
+    if let Some(handle) = hidden_lockfile_write_handle.take()
+        && let Err(e) = handle.await
+    {
+        tracing::debug!("hidden lockfile write task failed: {e}");
+    }
     finalize::run_finalize_phase(finalize::FinalizePhaseInput {
         cwd: &cwd,
         settings_ctx: &settings_ctx,
@@ -2313,6 +2459,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         jail_policy: &jail_policy,
         stats: &stats,
         managed_bin_links: &managed_bin_links,
+        gvs_dep_link_targets,
         node_linker,
         has_workspace,
         planned_gvs,

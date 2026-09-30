@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1](https://github.com/aubepkg/aube/compare/v2.6.0...v2.6.1) - 2026-09-29
+
+### Fixed
+
+- *(install)* reuse linked trees when the lockfile and store are deleted ([#1671](https://github.com/aubepkg/aube/pull/1671))
+
+### Other
+
+- *(deps)* bump usage-rs to 6.12.0 and adapt to FlagMeta::effect() ([#1668](https://github.com/aubepkg/aube/pull/1668))
+- *(install)* verify each store entry once across dep_paths ([#1659](https://github.com/aubepkg/aube/pull/1659))
+- refresh benchmarks for v2.6.0 ([#1667](https://github.com/aubepkg/aube/pull/1667))
+
+## [2.6.0](https://github.com/aubepkg/aube/compare/v2.5.1...v2.6.0) - 2026-09-28
+
+### Added
+
+- *(lockfile)* select the lockfile aube reads and writes ([#1649](https://github.com/aubepkg/aube/pull/1649))
+- publish an agent skill with release packslips ([#1644](https://github.com/aubepkg/aube/pull/1644))
+- support Bun 1.4 scoped overrides in bun.lock and package.json ([#1639](https://github.com/aubepkg/aube/pull/1639))
+
+### Fixed
+
+- *(import)* read Bun 1.4 lockfiles and link peer dependencies when importing ([#1638](https://github.com/aubepkg/aube/pull/1638))
+
+### Other
+
+- *(install)* avoid deep-copying indexes during peer remapping ([#1650](https://github.com/aubepkg/aube/pull/1650))
+
+## [2.5.1](https://github.com/aubepkg/aube/compare/v2.5.0...v2.5.1) - 2026-09-27
+
+### Other
+
+- *(install)* cache clean OSV confirmations briefly ([#1631](https://github.com/aubepkg/aube/pull/1631))
+- refresh benchmarks for v2.5.0 ([#1630](https://github.com/aubepkg/aube/pull/1630))
+- *(release)* start aube about 0.6 ms faster on Linux by linking non-PIE ([#1625](https://github.com/aubepkg/aube/pull/1625))
+
+## [2.5.0](https://github.com/aubepkg/aube/compare/v2.4.0...v2.5.0) - 2026-09-26
+
+### Added
+
+- *(update)* choose range or latest per package in --interactive ([#1612](https://github.com/aubepkg/aube/pull/1612))
+
+### Fixed
+
+- *(install)* recover after removing cache and lockfile ([#1613](https://github.com/aubepkg/aube/pull/1613))
+
+### Other
+
+- *(install)* reuse current state for explicit frozen installs ([#1615](https://github.com/aubepkg/aube/pull/1615))
+- *(install)* prefilter bulk fresh-install advisory checks ([#1616](https://github.com/aubepkg/aube/pull/1616))
+- refresh benchmarks for v2.4.0 ([#1608](https://github.com/aubepkg/aube/pull/1608))
+- refresh benchmarks for v2.4.0 ([#1595](https://github.com/aubepkg/aube/pull/1595))
+
+## [2.4.0](https://github.com/aubepkg/aube/compare/v2.3.0...v2.4.0) - 2026-09-25
+
+### Added
+
+- *(install)* reuse a hidden lockfile in node_modules when the lockfile is missing ([#1594](https://github.com/aubepkg/aube/pull/1594))
+
+### Fixed
+
+- *(install)* hold buffered tarball bytes against the budget until import ([#1605](https://github.com/aubepkg/aube/pull/1605))
+- *(install)* strip verbatim prefix from Windows install root ([#1591](https://github.com/aubepkg/aube/pull/1591))
+- *(update)* keep workspace member importers when updating at the root ([#1579](https://github.com/aubepkg/aube/pull/1579))
+
+### Other
+
+- *(install)* buffer small tarballs before starting their import ([#1604](https://github.com/aubepkg/aube/pull/1604))
+- *(install)* skip reading back GVS links written this install ([#1603](https://github.com/aubepkg/aube/pull/1603))
+- *(install)* cap blocking threads on Linux and skip per-file CAS chmod ([#1598](https://github.com/aubepkg/aube/pull/1598))
+- refresh benchmarks for v2.3.0 ([#1593](https://github.com/aubepkg/aube/pull/1593))
+- send bug reports to GitHub Issues ([#1583](https://github.com/aubepkg/aube/pull/1583))
+
 ## [2.3.0](https://github.com/aubepkg/aube/compare/v2.2.17...v2.3.0) - 2026-09-22
 
 ### Added

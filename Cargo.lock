@@ -226,7 +226,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aube"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "ambient-id",
  "assert_cmd",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "aube-codes"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "aube-ffi"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube",
  "aube-codes",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "aube-linker"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-lockfile",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "aube-lockfile"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "aube-manifest"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-util",
@@ -385,12 +385,13 @@ dependencies = [
 
 [[package]]
 name = "aube-node"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube",
  "aube-codes",
  "aube-registry",
  "aube-settings",
+ "aube-util",
  "miette",
  "napi",
  "napi-build",
@@ -400,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "aube-registry"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -433,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "aube-resolver"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-lockfile",
@@ -462,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "aube-runtime"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -486,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "aube-scripts"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -504,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "aube-settings"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -517,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "aube-store"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-util",
  "base64 0.23.1",
@@ -543,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "aube-util"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "blake3",
@@ -564,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "aube-workspace"
-version = "2.3.0"
+version = "2.6.1"
 dependencies = [
  "aube-codes",
  "aube-manifest",
@@ -1347,9 +1348,9 @@ dependencies = [
 
 [[package]]
 name = "demand"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c578ab3368e9211f6f8e262c60b105d5e91bd9725a38567ccfe9f1c7d86507f2"
+checksum = "e7585a0f6254e4545ecd6efced4a844500ea857cac7ff214c7dfdbfde6c06c9d"
 dependencies = [
  "console",
  "fuzzy-matcher",
@@ -2801,9 +2802,9 @@ dependencies = [
 
 [[package]]
 name = "napi"
-version = "3.12.5"
+version = "3.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0c007d4a8ead952a81887661d41fd56b7e7a70d3d4d921f445fb37a8f6efa1e"
+checksum = "b7d3c1107f2fda46a7bd2676d65221b7b8160054494b38554b0e055c731714db"
 dependencies = [
  "bitflags 2.13.1",
  "ctor",
@@ -3683,11 +3684,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -4695,7 +4696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",
@@ -5259,26 +5260,27 @@ dependencies = [
 
 [[package]]
 name = "usage-argv"
-version = "6.8.0"
+version = "6.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80dcf875185d0520e1a0675f6d413749e5050fde359eede97e45d0b9690eedbd"
+checksum = "d81d0292a01b769c28c094fc9da0596f49a4c78a6da88ffda53de9eafefc5b20"
 
 [[package]]
 name = "usage-derive"
-version = "6.8.0"
+version = "6.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "778373c082248ae6050e96beb69c817cf109b8c8e925fbcbdf2155a12e517442"
+checksum = "6731f7bc17e630509b9c254ac13049dfc02451011d9dc9eb52865157304c03dc"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+ "toml",
 ]
 
 [[package]]
 name = "usage-rs"
-version = "6.8.0"
+version = "6.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "894bcecc06869ce740fde1135ac8ee60d82bf33e88f34e4fee434a62e98e15e8"
+checksum = "b770a1ed5bf2c95707490f612e0c5597d7c664c6e37b60772ead3a8359526115"
 dependencies = [
  "usage-argv",
  "usage-derive",
@@ -5288,18 +5290,18 @@ dependencies = [
 
 [[package]]
 name = "usage-test"
-version = "6.8.0"
+version = "6.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75d170ba4aad33319a2a9ffc77494143559ec6173eef287750d439aab006169"
+checksum = "1011b07f3e21381eaaada43daeb5dce92469bc25c87921e6c957b2c3ba5ae716"
 dependencies = [
  "usage-argv",
 ]
 
 [[package]]
 name = "usage-validation"
-version = "6.8.0"
+version = "6.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ebdffbd14e4c6c8267340f697842c6cd30b6cd56a8c4f83154e6f6ecace9ad9"
+checksum = "45d62e7271a029ae2087e1e00a79fbe57dffa3ff8bd9b00f78a34be9013bf76d"
 dependencies = [
  "expr-lang",
 ]

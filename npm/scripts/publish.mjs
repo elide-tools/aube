@@ -4,8 +4,7 @@
 // For each release target this:
 //   1. downloads `aube-<tag>-<target>.{tar.gz,zip}` directly from the
 //      public GitHub release asset URL (no API, no auth token),
-//   2. extracts the three binary entries (aube, aubr, aubx) into a
-//      staging dir,
+//   2. extracts the archive and stages its aube executable once,
 //   3. generates a platform-scoped package.json and publishes it as
 //      `@endevco/aube-<os>-<arch>`.
 // Then rewrites the root `npm/package.json` version and publishes
@@ -52,7 +51,6 @@ const TARGETS = [
     { triple: 'aarch64-pc-windows-msvc',    os: 'win32',  cpu: 'arm64',                 ext: '.zip',    exe: '.exe' },
 ];
 
-const BINS = ['aube', 'aubr', 'aubx'];
 const DEFAULT_REGISTRY = 'https://registry.npmjs.org';
 
 function run(cmd, args, opts = {}) {
@@ -127,16 +125,13 @@ function extractArchive(archivePath, target, destDir) {
     } else {
         run('unzip', ['-o', archivePath, '-d', destDir]);
     }
-    // taiki-e/upload-rust-binary-action packs each bin at the archive
-    // root (no containing directory). Verify each expected binary lands
-    // where we think, so a silent rename doesn't ship an empty package.
-    for (const bin of BINS) {
-        const binPath = resolve(destDir, bin + target.exe);
-        if (!existsSync(binPath)) {
-            throw new Error(`missing ${binPath} in extracted archive`);
-        }
-        if (target.os !== 'win32') chmodSync(binPath, 0o755);
+    // Only aube is staged in the npm package; release archives may also
+    // include aubr and aubx aliases.
+    const binPath = resolve(destDir, 'aube' + target.exe);
+    if (!existsSync(binPath)) {
+        throw new Error(`missing ${binPath} in extracted archive`);
     }
+    if (target.os !== 'win32') chmodSync(binPath, 0o755);
 }
 
 async function resolveAubeBin(repo, tag) {
@@ -165,19 +160,14 @@ async function buildPlatformPackage(repo, tag, version, target) {
     rmSync(extractDir, { recursive: true, force: true });
     extractArchive(archivePath, target, extractDir);
 
-    const bins = {};
-    for (const bin of BINS) {
-        const src = resolve(extractDir, bin + target.exe);
-        const destName = bin + target.exe;
-        const dest = resolve(binDir, destName);
-        // Release archives store aubr/aubx as symlinks to aube on Unix
-        // to avoid shipping duplicate binaries. npm pack drops those
-        // symlinked bin entries, so platform packages must stage real
-        // files for every declared bin target.
-        copyFileSync(realpathSync(src), dest);
-        if (target.os !== 'win32') chmodSync(dest, 0o755);
-        bins[bin] = `bin/${destName}`;
-    }
+    const destName = 'aube' + target.exe;
+    const src = resolve(extractDir, destName);
+    const dest = resolve(binDir, destName);
+    copyFileSync(realpathSync(src), dest);
+    if (target.os !== 'win32') chmodSync(dest, 0o755);
+    // The root package hardlinks this file under each command name at install
+    // time, preserving argv[0] dispatch without three copies in the tarball.
+    const bins = { aube: `bin/${destName}` };
 
     const pkgJson = {
         name: pkgName,

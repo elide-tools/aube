@@ -447,6 +447,73 @@ fn test_link_all_handles_self_referential_dep_at_different_version() {
 }
 
 #[test]
+fn staged_entries_preserve_scoped_links_and_clean_failed_writes() {
+    for global in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, indices) = setup_store_with_files(dir.path());
+        let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, global);
+        let root = if global {
+            store.virtual_store_dir()
+        } else {
+            dir.path().join("project/node_modules/.aube")
+        };
+        let graph = make_graph();
+        let mut foo = graph.packages["foo@1.0.0"].clone();
+        foo.dependencies.clear();
+        foo.dependencies.insert("@scope/bar".into(), "2.0.0".into());
+        let mut bar = graph.packages["bar@2.0.0"].clone();
+        bar.name = "@scope/bar".into();
+        bar.dep_path = "@scope/bar@2.0.0".into();
+        let place = |pkg: &LockedPackage, index: &PackageIndex| {
+            let mut stats = LinkStats::default();
+            if global {
+                linker.ensure_in_virtual_store(&pkg.dep_path, pkg, index, &mut stats, None)
+            } else {
+                linker.ensure_in_aube_dir(&root, &pkg.dep_path, pkg, index, &mut stats, None)
+            }
+        };
+        place(&foo, &indices["foo@1.0.0"]).unwrap();
+        place(&bar, &indices["bar@2.0.0"]).unwrap();
+        let foo_entry = if global {
+            linker.virtual_store_subdir(&foo.dep_path)
+        } else {
+            linker.aube_dir_entry_name(&foo.dep_path)
+        };
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join(foo_entry)
+                    .join("node_modules/@scope/bar/index.js")
+            )
+            .unwrap(),
+            "module.exports = 'bar';"
+        );
+
+        let mut broken = foo.clone();
+        broken.name = "broken".into();
+        broken.dep_path = "broken@1.0.0".into();
+        let mut index = indices["foo@1.0.0"].clone();
+        index.get_mut("index.js").unwrap().store_path = dir.path().join("missing-store-file");
+        assert!(matches!(
+            place(&broken, &index),
+            Err(Error::MissingStoreFile { .. })
+        ));
+        let broken_entry = if global {
+            linker.virtual_store_subdir(&broken.dep_path)
+        } else {
+            linker.aube_dir_entry_name(&broken.dep_path)
+        };
+        assert!(!root.join(broken_entry).exists());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")
+        }));
+    }
+}
+
+#[test]
 fn test_ensure_in_aube_dir_handles_concurrent_same_dep_path() {
     const THREADS: usize = 16;
 
@@ -785,14 +852,12 @@ impl Drop for ForcedReflinkFailure {
 /// fallback so the split between `ReflinkAuto` and explicit `Reflink` is
 /// observable on any filesystem, including reflink-capable APFS/btrfs CI.
 #[cfg(unix)]
-fn realized_inode_matches_source_on_reflink_failure(strategy: LinkStrategy) -> bool {
+fn realized_inode_matches_source_on_reflink_failure(strategy: LinkStrategy, size: usize) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path().join("store/files"));
-    // >16 KiB so the macOS small-file copy shortcut does not pre-empt the
-    // reflink path under test.
-    let content = vec![b'x'; 32 * 1024];
+    let content = vec![b'x'; size];
     let stored = store.import_bytes(&content, false).unwrap();
     let store_path = stored.store_path.clone();
 
@@ -817,15 +882,15 @@ fn realized_inode_matches_source_on_reflink_failure(strategy: LinkStrategy) -> b
 
 #[test]
 #[cfg(unix)]
-fn test_reflink_auto_falls_back_to_hardlink_not_copy() {
-    // `auto` on a same-FS macOS target resolves to `ReflinkAuto`; the
-    // probe already proved the target shares a mount, so a clonefile
-    // failure (non-APFS same-FS volume, e.g. HFS+) must degrade to a
-    // zero-cost hardlink before a per-file copy.
-    assert!(
-        realized_inode_matches_source_on_reflink_failure(LinkStrategy::ReflinkAuto),
-        "ReflinkAuto must fall back to a hardlink (same inode), not a copy, on reflink failure"
-    );
+fn test_reflink_auto_preserves_platform_and_size_fallback() {
+    for size in [64, 16 * 1024, 16 * 1024 + 1, 32 * 1024] {
+        let expect_hardlink = !(cfg!(target_os = "macos") && size <= 16 * 1024);
+        assert_eq!(
+            realized_inode_matches_source_on_reflink_failure(LinkStrategy::ReflinkAuto, size),
+            expect_hardlink,
+            "unexpected ReflinkAuto fallback for {size} bytes"
+        );
+    }
 }
 
 #[test]
@@ -835,10 +900,64 @@ fn test_explicit_reflink_falls_back_to_copy_not_hardlink() {
     // documented contract is reflink with a plain *copy* fallback. They
     // must NOT take the auto-only hardlink step on a clonefile failure —
     // the result is a distinct inode (copy), never the source's inode.
-    assert!(
-        !realized_inode_matches_source_on_reflink_failure(LinkStrategy::Reflink),
-        "explicit Reflink must fall back to a copy (distinct inode), not a hardlink"
-    );
+    for size in [64, 32 * 1024] {
+        assert!(
+            !realized_inode_matches_source_on_reflink_failure(LinkStrategy::Reflink, size),
+            "explicit Reflink must fall back to a copy (distinct inode), not a hardlink"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn small_reflink_preserves_permissions_and_isolates_writes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut strategies = vec![LinkStrategy::Reflink];
+    if cfg!(target_os = "macos") {
+        strategies.push(LinkStrategy::ReflinkAuto);
+    }
+    for strategy in strategies {
+        for force_failure in [false, true] {
+            for executable in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::at(dir.path().join("store/files"));
+                let content = b"original small package file";
+                let stored = store.import_bytes(content, executable).unwrap();
+                let source_path = stored.store_path.clone();
+                let source_mode = std::fs::metadata(&source_path).unwrap().mode();
+                let mut index = PackageIndex::default();
+                index.insert("installed.js".into(), stored);
+                let mut pkg = make_graph().packages.remove("foo@1.0.0").unwrap();
+                pkg.dependencies.clear();
+                let base = dir.path().join("virtual");
+                let linker = Linker::new_with_gvs(&store, strategy, false);
+                let _forced = force_failure.then(ForcedReflinkFailure::engage);
+                linker
+                    .materialize_at(
+                        &base.join("foo@1.0.0"),
+                        &base,
+                        "foo@1.0.0",
+                        &pkg,
+                        &index,
+                        &mut LinkStats::default(),
+                        false,
+                        None,
+                    )
+                    .unwrap();
+                let dst = base.join("foo@1.0.0/node_modules/foo/installed.js");
+                let source_metadata = std::fs::metadata(&source_path).unwrap();
+                let target_metadata = std::fs::metadata(&dst).unwrap();
+                assert_ne!(source_metadata.ino(), target_metadata.ino());
+                assert_eq!(target_metadata.mode() & 0o111 != 0, executable);
+                assert_eq!(source_metadata.mode(), source_mode);
+                assert_eq!(std::fs::read(&dst).unwrap(), content);
+                std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(&dst, vec![b'y'; content.len()]).unwrap();
+                assert_eq!(std::fs::read(&source_path).unwrap(), content);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1005,6 +1124,197 @@ fn cached_entry_repair_rejects_dependency_path_escape() {
             .is_err()
     );
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep");
+}
+
+#[test]
+fn test_hidden_hoist_reconciles_on_relink() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    // A scoped package exercises the `@scope/` directories created ahead
+    // of the parallel pass; `Bar` collides with `bar` by case and takes
+    // the serial pass.
+    for (dep_path, name) in [("@scope/baz@1.0.0", "@scope/baz"), ("Bar@1.0.0", "Bar")] {
+        let stored = store
+            .import_bytes(format!("module.exports = '{name}';").as_bytes(), false)
+            .unwrap();
+        let mut index = PackageIndex::default();
+        index.insert("index.js".to_string(), stored);
+        indices.insert(dep_path.to_string(), index);
+        graph.packages.insert(
+            dep_path.to_string(),
+            LockedPackage {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: dep_path.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    #[cfg(unix)]
+    let original_foo_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(hidden.join("foo")).unwrap().ino()
+    };
+    // A stray entry from an earlier graph must not survive reconciliation.
+    std::fs::write(hidden.join("gone"), "").unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::symlink_metadata(hidden.join("foo")).unwrap().ino(),
+            original_foo_inode,
+            "an unchanged hidden-hoist link should survive a repeat install"
+        );
+    }
+
+    for name in ["foo", "bar", "@scope/baz", "Bar"] {
+        let link = hidden.join(name);
+        assert!(link.symlink_metadata().unwrap().is_symlink(), "{name}");
+        assert!(link.join("index.js").exists(), "{name} resolves");
+    }
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("@scope/baz/index.js")).unwrap(),
+        "module.exports = '@scope/baz';"
+    );
+    // `Bar@1.0.0` sorts before `bar@2.0.0`, so `bar` is linked last: it
+    // wins the shared path on a case-insensitive filesystem, and each name
+    // keeps its own package where case is significant.
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("bar/index.js")).unwrap(),
+        "module.exports = 'bar';"
+    );
+    if !hidden.join("BAR").exists() {
+        assert_eq!(
+            std::fs::read_to_string(hidden.join("Bar/index.js")).unwrap(),
+            "module.exports = 'Bar';"
+        );
+    }
+    assert!(!hidden.join("gone").exists());
+
+    graph.packages.remove("@scope/baz@1.0.0");
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert!(!hidden.join("@scope/baz").exists());
+
+    let old_foo_target = std::fs::read_link(hidden.join("foo")).unwrap();
+    assert!(hidden.join(&old_foo_target).exists());
+    let new_foo_file = store
+        .import_bytes(b"module.exports = 'foo v2';", false)
+        .unwrap();
+    let mut new_foo_index = PackageIndex::default();
+    new_foo_index.insert("index.js".to_string(), new_foo_file);
+    indices.insert("foo@2.0.0".to_string(), new_foo_index);
+    let mut new_foo = graph.packages.remove("foo@1.0.0").unwrap();
+    new_foo.version = "2.0.0".to_string();
+    new_foo.dep_path = "foo@2.0.0".to_string();
+    graph.packages.insert(new_foo.dep_path.clone(), new_foo);
+    graph.importers.get_mut(".").unwrap()[0].dep_path = "foo@2.0.0".to_string();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert!(hidden.join(&old_foo_target).exists());
+    assert_ne!(
+        std::fs::read_link(hidden.join("foo")).unwrap(),
+        old_foo_target
+    );
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("foo/index.js")).unwrap(),
+        "module.exports = 'foo v2';"
+    );
+
+    // `Bar` and `bar` share one slot on case-insensitive filesystems.
+    // Removing the later package's source must leave the earlier live link.
+    std::fs::remove_dir_all(project_dir.join("node_modules/.aube/bar@2.0.0/node_modules/bar"))
+        .unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("Bar/index.js")).unwrap(),
+        "module.exports = 'Bar';"
+    );
+}
+
+#[test]
+fn hidden_hoist_drops_link_when_package_source_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    let graph = make_graph();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let aube_dir = project_dir.join("node_modules/.aube");
+    let hidden_foo = aube_dir.join("node_modules/foo");
+    assert!(hidden_foo.exists());
+    std::fs::remove_dir_all(aube_dir.join("foo@1.0.0/node_modules/foo")).unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    assert!(std::fs::symlink_metadata(hidden_foo).is_err());
+    assert!(aube_dir.join("node_modules/bar/index.js").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_hoist_replaces_tampered_scope_without_following_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    let dep_path = "@scope/pkg@1.0.0";
+    let stored = store.import_bytes(b"ok", false).unwrap();
+    let mut index = PackageIndex::default();
+    index.insert("index.js".to_string(), stored);
+    indices.insert(dep_path.to_string(), index);
+    graph.packages.insert(
+        dep_path.to_string(),
+        LockedPackage {
+            name: "@scope/pkg".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: dep_path.to_string(),
+            ..Default::default()
+        },
+    );
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let sentinel = outside.join("sentinel");
+    std::fs::write(&sentinel, "keep").unwrap();
+    std::fs::remove_dir_all(hidden.join("@scope")).unwrap();
+    std::os::unix::fs::symlink(&outside, hidden.join("@scope")).unwrap();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+    assert!(hidden.join("@scope/pkg/index.js").exists());
+    assert!(
+        !std::fs::symlink_metadata(hidden.join("@scope"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    std::fs::remove_dir_all(&hidden).unwrap();
+    std::os::unix::fs::symlink(&outside, &hidden).unwrap();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+    assert!(hidden.join("@scope/pkg/index.js").exists());
+    assert!(
+        !std::fs::symlink_metadata(&hidden)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -1643,4 +1953,158 @@ fn create_dir_link_idempotent_tolerates_only_an_identical_winner() {
     crate::sys::create_dir_link(Path::new("other"), &conflict).unwrap();
     create_dir_link_idempotent(Path::new("real"), &conflict)
         .expect_err("conflicting existing link must surface as an error");
+}
+
+#[test]
+fn test_large_package_links_every_file_in_parallel() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let foo = indices.get_mut("foo@1.0.0").unwrap();
+    let paths: Vec<_> = (0..300)
+        .map(|i| match i % 4 {
+            0 => format!("f{i}.js"),
+            1 => format!("lib/f{i}.js"),
+            2 => format!("lib/deep/f{i}.js"),
+            _ => format!("lib-other/f{i}.js"),
+        })
+        .collect();
+    for (i, path) in paths.iter().enumerate() {
+        let content = format!("module.exports = {i};");
+        let stored = store.import_bytes(content.as_bytes(), i % 7 == 0).unwrap();
+        foo.insert(path.clone(), stored);
+    }
+
+    // Pin several workers so the files really link concurrently even on a
+    // single-CPU runner, where the default pool would have one.
+    let linker = Linker::new(&store, LinkStrategy::Hardlink).with_link_concurrency(Some(4));
+    let stats = linker
+        .link_all(&project_dir, &make_graph(), &indices)
+        .unwrap();
+    assert_eq!(stats.files_linked, 303);
+
+    let pkg = project_dir.join("node_modules/.aube/foo@1.0.0/node_modules/foo");
+    for (i, path) in paths.iter().enumerate() {
+        let file = pkg.join(path);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("module.exports = {i};")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111 != 0, i % 7 == 0, "exec bit of f{i}.js");
+        }
+    }
+}
+
+#[test]
+fn large_hardlinked_package_invalidates_index_when_a_store_file_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let foo = indices.get_mut("foo@1.0.0").unwrap();
+    let stored = store.import_bytes(b"shared content", false).unwrap();
+    for i in 0..300 {
+        foo.insert(format!("f{i}.js"), stored.clone());
+    }
+    store.save_index("foo", "1.0.0", None, foo).unwrap();
+    std::fs::remove_file(&foo["package.json"].store_path).unwrap();
+
+    let linker = Linker::new(&store, LinkStrategy::Hardlink).with_link_concurrency(Some(4));
+    let err = linker
+        .link_all(&project_dir, &make_graph(), &indices)
+        .expect_err("a missing CAS file must fail even within a large directory group");
+    assert!(
+        matches!(err, Error::MissingStoreFile { ref rel_path, .. } if rel_path == "package.json")
+    );
+    assert!(!store.index_dir().join("foo@1.0.0.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn large_flat_package_preserves_copy_fallback_across_filesystems() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Linux CI provides tmpfs here. Other environments may not expose a
+    // second writable filesystem, so only run when EXDEV is reproducible.
+    let Ok(project) = tempfile::tempdir_in("/dev/shm") else {
+        return;
+    };
+    if dir.path().metadata().unwrap().dev() == project.path().metadata().unwrap().dev() {
+        return;
+    }
+    let (store, mut indices) = setup_store_with_files(dir.path());
+    let foo = indices.get_mut("foo@1.0.0").unwrap();
+    for i in 0..300 {
+        let content = format!("module.exports = {i};");
+        foo.insert(
+            format!("f{i}.js"),
+            store.import_bytes(content.as_bytes(), i % 7 == 0).unwrap(),
+        );
+    }
+    let linker =
+        Linker::new_with_gvs(&store, LinkStrategy::Hardlink, false).with_link_concurrency(Some(4));
+    let sample = &foo["f0.js"];
+    let realized = linker
+        .link_file_fresh(sample, "probe", &project.path().join("probe"), None)
+        .unwrap();
+    assert!(matches!(realized, LinkStrategy::Copy));
+
+    let stats = linker
+        .link_all(project.path(), &make_graph(), &indices)
+        .unwrap();
+    assert_eq!(stats.files_linked, 303);
+    let pkg = project
+        .path()
+        .join("node_modules/.aube/foo@1.0.0/node_modules/foo");
+    for i in 0..300 {
+        let file = pkg.join(format!("f{i}.js"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("module.exports = {i};")
+        );
+        assert_eq!(file.metadata().unwrap().mode() & 0o111 != 0, i % 7 == 0);
+    }
+    std::fs::write(pkg.join("f0.js"), b"changed").unwrap();
+    assert_eq!(
+        std::fs::read(&indices["foo@1.0.0"]["f0.js"].store_path).unwrap(),
+        b"module.exports = 0;"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_recorded_gvs_dep_link_targets_match_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let virtual_store = store.virtual_store_dir();
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let graph = make_graph();
+
+    // Once materializing and once reusing the existing entries.
+    for _ in 0..2 {
+        linker.link_all(&project_dir, &graph, &indices).unwrap();
+        let recorded = linker
+            .take_gvs_dep_link_targets()
+            .expect("recorded under GVS");
+        assert_eq!(recorded.len(), graph.packages.len());
+        let foo = &recorded["foo@1.0.0"];
+        assert_eq!(foo.len(), 1);
+        let (dep_name, target) = &foo[0];
+        assert_eq!(dep_name, "bar");
+        let link = virtual_store
+            .join(linker.virtual_store_subdir("foo@1.0.0"))
+            .join("node_modules")
+            .join(dep_name);
+        assert_eq!(&std::fs::read_link(link).unwrap(), target);
+        assert!(recorded["bar@2.0.0"].is_empty());
+        std::fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+    }
 }

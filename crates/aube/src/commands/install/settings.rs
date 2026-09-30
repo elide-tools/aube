@@ -670,7 +670,7 @@ pub(crate) async fn finalize_lockfile_graph(
         .wrap_err("failed to load workspace config for lockfile finalization")?;
     let env = aube_settings::values::process_env();
     let ctx = files.ctx(&raw_workspace, env, &[]);
-    let write_kind = crate::commands::lockfile_kind_for_write_with_ctx(cwd, &ctx);
+    let write_kind = crate::commands::lockfile_kind_for_write_with_ctx(cwd, &ctx)?;
     let local_pnpmfile = if ignore_pnpmfile {
         None
     } else {
@@ -1153,6 +1153,13 @@ pub(crate) fn configure_resolver(
         }
     };
     let mut effective_overrides = manifest.overrides_map();
+    for path in manifest.skipped_nested_overrides() {
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_OVERRIDE_TOO_DEEP,
+            "override {path:?} nests more than one level deep; skipping it. \
+             Write it as a `parent>child` key instead"
+        );
+    }
     merge_string_map_setting(settings_ctx, "overrides", &mut effective_overrides);
     for (key, dep) in deprecated_dollar_override_refs(&effective_overrides) {
         tracing::warn!(

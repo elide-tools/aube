@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@503fe65046e8810d4844f6b3aa12ab599a3549d7 # v0.5.134
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           command: release
         env:
@@ -158,35 +158,10 @@ jobs:
       CERTIFICATES_P12: ${{ secrets.CERTIFICATES_P12 }}
       CERTIFICATES_P12_PASS: ${{ secrets.CERTIFICATES_P12_PASS }}
 
-  # The packslip is this release's signed inventory: every CLI archive's
-  # digest, the executables inside it, and the workflow identity that signed
-  # for all of it, so an installer can check a download against
-  # github.com/jdx/aube's identity rather than a key this project would have
-  # to hold. `upload-assets` already attests each archive's build provenance
-  # with actions/attest-build-provenance, so `attest: link` only links those
-  # statements instead of attesting a second time. The FFI libraries stay out
-  # — nothing installs a binary directly from them the way it does from these
-  # archives. See https://packslip.dev.
-  packslip:
-    name: Publish the packslip
-    needs: [release-plz-release, upload-assets]
-    if: ${{ needs.release-plz-release.outputs.tag != '' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-    steps:
-      - uses: jdx/packslip@74c75db7d611b36dd5a157999ec16cf823ccf80c # v1.2.0
-        with:
-          tag: ${{ needs.release-plz-release.outputs.tag }}
-          download: aube-*.tar.gz aube-*.zip
-          bin: aube aubr aubx
-          attest: link
-          token: ${{ secrets.AUBE_GH_TOKEN }}
-
   # Flip the draft release to non-draft once *every* asset uploaded
-  # cleanly and Communiqué has written the final notes. With immutable
-  # GitHub releases enabled, a published release can't have its assets
+  # cleanly and Communiqué has written the final notes. `upload-assets`
+  # includes the Packslip with provenance, completions, and available skills.
+  # With immutable GitHub releases enabled, a published release can't have its assets
   # replaced — so if any matrix target failed, we leave the draft in
   # place rather than ship a release with missing platform binaries
   # (downstream npm / COPR / PPA jobs would also fail trying to fetch
@@ -197,7 +172,7 @@ jobs:
   # happen after confirming the Communiqué notes are present too.
   publish-release:
     name: Publish release
-    needs: [release-plz-release, upload-assets, upload-ffi-assets, enhance-release, packslip]
+    needs: [release-plz-release, upload-assets, upload-ffi-assets, enhance-release]
     if: ${{ needs.release-plz-release.outputs.tag != '' }}
     runs-on: ubuntu-latest
     permissions:
@@ -305,7 +280,7 @@ jobs:
           cache: false
         env:
           MISE_LOCKED: "1"
-      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
           tool: release-plz
       # `release-plz update` shells out to `cargo package` inside temp
@@ -438,7 +413,7 @@ jobs:
             const pr = match?.[4];
             const [, items] = sections.get(type) || sections.get('default');
             const scoped = scope ? `*(${scope})* ${desc}` : desc;
-            const linked = pr ? `${scoped} ([#${pr}](https://github.com/jdx/aube/pull/${pr}))` : scoped;
+            const linked = pr ? `${scoped} ([#${pr}](https://github.com/aubepkg/aube/pull/${pr}))` : scoped;
             items.push(`- ${linked}`);
           }
 
@@ -448,7 +423,7 @@ jobs:
             body.push(`### ${heading}`, '', ...items, '');
           }
           const changelogEntry = [
-            `## [${newVersion}](https://github.com/jdx/aube/compare/${latestTag}...v${newVersion}) - ${today}`,
+            `## [${newVersion}](https://github.com/aubepkg/aube/compare/${latestTag}...v${newVersion}) - ${today}`,
             '',
             ...body,
           ].join('\n').trimEnd();

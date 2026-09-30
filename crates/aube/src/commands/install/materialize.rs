@@ -41,9 +41,11 @@ pub(super) enum VirtualStorePlan {
         hashes: std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>,
     },
     /// `.aube/<dep_path>` entries are per-project directories keyed by
-    /// dep_path alone, so their existence *is* the linker's freshness
-    /// test and there is no shared target to compare against.
-    PerProject,
+    /// dep_path alone. Only unchanged subtrees survive the link phase's
+    /// invalidation pass and can safely skip loading their store index.
+    PerProject {
+        reusable: std::sync::Arc<std::collections::BTreeSet<String>>,
+    },
 }
 
 impl VirtualStorePlan {
@@ -52,7 +54,7 @@ impl VirtualStorePlan {
     /// freshness tests: `classify_entry_state` under the global virtual
     /// store (the stored target must be the subdir this graph expects
     /// *and* still exist) and the plain existence check the per-project
-    /// materializer uses.
+    /// materializer uses, provided subtree invalidation will preserve it.
     pub(super) fn entry_is_current(
         &self,
         entry: &std::path::Path,
@@ -75,7 +77,7 @@ impl VirtualStorePlan {
                 matches!(std::fs::read_link(entry), Ok(target) if target == expected)
                     && entry.exists()
             }
-            Self::PerProject => entry.exists(),
+            Self::PerProject { reusable } => reusable.contains(dep_path) && entry.exists(),
         }
     }
 
@@ -84,7 +86,7 @@ impl VirtualStorePlan {
     fn hashes(&self) -> Option<&std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>> {
         match self {
             Self::Global { hashes, .. } => Some(hashes),
-            Self::PerProject => None,
+            Self::PerProject { .. } => None,
         }
     }
 }
@@ -96,6 +98,8 @@ impl VirtualStorePlan {
 /// yet, so a source-backed dep and its ancestors simply miss the
 /// already-linked shortcut and take the verified path instead.
 pub(super) struct VirtualStorePlanInputs<'a> {
+    pub cwd: &'a std::path::Path,
+    pub reuse_existing_entries: bool,
     pub graph: &'a std::sync::Arc<aube_lockfile::LockfileGraph>,
     pub store: &'a aube_store::Store,
     pub link_strategy: aube_linker::LinkStrategy,
@@ -112,18 +116,16 @@ pub(super) struct VirtualStorePlanInputs<'a> {
 /// This runs before the fetch phase rather than inside the prewarm
 /// task that overlaps it, because the already-linked shortcut needs the
 /// hashes to classify an entry correctly (see [`VirtualStorePlan`]).
-/// The prewarm and link phases then reuse the same `Arc` instead of
-/// repeating the walk, so the only cost is that on the lockfile-reuse
-/// path the walk no longer hides behind the fetch tail. Measured on a
-/// warm install of the 1.4k-package medium fixture (debug build): the
-/// fetch phase goes 5.1 ms -> 7.7 ms, the prewarm loses the matching
-/// 1.7 ms `hash_await`, and total install time is unchanged inside
-/// run-to-run noise. The cold-resolve path pays nothing at all — its
-/// tarball fetch is already in flight by the time this is called.
+/// Global-store hashes are reused by prewarm and link. Per-project
+/// entries also need to match the prior install's subtree fingerprint:
+/// the link phase deletes changed subtrees, so mere existence cannot
+/// guarantee that it will reuse an entry without a package index.
 pub(super) async fn plan_virtual_store(
     inputs: VirtualStorePlanInputs<'_>,
 ) -> miette::Result<VirtualStorePlan> {
     let VirtualStorePlanInputs {
+        cwd,
+        reuse_existing_entries,
         graph,
         store,
         link_strategy,
@@ -143,7 +145,32 @@ pub(super) async fn plan_virtual_store(
         probe = probe.with_use_global_virtual_store(enabled);
     }
     if !probe.uses_global_virtual_store() {
-        return Ok(VirtualStorePlan::PerProject);
+        if !reuse_existing_entries {
+            return Ok(VirtualStorePlan::PerProject {
+                reusable: Default::default(),
+            });
+        }
+        let cwd = cwd.to_path_buf();
+        let graph = graph.clone();
+        let reusable = tokio::task::spawn_blocking(move || {
+            let Some(prior) = crate::state::read_state_subtree_hashes(&cwd) else {
+                return std::collections::BTreeSet::new();
+            };
+            let (_, current) =
+                super::delta::compute_leaf_and_subtree_hashes(&graph, &patch_hashes, &cwd);
+            current
+                .into_iter()
+                .filter_map(|(dep_path, hash)| {
+                    (prior.get(&dep_path) == Some(&hash)).then_some(dep_path)
+                })
+                .collect()
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("per-project virtual store planning failed")?;
+        return Ok(VirtualStorePlan::PerProject {
+            reusable: std::sync::Arc::new(reusable),
+        });
     }
     let virtual_store = store.virtual_store_dir();
 
@@ -205,12 +232,18 @@ pub(super) type MaterializeChannel = (
     tokio::sync::mpsc::Receiver<(String, aube_store::PackageIndex)>,
 );
 
-pub(super) type MaterializeJoinHandle = tokio::task::JoinHandle<
-    miette::Result<(
-        aube_linker::LinkStats,
-        Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
-    )>,
->;
+/// What the fetch-time materializer hands the link phase.
+pub(super) struct PrewarmOutcome {
+    pub stats: aube_linker::LinkStats,
+    /// Graph hashes the global virtual-store prewarm named entries with;
+    /// `None` for the per-project materializer.
+    pub graph_hashes: Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
+    /// Dep paths whose global virtual-store entry the prewarm placed itself
+    /// under `graph_hashes`, rather than finding one already there.
+    pub placed: Vec<String>,
+}
+
+pub(super) type MaterializeJoinHandle = tokio::task::JoinHandle<miette::Result<PrewarmOutcome>>;
 
 pub(super) fn materialize_channel() -> MaterializeChannel {
     let (tx, rx) = tokio::sync::mpsc::channel(MATERIALIZE_CHANNEL_CAPACITY);
@@ -261,10 +294,7 @@ pub(super) async fn combine_install_pipeline_errors(
 pub(super) async fn run_gvs_prewarm_materializer(
     inputs: GvsPrewarmInputs,
     materialize_rx: tokio::sync::mpsc::Receiver<(String, aube_store::PackageIndex)>,
-) -> miette::Result<(
-    aube_linker::LinkStats,
-    Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
-)> {
+) -> miette::Result<PrewarmOutcome> {
     let GvsPrewarmInputs {
         graph,
         store,
@@ -371,8 +401,9 @@ pub(super) async fn run_gvs_prewarm_materializer(
     sem.disable_cusum_shrink();
     let linker_sem_for_persist = std::sync::Arc::clone(&sem);
     let linker_persistent_for_save = linker_persistent.clone();
-    let mut in_flight: Vec<tokio::task::JoinHandle<miette::Result<aube_linker::LinkStats>>> =
-        Vec::new();
+    let mut in_flight: Vec<
+        tokio::task::JoinHandle<miette::Result<(String, aube_linker::LinkStats)>>,
+    > = Vec::new();
     let mut rx = materialize_rx;
     while let Some((key, index)) = rx.recv().await {
         // canonical_to_contextualized only stores entries where
@@ -437,7 +468,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
                             nested_link_targets.as_deref(),
                         )
                         .map_err(|e| miette!("prewarm GVS for {dep_path_for_err}: {e}"))?;
-                    Ok(stats)
+                    Ok((dep_path, stats))
                 })
                 .await
                 .into_diagnostic()?;
@@ -450,8 +481,15 @@ pub(super) async fn run_gvs_prewarm_materializer(
         }
     }
     let mut total = aube_linker::LinkStats::default();
+    let mut placed = Vec::new();
     for handle in in_flight {
-        let s = handle.await.into_diagnostic()??;
+        let (dep_path, s) = handle.await.into_diagnostic()??;
+        // `packages_linked` stays 1 only when this call materialized the
+        // entry and won the rename; a lost race or an existing entry
+        // leaves it at 0.
+        if s.packages_linked > 0 {
+            placed.push(dep_path);
+        }
         total.packages_linked += s.packages_linked;
         total.packages_cached += s.packages_cached;
         total.files_linked += s.files_linked;
@@ -459,7 +497,11 @@ pub(super) async fn run_gvs_prewarm_materializer(
     if let Some(state) = linker_persistent_for_save.as_ref() {
         linker_sem_for_persist.persist(state, "linker_prewarm:default");
     }
-    Ok((total, Some(graph_hashes_arc)))
+    Ok(PrewarmOutcome {
+        stats: total,
+        graph_hashes: Some(graph_hashes_arc),
+        placed,
+    })
 }
 
 /// Per-project materializer: pipelines the link work into the fetch
@@ -474,10 +516,7 @@ async fn run_aube_dir_materializer(
     cwd: std::path::PathBuf,
     link_concurrency: Option<usize>,
     materialize_rx: tokio::sync::mpsc::Receiver<(String, aube_store::PackageIndex)>,
-) -> miette::Result<(
-    aube_linker::LinkStats,
-    Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
-)> {
+) -> miette::Result<PrewarmOutcome> {
     let aube_dir = std::sync::Arc::new(linker.aube_dir_for(&cwd));
     aube_linker::mkdirp(&aube_dir).map_err(|e| miette!("create {}: {e}", aube_dir.display()))?;
     let nested_link_targets =
@@ -608,12 +647,16 @@ async fn run_aube_dir_materializer(
     if let Some(state) = perproj_persistent_for_save.as_ref() {
         perproj_sem_for_persist.persist(state, "linker_per_project:default");
     }
-    Ok((total, None))
+    Ok(PrewarmOutcome {
+        stats: total,
+        graph_hashes: None,
+        placed: Vec::new(),
+    })
 }
 
 #[cfg(test)]
 mod combine_pipeline_errors_tests {
-    use super::combine_install_pipeline_errors;
+    use super::{PrewarmOutcome, combine_install_pipeline_errors};
     use miette::miette;
 
     fn fmt_chain(report: &miette::Report) -> String {
@@ -630,10 +673,11 @@ mod combine_pipeline_errors_tests {
     #[tokio::test]
     async fn returns_fetch_err_when_materializer_succeeded() {
         let handle = tokio::spawn(async {
-            Ok((
-                aube_linker::LinkStats::default(),
-                None::<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
-            ))
+            Ok(PrewarmOutcome {
+                stats: aube_linker::LinkStats::default(),
+                graph_hashes: None,
+                placed: Vec::new(),
+            })
         });
         let fetch_err = miette!("network down: timed out fetching foo@1.0");
         let combined = combine_install_pipeline_errors(handle, fetch_err).await;
@@ -647,13 +691,7 @@ mod combine_pipeline_errors_tests {
     #[tokio::test]
     async fn nests_both_errors_when_materializer_failed() {
         let handle = tokio::spawn(async {
-            Err::<
-                (
-                    aube_linker::LinkStats,
-                    Option<std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
-                ),
-                _,
-            >(miette!("materialize foo@1.0: permission denied"))
+            Err::<PrewarmOutcome, _>(miette!("materialize foo@1.0: permission denied"))
         });
         // The fetch task surfaces the channel-closed symptom.
         let fetch_err = miette!("materializer task exited before fetch finished");

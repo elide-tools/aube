@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1](https://github.com/aubepkg/aube/compare/aube-resolver-v2.6.0...aube-resolver-v2.6.1) - 2026-09-29
+
+### Fixed
+
+- *(resolver)* converge peer-context pass on dense hashed peer webs ([#1669](https://github.com/aubepkg/aube/pull/1669))
+
+### Other
+
+- refresh benchmarks for v2.6.0 ([#1667](https://github.com/aubepkg/aube/pull/1667))
+
+## [2.6.0](https://github.com/aubepkg/aube/compare/aube-resolver-v2.5.1...aube-resolver-v2.6.0) - 2026-09-28
+
+### Added
+
+- publish an agent skill with release packslips ([#1644](https://github.com/aubepkg/aube/pull/1644))
+- support Bun 1.4 scoped overrides in bun.lock and package.json ([#1639](https://github.com/aubepkg/aube/pull/1639))
+
+### Fixed
+
+- *(trust)* allow why-is-node-running 3.2.2 without provenance ([#1653](https://github.com/aubepkg/aube/pull/1653))
+- *(import)* read Bun 1.4 lockfiles and link peer dependencies when importing ([#1638](https://github.com/aubepkg/aube/pull/1638))
+
+## [2.5.1](https://github.com/aubepkg/aube/compare/aube-resolver-v2.5.0...aube-resolver-v2.5.1) - 2026-09-27
+
+### Other
+
+- refresh benchmarks for v2.5.0 ([#1630](https://github.com/aubepkg/aube/pull/1630))
+
+## [2.5.0](https://github.com/aubepkg/aube/compare/aube-resolver-v2.4.0...aube-resolver-v2.5.0) - 2026-09-26
+
+### Fixed
+
+- *(resolver)* show paste-ready exemptions in trust downgrade errors ([#1609](https://github.com/aubepkg/aube/pull/1609))
+
+### Other
+
+- *(resolver)* reuse full metadata for exact optional dependencies ([#1622](https://github.com/aubepkg/aube/pull/1622))
+- *(resolver)* decode fetched release metadata on demand ([#1620](https://github.com/aubepkg/aube/pull/1620))
+- *(resolver)* decode cached release metadata on demand ([#1619](https://github.com/aubepkg/aube/pull/1619))
+- *(resolver)* separate version selection from dependency metadata ([#1618](https://github.com/aubepkg/aube/pull/1618))
+- refresh benchmarks for v2.4.0 ([#1608](https://github.com/aubepkg/aube/pull/1608))
+- refresh benchmarks for v2.4.0 ([#1595](https://github.com/aubepkg/aube/pull/1595))
+
+## [2.4.0](https://github.com/aubepkg/aube/compare/aube-resolver-v2.3.0...aube-resolver-v2.4.0) - 2026-09-25
+
+### Fixed
+
+- *(resolver)* exclude webpack-dev-middleware@7.4.6 from no-downgrade by default ([#1592](https://github.com/aubepkg/aube/pull/1592))
+
+### Other
+
+- refresh benchmarks for v2.3.0 ([#1593](https://github.com/aubepkg/aube/pull/1593))
+- send bug reports to GitHub Issues ([#1583](https://github.com/aubepkg/aube/pull/1583))
+
 ## [2.2.16](https://github.com/aubepkg/aube/compare/v2.2.15...v2.2.16) - 2026-09-13
 
 ### Fixed

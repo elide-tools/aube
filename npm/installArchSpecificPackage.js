@@ -1,5 +1,5 @@
 // Fetch the platform-matching @endevco/aube-<os>-<arch> sub-package at
-// install time and hardlink (or copy) its three binaries into ./bin so
+// install time and hardlink (or copy) its executable under three names into ./bin so
 // npm's `bin` wrapper resolves directly to the native executable. The root
 // package's bin targets are stable `./bin/<name>` paths so npm/npx can create
 // shims without reading a rewritten package.json. On Windows, npm's generated
@@ -106,28 +106,30 @@ function linkSubpkgBins(subpkgName, platform) {
     var subpkgRealDir = fs.realpathSync(subpkgDir);
 
     var subpkgBin = subpkg.bin || {};
+    var srcRel = subpkgBin.aube;
+    if (typeof srcRel !== 'string') {
+        throw new Error('platform package has no aube executable');
+    }
+
+    var src = path.resolve(subpkgDir, srcRel);
+    // String-only containment first: rejects `../` traversal before
+    // we ever touch the filesystem.
+    if (!isContained(subpkgDir, src)) {
+        throw new Error('platform package bin "aube" escapes its package directory');
+    }
+    // Then realpath the source so a symlink inside the package can't
+    // smuggle in an arbitrary on-disk file (e.g. `bin/aube -> ~/.ssh/id_rsa`).
+    // The subsequent hardlink/copy follows symlinks, so a bare string
+    // check would let `fs.copyFileSync` read straight through.
+    var srcReal;
+    try { srcReal = fs.realpathSync(src); } catch (e) {
+        throw new Error('platform package bin "aube" cannot be resolved: ' + (e && e.message ? e.message : e));
+    }
+    if (!isContained(subpkgRealDir, srcReal)) {
+        throw new Error('platform package bin "aube" resolves outside its package directory');
+    }
+
     ALLOWED_BINS.forEach(function(name) {
-        var srcRel = subpkgBin[name];
-        if (typeof srcRel !== 'string') return;
-
-        var src = path.resolve(subpkgDir, srcRel);
-        // String-only containment first: rejects `../` traversal before
-        // we ever touch the filesystem.
-        if (!isContained(subpkgDir, src)) {
-            throw new Error('platform package bin "' + name + '" escapes its package directory');
-        }
-        // Then realpath the source so a symlink inside the package can't
-        // smuggle in an arbitrary on-disk file (e.g. `bin/aube -> ~/.ssh/id_rsa`).
-        // The subsequent hardlink/copy follows symlinks, so a bare string
-        // check would let `fs.copyFileSync` read straight through.
-        var srcReal;
-        try { srcReal = fs.realpathSync(src); } catch (e) {
-            throw new Error('platform package bin "' + name + '" cannot be resolved: ' + (e && e.message ? e.message : e));
-        }
-        if (!isContained(subpkgRealDir, srcReal)) {
-            throw new Error('platform package bin "' + name + '" resolves outside its package directory');
-        }
-
         var destBasename = platform === 'win32' ? name + '.exe' : name;
         var dest = path.resolve(binDir, destBasename);
         // destBasename comes from our static allowlist, but guard anyway so
@@ -161,4 +163,4 @@ function linkSubpkgBins(subpkgName, platform) {
 
 if (require.main === module) main();
 
-module.exports = { childNpmEnv: childNpmEnv };
+module.exports = { childNpmEnv: childNpmEnv, linkSubpkgBins: linkSubpkgBins };

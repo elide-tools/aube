@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.6.0...aube-lockfile-v2.6.1) - 2026-09-29
+
+### Fixed
+
+- *(install)* reuse linked trees when the lockfile and store are deleted ([#1671](https://github.com/aubepkg/aube/pull/1671))
+
+### Other
+
+- refresh benchmarks for v2.6.0 ([#1667](https://github.com/aubepkg/aube/pull/1667))
+
+## [2.6.0](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.5.1...aube-lockfile-v2.6.0) - 2026-09-28
+
+### Added
+
+- *(lockfile)* select the lockfile aube reads and writes ([#1649](https://github.com/aubepkg/aube/pull/1649))
+- publish an agent skill with release packslips ([#1644](https://github.com/aubepkg/aube/pull/1644))
+- support Bun 1.4 scoped overrides in bun.lock and package.json ([#1639](https://github.com/aubepkg/aube/pull/1639))
+
+### Fixed
+
+- *(import)* read Bun 1.4 lockfiles and link peer dependencies when importing ([#1638](https://github.com/aubepkg/aube/pull/1638))
+
+## [2.5.1](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.5.0...aube-lockfile-v2.5.1) - 2026-09-27
+
+### Other
+
+- refresh benchmarks for v2.5.0 ([#1630](https://github.com/aubepkg/aube/pull/1630))
+
+## [2.5.0](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.4.0...aube-lockfile-v2.5.0) - 2026-09-26
+
+### Other
+
+- refresh benchmarks for v2.4.0 ([#1608](https://github.com/aubepkg/aube/pull/1608))
+- refresh benchmarks for v2.4.0 ([#1595](https://github.com/aubepkg/aube/pull/1595))
+
+## [2.4.0](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.3.0...aube-lockfile-v2.4.0) - 2026-09-25
+
+### Fixed
+
+- *(lockfile)* read required importer peers from npm lockfiles ([#1588](https://github.com/aubepkg/aube/pull/1588))
+- *(update)* keep workspace member importers when updating at the root ([#1579](https://github.com/aubepkg/aube/pull/1579))
+
+### Other
+
+- refresh benchmarks for v2.3.0 ([#1593](https://github.com/aubepkg/aube/pull/1593))
+- send bug reports to GitHub Issues ([#1583](https://github.com/aubepkg/aube/pull/1583))
+
 ## [2.3.0](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.2.17...aube-lockfile-v2.3.0) - 2026-09-22
 
 ### Fixed

@@ -23,6 +23,7 @@ pub(super) fn pre_parse_lockfile(
     lockfile_importer_key: &str,
     manifest: &aube_manifest::PackageJson,
     parse_options: aube_lockfile::ParseOptions,
+    selected: Option<LockfileKind>,
 ) -> miette::Result<ParsedLockfile> {
     if !lockfile_enabled || !matches!(mode, FrozenMode::Fix | FrozenMode::Prefer) {
         return Ok(None);
@@ -32,10 +33,11 @@ pub(super) fn pre_parse_lockfile(
         lockfile_importer_key,
         manifest,
         parse_options,
+        selected,
     ) {
         Ok(parsed) => Ok(Some(parsed)),
         Err(aube_lockfile::Error::NotFound(_)) => Ok(None),
-        Err(e) if active_lockfile_has_conflict_markers(lockfile_dir) => {
+        Err(e) if active_lockfile_has_conflict_markers(lockfile_dir, selected) => {
             warn_lockfile_conflict_markers(lockfile_dir, &e);
             Ok(None)
         }
@@ -109,6 +111,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         write_lockfile,
         prog_ref,
     } = input;
+    let selected = crate::commands::selected_lockfile_kind_with_ctx(settings_ctx)?;
 
     // `--no-frozen-lockfile` means "always re-resolve", so skip the
     // freshness check entirely in that mode. Otherwise (Prefer, Fix,
@@ -130,6 +133,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                 lockfile_importer_key,
                 manifest,
                 parse_options,
+                selected,
             );
             match &parsed_owned {
                 Ok((g, k)) => Ok((g, *k)),
@@ -139,7 +143,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
     if let Err(e) = parsed
         && !matches!(e, aube_lockfile::Error::NotFound(_))
     {
-        if active_lockfile_has_conflict_markers(lockfile_dir) {
+        if active_lockfile_has_conflict_markers(lockfile_dir, selected) {
             if !lockfile_conflict_marker_warning_emitted {
                 warn_lockfile_conflict_markers(lockfile_dir, e);
             }
@@ -156,6 +160,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                 lockfile_importer_key,
                 manifest,
                 parse_options,
+                selected,
             ) {
                 Ok(_) => {
                     // Race: second parse succeeded while first failed.
@@ -395,6 +400,7 @@ pub(super) struct SelectLockfileInput<'a> {
     pub lockfile_importer_key: &'a str,
     pub manifest: &'a aube_manifest::PackageJson,
     pub parse_options: aube_lockfile::ParseOptions,
+    pub selected: Option<LockfileKind>,
     pub manifests: &'a [(String, aube_manifest::PackageJson)],
     pub ws_config: &'a aube_manifest::workspace::WorkspaceConfig,
     pub workspace_catalogs: &'a crate::commands::CatalogMap,
@@ -413,6 +419,7 @@ pub(super) fn select_lockfile_result(
         lockfile_importer_key,
         manifest,
         parse_options,
+        selected,
         manifests,
         ws_config,
         workspace_catalogs,
@@ -438,6 +445,7 @@ pub(super) fn select_lockfile_result(
                 lockfile_importer_key,
                 manifest,
                 parse_options,
+                selected,
             );
             if let Ok((ref graph, kind)) = parsed {
                 if let DriftStatus::Stale { reason } =
@@ -543,8 +551,11 @@ pub(crate) fn check_patch_drift(
     )
 }
 
-fn active_lockfile_has_conflict_markers(lockfile_dir: &Path) -> bool {
-    aube_lockfile::active_lockfile_has_conflict_markers(lockfile_dir)
+fn active_lockfile_has_conflict_markers(
+    lockfile_dir: &Path,
+    selected: Option<LockfileKind>,
+) -> bool {
+    aube_lockfile::active_lockfile_has_conflict_markers_selecting(lockfile_dir, selected)
 }
 
 fn warn_lockfile_conflict_markers(lockfile_dir: &Path, err: &aube_lockfile::Error) {
@@ -612,10 +623,7 @@ pub(super) fn apply_lockfile_graph_platform_rules(
     // so without the hoist running first it prunes every
     // peer-only package as unreachable — and a post-prune hoist
     // has nothing left to promote.
-    let needs_peer_pass = matches!(
-        kind,
-        LockfileKind::Npm | LockfileKind::NpmShrinkwrap | LockfileKind::Bun
-    );
+    let needs_peer_pass = lockfile_needs_peer_pass(kind);
     // Time the hoist on its own, then `filter_graph` runs untimed
     // (it's not part of the peer pass), then apply is timed below.
     // Snapshotting `pkgs_before` after `filter_graph` keeps the
@@ -633,14 +641,7 @@ pub(super) fn apply_lockfile_graph_platform_rules(
         &ignored_optional_deps,
     );
     if let Some(hoist_elapsed) = hoist_elapsed {
-        let peer_options = aube_resolver::PeerContextOptions {
-            dedupe_peer_dependents: super::settings::resolve_dedupe_peer_dependents(settings_ctx),
-            dedupe_peers: super::settings::resolve_dedupe_peers(settings_ctx),
-            resolve_from_workspace_root: super::settings::resolve_peers_from_workspace_root(
-                settings_ctx,
-            ),
-            peers_suffix_max_length: super::settings::resolve_peers_suffix_max_length(settings_ctx),
-        };
+        let peer_options = lockfile_peer_context_options(settings_ctx);
         let pkgs_before = graph.packages.len();
         let apply_start = std::time::Instant::now();
         graph = aube_resolver::apply_peer_contexts(graph, &peer_options)
@@ -654,6 +655,31 @@ pub(super) fn apply_lockfile_graph_platform_rules(
         );
     }
     Ok(graph)
+}
+
+/// Whether a graph read from a lockfile of this kind still needs the
+/// `hoist_auto_installed_peers` + `apply_peer_contexts` passes. npm and bun
+/// lockfiles record no peer context; aube and pnpm lockfiles already carry
+/// peer suffixes, so re-running the pass would double-suffix every key.
+pub(crate) fn lockfile_needs_peer_pass(kind: LockfileKind) -> bool {
+    matches!(
+        kind,
+        LockfileKind::Npm | LockfileKind::NpmShrinkwrap | LockfileKind::Bun
+    )
+}
+
+/// Peer-context settings for contextualizing a lockfile-sourced graph.
+pub(crate) fn lockfile_peer_context_options(
+    settings_ctx: &aube_settings::ResolveCtx<'_>,
+) -> aube_resolver::PeerContextOptions {
+    aube_resolver::PeerContextOptions {
+        dedupe_peer_dependents: super::settings::resolve_dedupe_peer_dependents(settings_ctx),
+        dedupe_peers: super::settings::resolve_dedupe_peers(settings_ctx),
+        resolve_from_workspace_root: super::settings::resolve_peers_from_workspace_root(
+            settings_ctx,
+        ),
+        peers_suffix_max_length: super::settings::resolve_peers_suffix_max_length(settings_ctx),
+    }
 }
 
 pub(super) fn lockfile_source_label(kind: LockfileKind) -> &'static str {

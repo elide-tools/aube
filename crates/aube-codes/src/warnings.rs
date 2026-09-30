@@ -44,6 +44,7 @@ pub const WARN_AUBE_INVALID_BLOCK_EXOTIC_SUBDEPS_EXCLUDE: &str =
 pub const WARN_AUBE_OVERRIDE_MISSING_DEP: &str = "WARN_AUBE_OVERRIDE_MISSING_DEP";
 pub const WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED: &str =
     "WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED";
+pub const WARN_AUBE_OVERRIDE_TOO_DEEP: &str = "WARN_AUBE_OVERRIDE_TOO_DEEP";
 pub const WARN_AUBE_INVALID_PEER_PATTERN: &str = "WARN_AUBE_INVALID_PEER_PATTERN";
 pub const WARN_AUBE_INVALID_SAVE_PREFIX: &str = "WARN_AUBE_INVALID_SAVE_PREFIX";
 pub const WARN_AUBE_CONCURRENCY_ENV_INVALID: &str = "WARN_AUBE_CONCURRENCY_ENV_INVALID";
@@ -104,6 +105,7 @@ pub const WARN_AUBE_YARN_BERRY_UNSUPPORTED: &str = "WARN_AUBE_YARN_BERRY_UNSUPPO
 pub const WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX: &str =
     "WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX";
 pub const WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE: &str = "WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE";
+pub const WARN_AUBE_HIDDEN_LOCKFILE_BROKEN: &str = "WARN_AUBE_HIDDEN_LOCKFILE_BROKEN";
 
 // ── global installs ─────────────────────────────────────────────────
 pub const WARN_AUBE_GLOBAL_DIR_LEGACY_LOCATION: &str = "WARN_AUBE_GLOBAL_DIR_LEGACY_LOCATION";
@@ -324,6 +326,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED,
         category: category::SETTINGS_CONFIG,
         description: "An `overrides` entry used pnpm's deprecated `$` version reference syntax.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_OVERRIDE_TOO_DEEP,
+        category: category::SETTINGS_CONFIG,
+        description: "A nested `overrides` entry went deeper than one level (or chained `>` inside a group) and was skipped.",
         exit_code: None,
     },
     CodeMeta {
@@ -578,6 +586,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE,
         category: category::LOCKFILE,
         description: "`aube outdated -g` found a global install without a lockfile and skipped that install.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_HIDDEN_LOCKFILE_BROKEN,
+        category: category::LOCKFILE,
+        description: "The hidden lockfile in `node_modules/.aube-lock.yaml` could not be parsed, so install ignored it and resolved dependencies without it.",
         exit_code: None,
     },
     // Global installs

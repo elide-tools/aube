@@ -298,7 +298,8 @@ pub fn check_no_downgrade(
 /// Trust-policy check using the compact history fetched for an exact
 /// dependency. The selected release remains full [`VersionMetadata`]; only
 /// historical releases use the evidence-only representation.
-pub fn check_no_downgrade_compact(
+#[cfg(test)]
+fn check_no_downgrade_compact(
     packument: &Packument,
     picked_version: &str,
     picked_meta: &VersionMetadata,
@@ -341,16 +342,49 @@ pub fn check_no_downgrade_history(
     )
 }
 
+/// Enforce the same policy over deferred metadata or a newer exact history.
+pub(crate) fn check_no_downgrade_resolution(
+    packument: &aube_registry::ResolutionPackument,
+    picked: &VersionMetadata,
+    exact_history: Option<&std::collections::BTreeMap<String, aube_registry::VersionTrustMetadata>>,
+    exclude: &TrustExcludeRules,
+    ignore_after_minutes: Option<u64>,
+) -> Result<(), TrustCheckError> {
+    if let Some(history) = exact_history {
+        return check_no_downgrade_over_history(
+            &packument.name,
+            &packument.time,
+            &picked.version,
+            evidence_for(picked),
+            history,
+            exclude,
+            ignore_after_minutes,
+        );
+    }
+    check_no_downgrade_over_history(
+        &packument.name,
+        &packument.time,
+        &picked.version,
+        evidence_for(picked),
+        packument
+            .versions
+            .iter()
+            .map(|(version, metadata)| (version, metadata.trust_metadata())),
+        exclude,
+        ignore_after_minutes,
+    )
+}
+
 /// Shared core for the compact-history trust checks: rank the strongest
 /// prior evidence in `history` and reject a picked version that weakens
 /// it. `history` may or may not contain `picked_version` itself — the
 /// ranking loop always skips it.
-fn check_no_downgrade_over_history(
+fn check_no_downgrade_over_history<'a>(
     name: &str,
     time: &std::collections::BTreeMap<String, String>,
     picked_version: &str,
     picked_evidence: Option<TrustEvidence>,
-    history: &std::collections::BTreeMap<String, aube_registry::VersionTrustMetadata>,
+    history: impl IntoIterator<Item = (&'a String, &'a aube_registry::VersionTrustMetadata)>,
     exclude: &TrustExcludeRules,
     ignore_after_minutes: Option<u64>,
 ) -> Result<(), TrustCheckError> {
@@ -455,6 +489,15 @@ pub const DEFAULT_TRUST_POLICY_EXCLUDES: &[&str] = &[
     // attestation after the trusted 2.0.10 release (2026-07-15). Trusted
     // publishing resumed with 1.19.17, so keep the exception version-scoped.
     "@hono/node-server@1.19.15",
+    // webpack-dev-middleware@7.4.6 (2026-09-03) is a hand-published backport
+    // on the 7.x maintenance line, released after the trusted 8.0.0 by the
+    // same maintainer who published every earlier 7.x release. It is what
+    // webpack-dev-server@5's `^7.4.2` range selects, so keep it version-scoped.
+    "webpack-dev-middleware@7.4.6",
+    // why-is-node-running@3.2.2 (2025-01-08) was published by the same npm
+    // account as the attested 3.2.0 release, but without provenance metadata.
+    // Keep the exception version-scoped so later releases remain protected.
+    "why-is-node-running@3.2.2",
     "chokidar",
     "eslint-config-prettier",
     "eslint-import-resolver-typescript",
@@ -1613,6 +1656,38 @@ mod tests {
             &node_semver::Version::parse("2.0.10").unwrap()
         ));
         assert!(!r.matches("hono", &node_semver::Version::parse("1.19.15").unwrap()));
+    }
+
+    #[test]
+    fn default_excludes_webpack_dev_middleware_backport() {
+        // Regression: 7.4.6 was hand-published on the 7.x line after the
+        // attested 8.0.0 release; later releases stay protected.
+        let r = TrustExcludeRules::default();
+        assert!(r.matches(
+            "webpack-dev-middleware",
+            &node_semver::Version::parse("7.4.6").unwrap()
+        ));
+        assert!(!r.matches(
+            "webpack-dev-middleware",
+            &node_semver::Version::parse("7.4.7").unwrap()
+        ));
+        assert!(!r.matches(
+            "webpack-dev-middleware",
+            &node_semver::Version::parse("8.3.0").unwrap()
+        ));
+    }
+
+    #[test]
+    fn default_excludes_why_is_node_running_3_2_2_only() {
+        let r = TrustExcludeRules::default();
+        assert!(r.matches(
+            "why-is-node-running",
+            &node_semver::Version::parse("3.2.2").unwrap()
+        ));
+        assert!(!r.matches(
+            "why-is-node-running",
+            &node_semver::Version::parse("3.2.3").unwrap()
+        ));
     }
 
     #[test]

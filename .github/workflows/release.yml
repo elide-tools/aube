@@ -366,6 +366,9 @@ jobs:
           AUBE_PGO_BOLT: "1"
           AUBE_PGO_USE_LLD: "1"
           AUBE_PGO_LLVM_VERSION: ${{ env.LLVM_VERSION }}
+          # Links the executables non-PIE (see link_without_pie in
+          # crates/aube/build.rs).
+          AUBE_NO_PIE: "1"
         run: |
           container_home="$RUNNER_TEMP/aube-home"
           # Docker creates missing bind-mount sources as root. Create target as
@@ -384,6 +387,7 @@ jobs:
             --env AUBE_PGO_BOLT \
             --env AUBE_PGO_USE_LLD \
             --env AUBE_PGO_LLVM_VERSION \
+            --env AUBE_NO_PIE \
             --env HOME=/tmp/aube-home \
             --env CARGO_HOME=/tmp/aube-home/.cargo \
             --env MISE_CACHE_DIR=/tmp/mise-cache \
@@ -411,6 +415,10 @@ jobs:
           if [ -n "$max_glibc" ] && \
              [ "$(printf '%s\n' GLIBC_2.31 "$max_glibc" | sort -V | tail -1)" != "GLIBC_2.31" ]; then
             echo "::error::ARM64 release requires $max_glibc, newer than GLIBC_2.31"
+            exit 1
+          fi
+          if ! readelf -h "$bin" | grep -q 'Type:.*EXEC'; then
+            echo "::error::$bin is not linked non-PIE; AUBE_NO_PIE did not reach build.rs"
             exit 1
           fi
           "$bin" --version
@@ -597,7 +605,20 @@ jobs:
           AUBE_PGO_TARGET: ${{ matrix.target }}
           AUBE_PGO_BOLT: ${{ matrix.bolt && '1' || '' }}
           AUBE_PGO_LLVM_VERSION: ${{ matrix.bolt && '18' || '' }}
+          # Links the Linux GNU executables non-PIE (see link_without_pie in
+          # crates/aube/build.rs); ignored for every other target.
+          AUBE_NO_PIE: "1"
         run: bash benchmarks/pgo.bash
+      - name: Check the Linux GNU binary is linked non-PIE
+        if: contains(matrix.target, '-linux-gnu')
+        shell: bash
+        env:
+          BINARY: target/${{ matrix.target }}/release-pgo/aube
+        run: |
+          if ! readelf -h "$BINARY" | grep -q 'Type:.*EXEC'; then
+            echo "::error::$BINARY is not linked non-PIE; AUBE_NO_PIE did not reach build.rs"
+            exit 1
+          fi
       - name: Codesign macOS binaries
         if: startsWith(matrix.os, 'macos')
         shell: bash
@@ -736,7 +757,7 @@ jobs:
   # The packslip is this release's signed inventory: every archive's digest,
   # the three multicall executables inside it, the shared objects it needs
   # from the host, and the workflow identity that signed for all of it. An
-  # installer checks a download against jdx/aube's identity rather than
+  # installer checks a download against aubepkg/aube's identity rather than
   # against a key this project would have to hold. See https://packslip.dev.
   #
   # Its own job because the four upload jobs above each write straight to the
@@ -756,6 +777,18 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ format('refs/tags/{0}', inputs.tag) }}
+          persist-credentials: false
+      - name: Resolve the release source and available skill
+        id: source
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Recovery runs can target releases older than the skill.
+          if [ -f skills/aube/SKILL.md ]; then
+            echo "skill=skill/aube=repo:skills/aube" >> "$GITHUB_OUTPUT"
+          fi
       - name: Download the release archives
         shell: bash
         env:
@@ -810,15 +843,16 @@ jobs:
           POWERSHELL
           pwsh -NoProfile -NonInteractive -File completion-syntax-check.ps1
           gh release upload "$TAG" resources/* --repo "$REPO" --clobber
-      # The jobs that built these archives already attested them as they went,
-      # which is the stronger claim; attesting again here would only add a
-      # second statement about the same digests.
-      - uses: jdx/packslip@74c75db7d611b36dd5a157999ec16cf823ccf80c # v1.2.0
+      # The jobs that built these archives already attested them as they went.
+      # Link that provenance from the inventory without attesting them again.
+      - uses: jdx/packslip@87479dfc6443253dff69601cace5fc6ea07e6df5 # v1.4.0
         with:
           tag: ${{ inputs.tag }}
+          commit: ${{ steps.source.outputs.commit }}
           artifacts: dist/aube-v*.tar.gz dist/aube-v*.zip
           bin: aube aubr aubx
           resources: |
+            ${{ steps.source.outputs.skill }}
             cli-spec/usage/aube=asset:resources/aube.usage.kdl
             completion/bash/aube=asset:resources/aube.bash
             completion/zsh/aube=asset:resources/aube.zsh
@@ -832,5 +866,5 @@ jobs:
             completion/zsh/aubx=asset:resources/aubx.zsh
             completion/fish/aubx=asset:resources/aubx.fish
             completion/powershell/aubx=asset:resources/aubx.powershell
-          attest: "false"
+          attest: link
           token: ${{ secrets.AUBE_GH_TOKEN }}

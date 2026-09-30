@@ -62,7 +62,7 @@ subsystems:
 
 support:
   issues_disabled: true
-  channel: https://github.com/jdx/aube/discussions
+  channel: https://github.com/aubepkg/aube/discussions
   doc_phrasing: link Discussions, never "file an issue" or "open an issue"
 
 pr_release_notes:
@@ -141,7 +141,7 @@ when_to_use_release:
 
 commits:
   format: <type>(<scope>): <description>
-  style: conventional commits — start the description lowercase, use imperative mood, keep it concise, subject typically <=80 chars (p95 in history is 73), usually no body
+  style: conventional commits — start the description lowercase or with an acronym such as `CLI`, use imperative mood, keep it concise, subject typically <=80 chars (p95 in history is 73), usually no body
   why: PR titles drive release-plz version bumps (feat→minor, fix→patch, BREAKING CHANGE/`!` →major, others→no bump). enforced by .github/workflows/semantic-pr-lint.yml on PR title via amannn/action-semantic-pull-request
   types[12]: fix, feat, refactor, chore, docs, style, test, perf, build, ci, revert, security
   scope_optional: true (omit for repo-wide changes like `chore: release v1.2.0`)
@@ -255,6 +255,7 @@ security[5]:
 deps:
   policy: minimize, prefer std over external, every added dep must justify >=20 LOC saved
   version_requirements: use the lowest compatibility-significant specificity (for example, "1" for stable 1.x dependencies)
+  internal_crate_requirements: the aube-* workspace crates are released in lockstep, so their path dependencies in [workspace.dependencies] carry the full workspace version (release-plz bumps them each release). A bare major would let a consumer's Cargo.lock keep an older sibling next to a newer aube, which lacks APIs the newer crate calls
   routine_updates: update Cargo.lock only when the existing Cargo.toml requirement already accepts the new version
   lockfile_scope: keep dependency lockfile updates focused; avoid unrelated transitive churn
   tls: rustls (no OpenSSL / native-tls)

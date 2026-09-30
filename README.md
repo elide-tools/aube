@@ -39,7 +39,7 @@ To pin aube for a project with mise, run `mise use aube` inside that project.
 ## Why aube
 
 <!-- BENCH_RATIOS:START -->
-**[Fast installs](https://aube.sh/benchmarks).** Warm installs are about 8x faster than pnpm and about 3x faster than Bun in the current benchmarks. Repeat test commands run up to 24x faster than pnpm and up to 2x faster than Bun.
+**[Fast installs](https://aube.sh/benchmarks).** Warm installs are ~1.8x faster than pnpm and about 2x faster than Bun in the current benchmarks. Repeat test commands run up to 4x faster than pnpm and up to 2x faster than Bun.
 <!-- BENCH_RATIOS:END -->
 
 Those results describe the recorded fixtures and cache conditions. See the
@@ -84,7 +84,7 @@ argument forwarding, and workspace runs.
 | `package-lock.json` | v2 and v3 |
 | `npm-shrinkwrap.json` | npm shrinkwrap |
 | `yarn.lock` | Classic v1 and Berry v2+ |
-| `bun.lock` | Text format v1 |
+| `bun.lock` | Text format v1–v3 (Bun 1.4) |
 
 Run `aube install`, inspect the diff, and run your tests. You do not need to
 import or delete a supported lockfile. Upgrade older pnpm lockfiles with pnpm
@@ -134,6 +134,20 @@ Commands run through aube use the project's Node pin from `devEngines.runtime`,
 See [workspaces](https://aube.sh/package-manager/workspaces) and
 [Node runtime switching](https://aube.sh/package-manager/node-runtime).
 
+## Agent skill
+
+The [aube skill](skills/aube/SKILL.md) helps coding agents manage dependencies,
+run scripts, and diagnose installs while preserving the project's lockfile and
+build approvals. Release Packslips pin the skill to the release's source commit.
+With a release that includes the skill active in mise, link it into your project:
+
+```sh
+mise skills sync --dir .agents/skills
+```
+
+See [mise's skills documentation](https://mise.jdx.dev/dev-tools/packslip-resources.html#skills)
+for discovery and automatic synchronization.
+
 ## Find your next step
 
 - [CI and containers](https://aube.sh/package-manager/ci): frozen installs, production dependencies, and cache choices.
@@ -142,7 +156,7 @@ See [workspaces](https://aube.sh/package-manager/workspaces) and
 - [Embedding](https://aube.sh/embedding/): use aube from Rust, Node-API, or a C ABI host.
 - [Contributing](CONTRIBUTING.md): build, test, and improve aube.
 
-Questions and bug reports belong in [GitHub Discussions](https://github.com/jdx/aube/discussions).
+Report bugs in [GitHub Issues](https://github.com/aubepkg/aube/issues). Ask questions in [GitHub Discussions](https://github.com/aubepkg/aube/discussions).
 Report vulnerabilities through the [security policy](SECURITY.md).
 
 *aube* means dawn in French, pronounced `/ob/` ("ohb"). Built by [jdx](https://jdx.dev).

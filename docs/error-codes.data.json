@@ -771,6 +771,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_OVERRIDE_TOO_DEEP",
+      "category": "Settings / config validation",
+      "description": "A nested `overrides` entry went deeper than one level (or chained `>` inside a group) and was skipped.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_INVALID_PEER_PATTERN",
       "category": "Settings / config validation",
       "description": "A `peerDependencyRules` pattern was unparseable and skipped.",
@@ -1014,6 +1020,12 @@
       "name": "WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE",
       "category": "Lockfile",
       "description": "`aube outdated -g` found a global install without a lockfile and skipped that install.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_HIDDEN_LOCKFILE_BROKEN",
+      "category": "Lockfile",
+      "description": "The hidden lockfile in `node_modules/.aube-lock.yaml` could not be parsed, so install ignored it and resolved dependencies without it.",
       "exit_code": null
     },
     {
