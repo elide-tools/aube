@@ -987,6 +987,11 @@ JSON
 	run aube -C .. run probe
 	assert_success
 	assert_output --partial "pwd-matches: true"
+	# A symlinked -C target must also export the physical working directory.
+	ln -s .. project-link
+	run aube -C project-link run probe
+	assert_success
+	assert_output --partial "pwd-matches: true"
 }
 
 @test "aube run forwards args to a direct command without shell reparse" {

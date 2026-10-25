@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh TLS and Tokio security fixes while retaining ZIP 9, and remove the unmaintained YAML backend from workspace edits.
+- Export the resolved working directory as `PWD` for directly executed scripts, including relative and symlinked `-C` paths.
+- Update the API compatibility checker to support the current Rust documentation format.
+
 ## [2.6.1](https://github.com/aubepkg/aube/compare/v2.6.0...v2.6.1) - 2026-09-29
 
 ### Fixed
