@@ -1599,14 +1599,29 @@ process.exit(17);
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"shell works");
-        create_bin_shim_with_node(
-            &bin,
-            "native",
-            Path::new("/bin/echo"),
-            BinShimOptions::default(),
-            &runtime,
+        // System echo may be a multicall executable that rejects alias argv[0].
+        // Compile a native fixture so this exercises arbitrary package-bin names.
+        let source = tmp.path().join("echo.c");
+        let native = tmp.path().join("echo-bin");
+        std::fs::write(
+            &source,
+            "#include <stdio.h>\nint main(int argc, char **argv) {\n\
+             return argc == 2 && puts(argv[1]) >= 0 ? 0 : 1;\n}\n",
         )
         .unwrap();
+        let compiled = std::process::Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&native)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        create_bin_shim_with_node(&bin, "native", &native, BinShimOptions::default(), &runtime)
+            .unwrap();
         let output = std::process::Command::new(bin.join("native"))
             .arg("native works")
             .output()

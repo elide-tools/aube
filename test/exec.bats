@@ -17,7 +17,16 @@ teardown() {
 	cat >package.json <<'EOF'
 {"name":"native-root","version":"1.0.0","bin":{"native-echo":"native-echo"}}
 EOF
-	ln -s /bin/echo native-echo
+	# System echo may be a multicall binary that rejects an alias argv[0].
+	# Build a real native fixture and retain the symlinked package-bin path.
+	cat >native-echo.c <<'EOF'
+#include <stdio.h>
+int main(int argc, char **argv) {
+    return argc == 2 && puts(argv[1]) >= 0 ? 0 : 1;
+}
+EOF
+	cc native-echo.c -o native-echo-bin
+	ln -s native-echo-bin native-echo
 
 	run aube install
 	assert_success

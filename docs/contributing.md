@@ -26,6 +26,10 @@ Cargo directly, activate mise in your shell first.
 The debug binary is `target/debug/aube`. BATS tests use that binary; release
 builds are for profiling and benchmarks.
 
+Keep a C compiler (`cc`) available for the native package-bin tests. These
+compile small executables rather than aliasing system utilities, which may
+reject renamed invocations on multicall-based distributions.
+
 ## Run the relevant checks
 
 ```sh
