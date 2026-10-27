@@ -47,7 +47,7 @@ homepage = "https://github.com/aubepkg/aube"
 readme = "README.md"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Node-API bindings
@@ -64,13 +64,11 @@ yaml_serde = "0.10"
 # aube to surgically rewrite user-authored workspace YAML files
 # (catalogs, allowBuilds, patchedDependencies) without stripping
 # comments — yaml_serde's round-trip would otherwise destroy them.
-# yamlpatch uses yaml_serde for patch payloads; serde_yaml remains only
-# for the manual block injector that works around nested Add formatting.
+# yamlpatch and the manual block injector both use yaml_serde values.
 yamlpatch = ">=1.25, <1.28"
 # yamlpath 1.28 does not declare the Rust 1.97 requirement it inherits
 # from tree-sitter-iter 1.28, so resolver 3 cannot avoid it.
 yamlpath = ">=1.25, <1.28"
-serde_yaml = "0.9"
 sonic-rs = "0.5"
 toml = "1"
 toml_edit = "0.25"
@@ -90,7 +88,7 @@ strum = { version = "0.28", features = ["derive"] }
 # the final binary. The aube binary gets rustls + hickory-dns through
 # aube-registry's default features.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "http2", "charset", "system-proxy", "gzip", "brotli", "zstd"] }
-webpki-root-certs = "1"
+webpki-root-certs = "1.0.10"
 
 # Hashing
 sha1 = "0.11"
@@ -186,7 +184,7 @@ zstd = { version = "0.14", default-features = false }
 # zip-of-JSONs and the dependency-free std crate ecosystem has no
 # alternative. `deflate` is the only OSV-used compression method, so
 # defeature everything else to keep the build slim.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 # Semver
 node-semver = "2"

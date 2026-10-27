@@ -1011,6 +1011,7 @@ Directory to install dependencies into.
 
 - Type: `path`
 - Default: `"node_modules"`
+- CLI flags: `modulesDir`, `modules-dir`
 - Environment: `npm_config_modules_dir`, `NPM_CONFIG_MODULES_DIR`, `AUBE_MODULES_DIR`
 - .npmrc keys: `modulesDir`, `modules-dir`
 - Workspace YAML keys: `modulesDir`

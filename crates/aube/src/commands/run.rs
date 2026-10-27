@@ -1299,7 +1299,11 @@ async fn build_script_command(
         // the two paths stay indistinguishable. Without this, a tool that
         // reads `process.env.PWD` instead of `process.cwd()` would see
         // aube's invocation dir under `aube -C dir run x`.
-        command.env("PWD", &script_dir);
+        // Resolve `..` and symlinks just as the child's getcwd() does.
+        command.env(
+            "PWD",
+            crate::dirs::canonicalize(&script_dir).into_diagnostic()?,
+        );
     }
     Ok((command, echo_line))
 }
