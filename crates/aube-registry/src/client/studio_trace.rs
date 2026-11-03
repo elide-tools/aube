@@ -29,9 +29,10 @@ impl StudioTrace for RequestBuilder {
 
 fn attach(request: RequestBuilder, url: &str, value: Option<&str>) -> RequestBuilder {
     if Url::parse(url).is_ok_and(|url| pkgst_origin(&url))
-        && let Some(id) = session_id(value) {
-            return request.header("x-elide-studio-session-id", id);
-        }
+        && let Some(id) = session_id(value)
+    {
+        return request.header("x-elide-studio-session-id", id);
+    }
     request
 }
 
