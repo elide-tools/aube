@@ -13,6 +13,7 @@ mod lifecycle;
 mod packument;
 mod parse;
 mod request;
+mod studio_trace;
 mod tarball;
 
 #[cfg(test)]
