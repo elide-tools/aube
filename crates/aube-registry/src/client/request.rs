@@ -3,6 +3,7 @@ use super::body::{
     read_body_capped_streaming_sha512, retry_after_from,
 };
 use super::cache::cached_is_fresh;
+use super::studio_trace::StudioTrace;
 use super::{RegistryClient, encoded_name};
 use crate::{Error, NetworkMode};
 
@@ -59,7 +60,9 @@ impl RegistryClient {
         registry_url: &str,
     ) -> reqwest::RequestBuilder {
         self.authed(
-            self.http_for(registry_url).request(method, url),
+            self.http_for(registry_url)
+                .request(method, url)
+                .studio_trace(url),
             registry_url,
         )
     }
@@ -73,7 +76,8 @@ impl RegistryClient {
     ) -> reqwest::RequestBuilder {
         self.authed_for_package(
             self.http_for_package(registry_url, package_name)
-                .request(method, url),
+                .request(method, url)
+                .studio_trace(url),
             registry_url,
             package_name,
         )
@@ -89,7 +93,9 @@ impl RegistryClient {
         url: &str,
         registry_url: &str,
     ) -> reqwest::RequestBuilder {
-        self.http_for(registry_url).request(method, url)
+        self.http_for(registry_url)
+            .request(method, url)
+            .studio_trace(url)
     }
 
     pub fn has_resolved_auth_for(&self, registry_url: &str) -> bool {
@@ -269,12 +275,14 @@ impl RegistryClient {
         if let Some(package_name) = package_name_from_tarball_url(url) {
             let req = self
                 .http_tarball_for_package(registry_url, &package_name)
-                .request(reqwest::Method::GET, url);
+                .request(reqwest::Method::GET, url)
+                .studio_trace(url);
             self.authed_for_package(req, registry_url, &package_name)
         } else {
             let req = self
                 .http_tarball_for(registry_url)
-                .request(reqwest::Method::GET, url);
+                .request(reqwest::Method::GET, url)
+                .studio_trace(url);
             self.authed(req, registry_url)
         }
     }

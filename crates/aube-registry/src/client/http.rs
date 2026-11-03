@@ -249,6 +249,15 @@ fn build_http_client_inner(
             {
                 return attempt.stop();
             }
+            // Custom correlation headers must never follow Pkgst redirects to another origin.
+            if attempt
+                .previous()
+                .iter()
+                .any(super::studio_trace::pkgst_origin)
+                && !super::studio_trace::pkgst_origin(attempt.url())
+            {
+                return attempt.stop();
+            }
             attempt.follow()
         }))
         // Disable reqwest's built-in `system-proxy` auto-detection
