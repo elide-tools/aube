@@ -209,3 +209,8 @@ aube-util = { path = "crates/aube-util", version = "2.6.1" }
 
 [profile.dev]
 debug = 1
+
+[patch.crates-io]
+# Same compatibility fork used by Elide: permit patched zstd releases instead
+# of decmpfs 0.1.5's exact vulnerable 0.13.3 pin. Retire after an upstream release.
+decmpfs = { git = "https://github.com/elide-tools/decmpfs.git", rev = "55e417d499b20031a708a12bb31b08f12e4c20ac" }

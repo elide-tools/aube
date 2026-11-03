@@ -34,4 +34,4 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Git sources are blocked intentionally. The usage 6.x migration PR is an
 # explicit pre-release experiment and removes this exception when it switches
 # back to the published crates.
-allow-git = ["https://github.com/jdx/usage"]
+allow-git = ["https://github.com/jdx/usage", "https://github.com/elide-tools/decmpfs"]
