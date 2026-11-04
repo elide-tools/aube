@@ -89,15 +89,11 @@ pub fn write_lockfile(
     Ok(())
 }
 
-/// Collapse peer-context variants from `graph` into a single map keyed
-/// by `"name@version"`, pointing at the first-seen package. Several
-/// writers (npm, yarn, …) share this shape: one canonical entry per
-/// `(name, version)` pair regardless of how many peer suffixes the
-/// full graph emits.
+/// Collapse peer contexts while retaining distinct registry alias targets.
 pub fn build_canonical_map(graph: &LockfileGraph) -> BTreeMap<String, &LockedPackage> {
     let mut canonical: BTreeMap<String, &LockedPackage> = BTreeMap::new();
     for pkg in graph.packages.values() {
-        canonical.entry(pkg.spec_key()).or_insert(pkg);
+        canonical.entry(pkg.canonical_dep_path()).or_insert(pkg);
     }
     canonical
 }
@@ -134,6 +130,17 @@ pub fn write_lockfile_as(
     manifest: &aube_manifest::PackageJson,
     kind: LockfileKind,
 ) -> Result<PathBuf, Error> {
+    write_lockfile_as_with_project_root(project_dir, project_dir, graph, manifest, kind)
+}
+
+/// Write to `lockfile_dir` while resolving format-specific manifest paths against `project_root`.
+pub fn write_lockfile_as_with_project_root(
+    lockfile_dir: &Path,
+    project_root: &Path,
+    graph: &LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    kind: LockfileKind,
+) -> Result<PathBuf, Error> {
     let _diag = aube_util::diag::Span::new(aube_util::diag::Category::Lockfile, "write")
         .with_meta_fn(|| {
             format!(
@@ -143,17 +150,21 @@ pub fn write_lockfile_as(
             )
         });
     let filename = match kind {
-        LockfileKind::Aube => aube_lock_filename(project_dir),
-        LockfileKind::Pnpm => pnpm_lock_filename(project_dir),
+        LockfileKind::Aube => aube_lock_filename(lockfile_dir),
+        LockfileKind::Pnpm => pnpm_lock_filename(lockfile_dir),
         other => other.filename().to_string(),
     };
-    let path = project_dir.join(&filename);
+    let path = lockfile_dir.join(&filename);
     match kind {
-        LockfileKind::Aube | LockfileKind::Pnpm => pnpm::write(&path, graph, manifest)?,
-        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => npm::write(&path, graph, manifest)?,
+        LockfileKind::Aube | LockfileKind::Pnpm => {
+            pnpm::write_with_project_root(&path, project_root, graph, manifest)?
+        }
+        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => {
+            npm::write_with_project_root(&path, project_root, graph, manifest)?
+        }
         LockfileKind::Yarn => yarn::write_classic(&path, graph, manifest)?,
         LockfileKind::YarnBerry => yarn::write_berry(&path, graph, manifest)?,
-        LockfileKind::Bun => bun::write(&path, graph, manifest)?,
+        LockfileKind::Bun => bun::write_with_project_root(&path, project_root, graph, manifest)?,
     }
     Ok(path)
 }
@@ -370,18 +381,30 @@ pub fn parse_lockfile_with_kind_and_options_selecting(
     options: ParseOptions,
     selected: Option<LockfileKind>,
 ) -> Result<(LockfileGraph, LockfileKind), Error> {
+    parse_lockfile_with_project_root(project_dir, project_dir, manifest, options, selected)
+}
+
+/// Parse a possibly relocated lockfile. Bun's native local paths are relative
+/// to `project_root`; pnpm-format local paths remain lockfile-relative.
+pub fn parse_lockfile_with_project_root(
+    lockfile_dir: &Path,
+    project_root: &Path,
+    manifest: &aube_manifest::PackageJson,
+    options: ParseOptions,
+    selected: Option<LockfileKind>,
+) -> Result<(LockfileGraph, LockfileKind), Error> {
     if selected.is_none() || selected == Some(LockfileKind::Bun) {
-        reject_bun_binary(project_dir)?;
+        reject_bun_binary(lockfile_dir)?;
     }
-    for (path, kind) in lockfile_candidates_selecting(project_dir, true, selected) {
+    for (path, kind) in lockfile_candidates_selecting(lockfile_dir, true, selected) {
         if !path.exists() {
             continue;
         }
         let kind = refine_yarn_kind(&path, kind);
-        let graph = parse_one(&path, kind, manifest, options)?;
+        let graph = parse_one(&path, kind, manifest, options, project_root)?;
         return Ok((graph, kind));
     }
-    Err(Error::NotFound(project_dir.to_path_buf()))
+    Err(Error::NotFound(lockfile_dir.to_path_buf()))
 }
 
 /// Variant of [`parse_lockfile_with_kind`] used by `aube import`.
@@ -400,7 +423,7 @@ pub fn parse_for_import(
             continue;
         }
         let kind = refine_yarn_kind(&path, kind);
-        let graph = parse_one(&path, kind, manifest, ParseOptions::default())?;
+        let graph = parse_one(&path, kind, manifest, ParseOptions::default(), project_dir)?;
         return Ok((graph, kind));
     }
     Err(Error::NotFound(project_dir.to_path_buf()))
@@ -521,6 +544,7 @@ fn parse_one(
     kind: LockfileKind,
     manifest: &aube_manifest::PackageJson,
     options: ParseOptions,
+    project_root: &Path,
 ) -> Result<LockfileGraph, Error> {
     let _diag = aube_util::diag::Span::new(aube_util::diag::Category::Lockfile, "parse_one")
         .with_meta_fn(|| {
@@ -536,7 +560,7 @@ fn parse_one(
                 aube_util::diag::jstr(&display)
             )
         });
-    let graph = match kind {
+    let mut graph = match kind {
         // `aube-lock.yaml` uses the same on-disk format as pnpm v9 for
         // now — same parser, same writer — so we piggyback on the pnpm
         // module. Keeping the variant distinct lets detection/import
@@ -551,8 +575,64 @@ fn parse_one(
         LockfileKind::Npm | LockfileKind::NpmShrinkwrap => npm::parse(path),
         LockfileKind::Bun => bun::parse(path),
     }?;
+    if matches!(
+        kind,
+        LockfileKind::Aube | LockfileKind::Pnpm | LockfileKind::Bun
+    ) && let Some(lockfile_dir) = path.parent()
+    {
+        fill_local_package_versions(
+            &mut graph,
+            if kind == LockfileKind::Bun {
+                project_root
+            } else {
+                lockfile_dir
+            },
+        );
+    }
     validate_resolution_shapes(path, &graph)?;
     Ok(graph)
+}
+
+/// pnpm-format lockfiles record no version for `file:` directory, `link:`,
+/// and `portal:` packages, so the reader stores a `0.0.0` placeholder; the
+/// bun reader keeps the `file:` or `workspace:` spec a package is listed
+/// under instead. Read the real version from the package's own
+/// `package.json`, as a fresh resolve does — otherwise installs from the
+/// lockfile and `aube list` report the placeholder. Their paths are relative to
+/// `base_dir`: the lockfile's directory for a project lockfile, and the
+/// project root for the hidden lockfile kept under the modules dir.
+pub fn fill_local_package_versions(graph: &mut LockfileGraph, base_dir: &Path) {
+    for pkg in graph.packages.values_mut() {
+        let Some(
+            crate::LocalSource::Directory(dir)
+            | crate::LocalSource::Link(dir)
+            | crate::LocalSource::Portal(dir),
+        ) = &pkg.local_source
+        else {
+            continue;
+        };
+        let placeholder = pkg.version == "0.0.0"
+            || pkg.version.starts_with("file:")
+            // bun reads a `workspace:` spec that names no path as `.`.
+            || (pkg.version.starts_with("workspace:") && dir != Path::new("."));
+        if !placeholder {
+            continue;
+        }
+        let manifest_path = base_dir.join(dir).join("package.json");
+        let version = std::fs::read(&manifest_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|manifest| manifest.get("version")?.as_str().map(str::to_string));
+        match version {
+            Some(version) => pkg.version = version,
+            None => tracing::debug!(
+                "no version in {}; keeping {} for {}",
+                manifest_path.display(),
+                pkg.version,
+                pkg.name
+            ),
+        }
+    }
 }
 
 fn validate_resolution_shapes(path: &Path, graph: &LockfileGraph) -> Result<(), Error> {
@@ -691,6 +771,79 @@ mod tests {
             active_lockfile_path_selecting(dir.path(), Some(LockfileKind::Pnpm)),
             ("pnpm-lock.yaml".to_string(), None)
         );
+    }
+
+    #[test]
+    fn local_package_versions_come_from_their_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(root.join("filedep")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside").join("linked")).unwrap();
+        std::fs::create_dir_all(root.join("noversion")).unwrap();
+        std::fs::write(
+            root.join("filedep").join("package.json"),
+            r#"{"name":"filedep","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("outside")
+                .join("linked")
+                .join("package.json"),
+            r#"{"name":"linked","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("noversion").join("package.json"),
+            r#"{"name":"noversion"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("aube-lock.yaml"),
+            "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      filedep:
+        specifier: file:./filedep
+        version: file:./filedep
+      linked:
+        specifier: link:../outside/linked
+        version: link:../outside/linked
+      noversion:
+        specifier: file:./noversion
+        version: file:./noversion
+
+packages:
+
+  filedep@file:./filedep:
+    resolution: {directory: ./filedep, type: directory}
+
+  noversion@file:./noversion:
+    resolution: {directory: ./noversion, type: directory}
+
+snapshots:
+
+  filedep@file:./filedep: {}
+
+  noversion@file:./noversion: {}
+",
+        )
+        .unwrap();
+
+        let graph = super::parse_lockfile(&root, &aube_manifest::PackageJson::default()).unwrap();
+        let version_of = |name: &str| {
+            graph
+                .packages
+                .values()
+                .find(|pkg| pkg.name == name)
+                .map(|pkg| pkg.version.clone())
+        };
+        assert_eq!(version_of("filedep").as_deref(), Some("1.0.0"));
+        assert_eq!(version_of("linked").as_deref(), Some("2.0.0"));
+        assert_eq!(version_of("noversion").as_deref(), Some("0.0.0"));
     }
 
     fn package_name() -> impl Strategy<Value = String> {

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.4](https://github.com/aubepkg/aube/compare/aube-manifest-v2.8.3...aube-manifest-v2.8.4) - 2026-10-27
+
+### Fixed
+
+- *(lockfile)* keep existing npm lock entries intact on unrelated adds ([#1851](https://github.com/aubepkg/aube/pull/1851))
+
+## [2.8.2](https://github.com/aubepkg/aube/compare/aube-manifest-v2.8.1...aube-manifest-v2.8.2) - 2026-10-22
+
+### Fixed
+
+- *(manifest)* accept pnpm platform-list supportedArchitectures ([#1813](https://github.com/aubepkg/aube/pull/1813))
+
+## [2.7.1](https://github.com/aubepkg/aube/compare/aube-manifest-v2.7.0...aube-manifest-v2.7.1) - 2026-10-15
+
+### Fixed
+
+- *(manifest)* accept nested lockfile settings map in pnpm-workspace.yaml ([#1735](https://github.com/aubepkg/aube/pull/1735))
+- *(deps)* drop serde_yaml to clear unmaintained unsafe-libyaml advisory ([#1728](https://github.com/aubepkg/aube/pull/1728))
+- *(lockfile)* keep npm workspace members in package-lock.json ([#1712](https://github.com/aubepkg/aube/pull/1712))
+
+## [2.7.0](https://github.com/aubepkg/aube/compare/aube-manifest-v2.6.1...aube-manifest-v2.7.0) - 2026-10-07
+
+### Other
+
+- refresh benchmarks for v2.6.1 ([#1675](https://github.com/aubepkg/aube/pull/1675))
+
 ## [2.6.1](https://github.com/aubepkg/aube/compare/aube-manifest-v2.6.0...aube-manifest-v2.6.1) - 2026-09-29
 
 ### Other

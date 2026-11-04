@@ -12,7 +12,7 @@ pub(super) fn resolve_global_virtual_store_override(
         let triggers =
             aube_settings::resolved::disable_global_virtual_store_for_packages(settings_ctx);
         let triggered_by = super::settings::find_gvs_incompatible_trigger(manifests, &triggers);
-        let ci_mode = env_snapshot.iter().any(|(k, _)| k == "CI");
+        let ci_mode = aube_util::env::is_ci_in(env_snapshot);
         let virtual_store_only_setting = aube_settings::resolved::virtual_store_only(settings_ctx);
         if let Some(name) = triggered_by
             && !ci_mode
@@ -42,8 +42,7 @@ pub(super) fn planned_global_virtual_store(
     use_global_virtual_store_override: Option<bool>,
     env_snapshot: &[(String, String)],
 ) -> bool {
-    use_global_virtual_store_override
-        .unwrap_or_else(|| !env_snapshot.iter().any(|(k, _)| k == "CI"))
+    use_global_virtual_store_override.unwrap_or_else(|| !aube_util::env::is_ci_in(env_snapshot))
 }
 
 /// Write the pnpm-compatible metadata Vite 8.1+ uses to allow files
@@ -75,6 +74,12 @@ pub(super) fn write_modules_metadata(
                 metadata.insert(
                     "virtualStoreDir".to_string(),
                     serde_json::Value::String(virtual_store_dir.clone()),
+                );
+                // `which-pm` (and VS Code's npm task provider) read this
+                // file as pnpm's state and crash without `packageManager`.
+                metadata.insert(
+                    "packageManager".to_string(),
+                    serde_json::Value::String(format!("aube@{}", env!("CARGO_PKG_VERSION"))),
                 );
                 serde_json::to_vec_pretty(&metadata)?
             }
@@ -283,39 +288,16 @@ fn legacy_vite_dep_paths(
         .collect()
 }
 
-/// Select each legacy Vite package plus every package ancestor needed
-/// to make the root/importer resolution path reach that local copy.
+/// Select project-relative sources, legacy Vite, and every ancestor needed
+/// to make the root/importer resolution path reach those local copies.
 ///
 /// Other branches of the graph remain in the GVS. Dependencies of a
 /// selected ancestor that are not themselves selected still resolve
 /// through the ordinary local `.aube` symlinks into the shared store.
-pub(super) fn legacy_vite_project_local_closure(
+pub(super) fn project_local_closure(
     graph: &aube_lockfile::LockfileGraph,
 ) -> std::collections::BTreeSet<String> {
-    let mut selected = legacy_vite_dep_paths(graph);
-    if selected.is_empty() {
-        return selected;
-    }
-    loop {
-        let mut added = false;
-        for (parent_path, parent) in &graph.packages {
-            if selected.contains(parent_path) {
-                continue;
-            }
-            let reaches_selected = parent.dependencies.iter().any(|(name, tail)| {
-                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
-                    .is_some_and(|child| selected.contains(&child))
-            });
-            if reaches_selected {
-                selected.insert(parent_path.clone());
-                added = true;
-            }
-        }
-        if !added {
-            break;
-        }
-    }
-    selected
+    aube_linker::project_local_dependency_closure_with_seeds(graph, legacy_vite_dep_paths(graph))
 }
 
 fn vite_needs_modules_metadata_backport(version: &str) -> bool {
@@ -588,6 +570,27 @@ mod tests {
         write_modules_metadata(root, &graph, "node_modules", &store)
             .expect("metadata should be written");
 
+        std::fs::remove_file(root.join("node_modules/.modules.yaml"))
+            .expect("root metadata should be removed");
+        write_modules_metadata(root, &graph, "node_modules", &store)
+            .expect("fresh metadata should be written");
+        let fresh: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("node_modules/.modules.yaml"))
+                .expect("fresh metadata should exist"),
+        )
+        .expect("fresh metadata should parse");
+        assert_eq!(
+            fresh["packageManager"],
+            format!("aube@{}", env!("CARGO_PKG_VERSION"))
+        );
+        std::fs::write(
+            root.join("node_modules/.modules.yaml"),
+            "{\"packageManager\":\"pnpm@11.0.0\"}",
+        )
+        .expect("existing metadata should be restored");
+        write_modules_metadata(root, &graph, "node_modules", &store)
+            .expect("metadata should be rewritten");
+
         for project in [root.to_path_buf(), root.join("packages/app")] {
             let bytes = std::fs::read(project.join("node_modules/.modules.yaml"))
                 .expect("metadata should exist");
@@ -822,7 +825,7 @@ mod tests {
         );
 
         assert_eq!(
-            legacy_vite_project_local_closure(&graph),
+            project_local_closure(&graph),
             ["vite@5.4.21".to_string(), "vitepress@1.6.4".to_string()]
                 .into_iter()
                 .collect()

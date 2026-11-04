@@ -44,12 +44,25 @@ fn apply_extra_root_certs(
     builder
 }
 
+#[cfg(test)]
 pub(super) fn build_http_client(
     config: &NpmConfig,
     registry_config: Option<&crate::config::AuthConfig>,
     fetch_policy: &FetchPolicy,
     extra_ca_certs: &[reqwest::Certificate],
 ) -> reqwest::Client {
+    try_build_http_client(config, registry_config, fetch_policy, extra_ca_certs)
+        .expect("failed to build HTTP client")
+}
+
+/// Fallible [`build_http_client`]: a TLS root store reqwest cannot load
+/// (for example a malformed certificate) is returned instead of panicking.
+pub(super) fn try_build_http_client(
+    config: &NpmConfig,
+    registry_config: Option<&crate::config::AuthConfig>,
+    fetch_policy: &FetchPolicy,
+    extra_ca_certs: &[reqwest::Certificate],
+) -> reqwest::Result<reqwest::Client> {
     build_http_client_inner(config, registry_config, fetch_policy, extra_ca_certs, false)
 }
 
@@ -120,6 +133,18 @@ pub(crate) fn probe_client_builder() -> reqwest::ClientBuilder {
     builder
 }
 
+/// Panicking [`try_build_http_tarball_client`], for tests.
+#[cfg(test)]
+pub(super) fn build_http_tarball_client(
+    config: &NpmConfig,
+    registry_config: Option<&crate::config::AuthConfig>,
+    fetch_policy: &FetchPolicy,
+    extra_ca_certs: &[reqwest::Certificate],
+) -> reqwest::Client {
+    try_build_http_tarball_client(config, registry_config, fetch_policy, extra_ca_certs)
+        .expect("failed to build HTTP client")
+}
+
 /// HTTP/1.1-only variant for tarball downloads. Tarballs are large
 /// opaque blobs where h2 multiplexing buys nothing: there are no
 /// compressible headers, and a single slow tarball stream causes
@@ -139,12 +164,14 @@ pub(crate) fn probe_client_builder() -> reqwest::ClientBuilder {
 /// Packument requests stay on the h2 client because gzip+brotli
 /// header compression and request multiplexing are real wins for
 /// thousands of small JSON payloads.
-pub(super) fn build_http_tarball_client(
+///
+/// A trust root reqwest cannot load is returned as an error.
+pub(super) fn try_build_http_tarball_client(
     config: &NpmConfig,
     registry_config: Option<&crate::config::AuthConfig>,
     fetch_policy: &FetchPolicy,
     extra_ca_certs: &[reqwest::Certificate],
-) -> reqwest::Client {
+) -> reqwest::Result<reqwest::Client> {
     build_http_client_inner(config, registry_config, fetch_policy, extra_ca_certs, true)
 }
 
@@ -154,7 +181,7 @@ fn build_http_client_inner(
     fetch_policy: &FetchPolicy,
     extra_ca_certs: &[reqwest::Certificate],
     for_tarball: bool,
-) -> reqwest::Client {
+) -> reqwest::Result<reqwest::Client> {
     // `maxsockets` (when set) overrides the default pool size. pnpm
     // documents this as "concurrent connections per origin"; reqwest
     // doesn't expose a hard cap, but `pool_max_idle_per_host` is the
@@ -189,20 +216,31 @@ fn build_http_client_inner(
         .gzip(true)
         .brotli(true)
         .zstd(true)
-        // `fetchTimeout` — applied to the whole response (headers +
-        // body) via reqwest's single-knob timeout. pnpm / npm expose
-        // this as `fetch-timeout` in `.npmrc`; the default matches
-        // npm's 60s. Without this override reqwest would use its
-        // built-in 30s default, which is tighter than pnpm's.
-        .timeout(std::time::Duration::from_millis(fetch_policy.timeout_ms))
         // Bigger connection pool so concurrent fetches don't queue on a small set of conns.
         // HTTP/2 (when negotiated via ALPN, which npm registry supports) multiplexes many
         // requests over a single connection so this mostly matters for fallback HTTP/1.1.
         .pool_max_idle_per_host(pool_max_idle)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_nodelay(true);
-    if !for_tarball {
+    let timeout = std::time::Duration::from_millis(fetch_policy.timeout_ms);
+    if for_tarball {
+        // Tarballs are large opaque bodies, so `fetchTimeout` bounds
+        // inactivity, not the whole transfer: `connect_timeout` limits
+        // the handshake and `read_timeout` resets every time data
+        // arrives, so a slow but steady download (100MB+ native
+        // packages on a ~400 kB/s link) finishes however long it takes,
+        // while a connection that stops sending still fails after
+        // `fetchTimeout`.
         builder = builder
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
+            .http1_only();
+    } else {
+        // Metadata responses are small, so `fetchTimeout` caps the whole
+        // response (headers + body) via reqwest's single-knob timeout.
+        // pnpm / npm expose this as `fetch-timeout` in `.npmrc`.
+        builder = builder
+            .timeout(timeout)
             .http2_keep_alive_interval(std::time::Duration::from_secs(30))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
             .http2_keep_alive_while_idle(true)
@@ -210,8 +248,6 @@ fn build_http_client_inner(
             .http2_initial_stream_window_size(Some(16 * 1024 * 1024))
             .http2_initial_connection_window_size(Some(16 * 1024 * 1024))
             .http2_max_frame_size(Some(16 * 1024 * 1024 - 1));
-    } else {
-        builder = builder.http1_only();
     }
     // In-process DNS caching via hickory-dns. The system resolver
     // does not cache and uses a thread pool for `getaddrinfo`,
@@ -341,7 +377,7 @@ fn build_http_client_inner(
         }
     }
 
-    builder.build().expect("failed to build HTTP client")
+    builder.build()
 }
 
 /// Build a client-cert identity from `.npmrc` `cert` / `key` values.
@@ -380,7 +416,10 @@ pub(super) fn force_full_packument() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_http_client, load_node_extra_ca_certs};
+    use super::{
+        build_http_client, build_http_tarball_client, load_node_extra_ca_certs,
+        try_build_http_client,
+    };
     use crate::config::{FetchPolicy, NpmConfig};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
@@ -455,6 +494,57 @@ mod tests {
     /// roots, and treats a missing / unreadable / malformed file as an
     /// empty list (warned, never fatal) so client construction always
     /// succeeds. `build_http_client` accepts whatever it returns.
+    /// PEM that parses but whose body is not a DER certificate: reqwest
+    /// accepts it until the client is built, as with a malformed `.npmrc`
+    /// `ca` entry.
+    const UNLOADABLE_CA_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n";
+
+    fn unloadable_auth() -> crate::config::AuthConfig {
+        crate::config::AuthConfig {
+            tls: crate::config::TlsConfig {
+                ca: vec![UNLOADABLE_CA_PEM.to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn try_from_config_returns_a_per_registry_root_error() {
+        let mut config = NpmConfig::default();
+        config
+            .auth_by_uri
+            .insert("//registry.example/".to_string(), unloadable_auth());
+        assert!(crate::client::RegistryClient::try_from_config(config).is_err());
+    }
+
+    #[test]
+    fn try_from_config_returns_a_scoped_root_error() {
+        let mut config = NpmConfig::default();
+        config
+            .scoped_auth_by_uri
+            .entry("//registry.example/".to_string())
+            .or_default()
+            .insert("@scope".to_string(), unloadable_auth());
+        assert!(crate::client::RegistryClient::try_from_config(config).is_err());
+    }
+
+    #[test]
+    fn try_from_config_builds_with_a_valid_config() {
+        assert!(crate::client::RegistryClient::try_from_config(NpmConfig::default()).is_ok());
+    }
+
+    /// A trust root reqwest cannot load is returned as an error rather
+    /// than panicking, so embedders can report it.
+    #[test]
+    fn try_build_http_client_returns_an_unloadable_root_as_an_error() {
+        let bad = reqwest::Certificate::from_der(b"not a certificate").expect("stores the bytes");
+        let result =
+            try_build_http_client(&NpmConfig::default(), None, &FetchPolicy::default(), &[bad]);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn node_extra_ca_certs_is_loaded_and_failures_are_non_fatal() {
         let env = EnvVarGuard::acquire();
@@ -696,5 +786,116 @@ mod tests {
                 assert_eq!(response.status(), reqwest::StatusCode::OK, "{name}");
             }
         });
+    }
+
+    /// Verify npmrc CA bundles authenticate direct and proxied TLS requests.
+    #[tokio::test]
+    async fn npmrc_cafile_trusts_private_registry_directly_and_through_proxy() {
+        let server = PrivateCaServer::start().await;
+        let project = tempfile::tempdir().unwrap();
+        let policy = FetchPolicy::default();
+
+        // An HTTP CONNECT proxy tunnels TLS to the private registry. This
+        // tests both trust propagation and the explicit HTTPS proxy path.
+        let proxy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let target = reqwest::Url::parse(&server.url).unwrap();
+        let port = target.port().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            loop {
+                let (mut inbound, _) = proxy.accept().await.unwrap();
+                accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(inbound.read_u8().await.unwrap());
+                        assert!(request.len() < 8192);
+                    }
+                    assert!(request.starts_with(b"CONNECT localhost:"));
+                    let mut upstream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .unwrap();
+                    inbound
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    // A rejected TLS handshake closes the tunnel too.
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
+                });
+            }
+        });
+
+        for proxy in [None, Some(&proxy_url)] {
+            let proxy_setting = proxy
+                .map(|url| format!("https-proxy={url}\n"))
+                .unwrap_or_default();
+            for scoped in [false, true] {
+                let key = if scoped {
+                    format!("//localhost:{port}/:cafile")
+                } else {
+                    "cafile".to_string()
+                };
+                std::fs::write(
+                    project.path().join(".npmrc"),
+                    format!("registry={}\nstrict-ssl=true\n{proxy_setting}", server.url),
+                )
+                .unwrap();
+                let config = NpmConfig::load_isolated(project.path());
+                let client = build_http_client(&config, None, &policy, &[]);
+                let error = client.get(&server.url).send().await.unwrap_err();
+                let message = crate::Error::Http(error).to_string();
+                assert!(message.to_lowercase().contains("certificate"), "{message}");
+
+                std::fs::write(
+                    project.path().join(".npmrc"),
+                    format!(
+                        "registry={}\nstrict-ssl=true\n{proxy_setting}{key}={}\n",
+                        server.url,
+                        server.ca_bundle.display()
+                    ),
+                )
+                .unwrap();
+                let config = NpmConfig::load_isolated(project.path());
+                let auth = config.registry_config_for(&server.url);
+                for client in [
+                    build_http_client(&config, auth, &policy, &[]),
+                    build_http_tarball_client(&config, auth, &policy, &[]),
+                ] {
+                    assert_eq!(
+                        client.get(&server.url).send().await.unwrap().status(),
+                        reqwest::StatusCode::OK
+                    );
+                }
+            }
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::Relaxed), 6);
+        proxy_task.abort();
+    }
+
+    /// Keep the TLS cause while masking URL userinfo and signed query values.
+    #[tokio::test]
+    async fn transport_error_display_keeps_the_cause_and_redacts_url_credentials() {
+        let server = PrivateCaServer::start().await;
+        let url = server
+            .url
+            .replace("https://", "https://test-user:test-password@")
+            + "?token=test-secret&X-Amz-Signature=signed-secret&sig=azure-secret";
+        let client = build_http_client(&NpmConfig::default(), None, &FetchPolicy::default(), &[]);
+        let error = client.get(url).send().await.unwrap_err();
+        let message = crate::Error::Http(error).to_string();
+        assert!(message.to_lowercase().contains("certificate"), "{message}");
+        for secret in [
+            "test-user",
+            "test-password",
+            "test-secret",
+            "signed-secret",
+            "azure-secret",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 use super::{
     dep_path::{parse_dep_path, registry_name_from_qualified_version, version_to_dep_path},
-    parse, parse_with_options, write,
+    parse, parse_with_options, write_with_project_root,
 };
 use crate::{
     CatalogEntry, DepType, DirectDep, GitSource, LocalSource, LockedPackage, LockfileGraph,
@@ -415,6 +415,98 @@ snapshots:
     assert_eq!(local.optional_dependencies.get("native").unwrap(), "1.0.0");
 }
 
+const FILE_PACKAGE_WITH_WORKSPACE_PEER_LOCKFILE: &str = r#"
+lockfileVersion: '9.0'
+
+importers:
+  .: {}
+
+  apps/app:
+    dependencies:
+      '@x/md':
+        specifier: file:./modules/md
+        version: file:apps/app/modules/md(@x/shared@packages+shared)
+      '@x/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
+
+  packages/shared: {}
+
+packages:
+  '@x/md@file:apps/app/modules/md':
+    resolution: {directory: apps/app/modules/md, type: directory}
+    peerDependencies:
+      '@x/shared': '*'
+
+snapshots:
+  '@x/md@file:apps/app/modules/md(@x/shared@packages+shared)':
+    dependencies:
+      '@x/shared': link:packages/shared
+"#;
+
+#[test]
+fn parse_snapshot_link_dependency_points_at_the_importer_link_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&lockfile_path, FILE_PACKAGE_WITH_WORKSPACE_PEER_LOCKFILE).unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+
+    let md = graph
+        .packages
+        .values()
+        .find(|pkg| pkg.name == "@x/md")
+        .unwrap();
+    let tail = md.dependencies.get("@x/shared").unwrap();
+    let edge_dep_path = format!("@x/shared@{tail}");
+    let shared = graph.packages.get(&edge_dep_path).unwrap_or_else(|| {
+        panic!("the `link:` edge must name a package in the graph, got {edge_dep_path}")
+    });
+    assert_eq!(
+        shared.local_source,
+        Some(LocalSource::Link("packages/shared".into()))
+    );
+    let importer_dep = graph.importers["apps/app"]
+        .iter()
+        .find(|dep| dep.name == "@x/shared")
+        .unwrap();
+    assert_eq!(importer_dep.dep_path, edge_dep_path);
+}
+
+#[test]
+fn write_renders_link_dependency_edges_as_link_specifiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source-lock.yaml");
+    std::fs::write(&source_path, FILE_PACKAGE_WITH_WORKSPACE_PEER_LOCKFILE).unwrap();
+    let graph = parse(&source_path).unwrap();
+
+    let out_path = dir.path().join("out-lock.yaml");
+    write_with_project_root(
+        &out_path,
+        out_path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
+
+    let written = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        written.contains("'@x/shared': link:packages/shared"),
+        "snapshot edge should keep pnpm's `link:` shape:\n{written}"
+    );
+    let reparsed = parse(&out_path).unwrap();
+    let md = reparsed
+        .packages
+        .values()
+        .find(|pkg| pkg.name == "@x/md")
+        .unwrap();
+    let edge_dep_path = format!("@x/shared@{}", md.dependencies["@x/shared"]);
+    assert_eq!(
+        reparsed.packages[&edge_dep_path].local_source,
+        Some(LocalSource::Link("packages/shared".into()))
+    );
+}
+
 #[test]
 fn parse_workspace_local_snapshot_keys_do_not_duplicate_rebased_packages() {
     let dir = tempfile::tempdir().unwrap();
@@ -739,7 +831,7 @@ snapshots:
         ..PackageJson::default()
     };
     let out_path = dir.path().join("round-trip.yaml");
-    write(&out_path, &graph, &manifest).unwrap();
+    write_with_project_root(&out_path, out_path.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out_path).unwrap();
     assert!(
             written.contains("node-expat@https://codeload.github.com/astro/node-expat/tar.gz/78e559baa908942097330f7967dfbf623ebc2529:"),
@@ -955,7 +1047,13 @@ fn fresh_resolved_codeload_tarball_writes_pnpm_version_and_resolution() {
         ..PackageJson::default()
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let written = std::fs::read_to_string(&lockfile_path).unwrap();
 
     // Keyed by the bare codeload URL (pnpm parity), never the hashed
@@ -1095,7 +1193,13 @@ fn git_tarball_peer_suffix_renders_as_spec_and_round_trips() {
         ..PackageJson::default()
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let written = std::fs::read_to_string(&lockfile_path).unwrap();
 
     // Snapshot keys + embedded dep values render the suffix as the spec.
@@ -1138,6 +1242,98 @@ fn git_tarball_peer_suffix_renders_as_spec_and_round_trips() {
         "reader must normalize the embedded dep-value suffix: {:?}",
         rp.dependencies
     );
+}
+
+#[test]
+fn nested_contextual_git_tarball_peers_keep_source_urls() {
+    let core = LocalSource::RemoteTarball(crate::RemoteTarballSource {
+        url: "https://example.com/core.tgz".to_string(),
+        integrity: "sha512-core".to_string(),
+        git_hosted: false,
+    });
+    let sources = [
+        LocalSource::RemoteTarball(crate::RemoteTarballSource {
+            url: "https://example.com/adapter.tgz".to_string(),
+            integrity: "sha512-adapter".to_string(),
+            git_hosted: false,
+        }),
+        LocalSource::Git(GitSource {
+            url: "https://example.com/adapter.git".to_string(),
+            committish: None,
+            resolved: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+            integrity: None,
+            subpath: None,
+        }),
+    ];
+    for adapter in sources {
+        let core_key = core.dep_path("core");
+        let adapter_head = adapter.dep_path("adapter");
+        let adapter_key = format!("{adapter_head}({core_key})");
+        let consumer_key = format!("consumer@1.0.0({adapter_key})");
+        // The transitive adapter exists only with a peer context, so looking
+        // it up by the flat head alone cannot recover its source.
+        let graph = LockfileGraph {
+            packages: [
+                LockedPackage {
+                    name: "core".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: core_key.clone(),
+                    local_source: Some(core.clone()),
+                    ..Default::default()
+                },
+                LockedPackage {
+                    name: "adapter".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: adapter_key,
+                    local_source: Some(adapter.clone()),
+                    ..Default::default()
+                },
+                LockedPackage {
+                    name: "consumer".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: consumer_key.clone(),
+                    ..Default::default()
+                },
+            ]
+            .into_iter()
+            .map(|pkg| (pkg.dep_path.clone(), pkg))
+            .collect(),
+            importers: BTreeMap::from([(
+                ".".to_string(),
+                vec![DirectDep {
+                    name: "consumer".to_string(),
+                    dep_path: consumer_key,
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                }],
+            )]),
+            ..Default::default()
+        };
+        assert!(!graph.packages.contains_key(&adapter_head));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-lock.yaml");
+        let expected = format!(
+            "1.0.0(adapter@{}(core@{}))",
+            adapter.specifier(),
+            core.specifier()
+        );
+        write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+        for _ in 0..2 {
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                written.contains(&format!("version: {expected}")),
+                "{written}"
+            );
+            assert!(
+                written.contains(&format!("consumer@{expected}:")),
+                "{written}"
+            );
+            assert!(!written.contains(&adapter_head), "{written}");
+            assert!(!written.contains(&core_key), "{written}");
+            let reparsed = parse(&path).unwrap();
+            write_with_project_root(&path, dir.path(), &reparsed, &PackageJson::default()).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -1285,7 +1481,13 @@ fn test_write_and_reparse_roundtrip() {
         extra: BTreeMap::new(),
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     // Re-parse and verify
     let reparsed = parse(&lockfile_path).unwrap();
@@ -1355,7 +1557,7 @@ fn engines_star_values_are_dropped_like_pnpm() {
 
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("pnpm-lock.yaml");
-    write(&out, &graph, &manifest).unwrap();
+    write_with_project_root(&out, out.parent().unwrap(), &graph, &manifest).unwrap();
     let yaml = std::fs::read_to_string(&out).unwrap();
 
     // `{node: '*'}` collapses to nothing → exactly three engines lines
@@ -1464,7 +1666,7 @@ snapshots:
         ..Default::default()
     };
     let out = dir.path().join("out.yaml");
-    write(&out, &graph, &manifest).unwrap();
+    write_with_project_root(&out, out.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out).unwrap();
 
     assert!(
@@ -1554,7 +1756,13 @@ fn test_write_prunes_time_to_direct_importer_deps() {
         ..Default::default()
     };
 
-    write(&lockfile_path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let written = std::fs::read_to_string(&lockfile_path).unwrap();
 
     assert!(written.contains("\n  foo@1.0.0: 2026-01-01T00:00:00.000Z\n"));
@@ -1600,7 +1808,13 @@ fn test_write_preserves_real_name_time_for_aube_aliases() {
         ..Default::default()
     };
 
-    write(&lockfile_path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let written = std::fs::read_to_string(&lockfile_path).unwrap();
 
     assert!(written.contains("\n  alias-pkg@1.0.0: 2026-01-01T00:00:00.000Z\n"));
@@ -1667,7 +1881,13 @@ fn writer_preserves_workspace_importer_specifiers() {
         extra: BTreeMap::new(),
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     let reparsed = parse(&lockfile_path).unwrap();
     let workspace_deps = reparsed
@@ -1675,6 +1895,116 @@ fn writer_preserves_workspace_importer_specifiers() {
         .get("packages/public/umd/babylonjs")
         .unwrap();
     assert_eq!(workspace_deps[0].specifier.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn fresh_workspace_dependencies_are_written_as_links() {
+    let dir = tempfile::tempdir().unwrap();
+    for (member, version) in [("app", "1.0.0"), ("shared", "1.2.3")] {
+        let member_dir = dir.path().join("packages").join(member);
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(
+            member_dir.join("package.json"),
+            format!(r#"{{"name":"@x/{member}","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), Vec::new());
+    importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "@x/shared".to_string(),
+            dep_path: "@x/shared@1.2.3".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("workspace:*".to_string()),
+        }],
+    );
+    importers.insert("packages/shared".to_string(), Vec::new());
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "consumer@1.0.0".to_string(),
+        LockedPackage {
+            name: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "consumer@1.0.0".to_string(),
+            dependencies: BTreeMap::from([("@x/shared".to_string(), "1.2.3".to_string())]),
+            ..Default::default()
+        },
+    );
+    let graph = LockfileGraph {
+        importers,
+        packages,
+        ..Default::default()
+    };
+    let manifest = PackageJson::default();
+
+    write_with_project_root(&lockfile_path, dir.path(), &graph, &manifest).unwrap();
+
+    let written = std::fs::read_to_string(&lockfile_path).unwrap();
+    assert!(
+        written.contains("version: link:../shared"),
+        "workspace dependency must be a link, got:\n{written}"
+    );
+    assert!(
+        written.contains("'@x/shared': link:packages/shared"),
+        "snapshot edge must be a root-relative link, got:\n{written}"
+    );
+
+    let mut excluded = graph.clone();
+    excluded.settings.exclude_links_from_lockfile = true;
+    write_with_project_root(&lockfile_path, dir.path(), &excluded, &manifest).unwrap();
+    let written = std::fs::read_to_string(&lockfile_path).unwrap();
+    assert!(
+        !written.contains("version: link:../shared"),
+        "excludeLinksFromLockfile must drop workspace links, got:\n{written}"
+    );
+}
+
+#[test]
+fn workspace_links_cover_versionless_members_and_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"@x/root","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    let app_dir = dir.path().join("packages/app");
+    let bare_dir = dir.path().join("packages/bare");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(app_dir.join("package.json"), r#"{"name":"@x/app"}"#).unwrap();
+    std::fs::write(bare_dir.join("package.json"), r#"{"name":"@x/bare"}"#).unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+
+    let dep = |name: &str, dep_path: &str| DirectDep {
+        name: name.to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some("workspace:*".to_string()),
+    };
+    let mut importers = BTreeMap::new();
+    importers.insert(".".to_string(), Vec::new());
+    importers.insert(
+        "packages/app".to_string(),
+        vec![
+            dep("@x/root", "@x/root@2.0.0"),
+            dep("@x/bare", "@x/bare@0.0.0"),
+        ],
+    );
+    importers.insert("packages/bare".to_string(), Vec::new());
+    let graph = LockfileGraph {
+        importers,
+        ..Default::default()
+    };
+
+    write_with_project_root(&lockfile_path, dir.path(), &graph, &PackageJson::default()).unwrap();
+
+    let written = std::fs::read_to_string(&lockfile_path).unwrap();
+    assert!(written.contains("version: link:../.."), "got:\n{written}");
+    assert!(written.contains("version: link:../bare"), "got:\n{written}");
 }
 
 #[test]
@@ -1709,7 +2039,13 @@ fn overrides_round_trip_through_pnpm_lock_yaml() {
         extra: BTreeMap::new(),
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     // The serialized YAML must contain an `overrides:` block — guard
     // against a future serde change silently dropping the field.
@@ -1771,7 +2107,13 @@ fn catalogs_overrides_patched_dependencies_match_pnpm_order() {
         ..Default::default()
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
 
     let catalogs_at = yaml.find("catalogs:").expect("catalogs:");
@@ -1808,7 +2150,13 @@ fn empty_overrides_block_omitted_from_yaml() {
         bundled_dependencies: None,
         extra: BTreeMap::new(),
     };
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         !yaml.contains("overrides:"),
@@ -1845,7 +2193,13 @@ fn config_checksums_round_trip_in_pnpm_order() {
         ..Default::default()
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
 
     // Exact lines pnpm emits (unquoted scalars, `sha256-` prefix kept).
@@ -1911,7 +2265,13 @@ fn absent_config_checksums_are_omitted_from_yaml() {
         version: Some("0.0.0".to_string()),
         ..Default::default()
     };
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         !yaml.contains("packageExtensionsChecksum:"),
@@ -1997,7 +2357,13 @@ fn test_write_dev_and_optional_deps() {
         extra: BTreeMap::new(),
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     let reparsed = parse(&lockfile_path).unwrap();
     let root_deps = reparsed.importers.get(".").unwrap();
@@ -2035,7 +2401,13 @@ fn test_catalogs_roundtrip() {
         version: Some("0.0.0".to_string()),
         ..Default::default()
     };
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
@@ -2083,7 +2455,13 @@ fn ignored_optional_dependencies_section_matches_pnpm_order() {
         version: Some("0.0.0".to_string()),
         ..Default::default()
     };
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     let catalogs = yaml.find("\ncatalogs:").expect("missing catalogs");
@@ -2183,7 +2561,13 @@ fn exclude_links_from_lockfile_drops_link_deps_from_importer() {
         extra: BTreeMap::new(),
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
 
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
@@ -2204,7 +2588,13 @@ fn exclude_links_from_lockfile_drops_link_deps_from_importer() {
         settings: LockfileSettings::default(),
         ..graph
     };
-    write(&lockfile_path, &graph_off, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph_off,
+        &manifest,
+    )
+    .unwrap();
     let yaml_off = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         yaml_off.contains("sibling:"),
@@ -2274,7 +2664,13 @@ fn writer_uses_pnpm_resolution_types_for_portal_and_exec() {
         ..Default::default()
     };
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
 
     assert!(
@@ -2570,7 +2966,7 @@ fn test_write_byte_identical_to_native_pnpm() {
 
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("pnpm-lock.yaml");
-    write(&out, &graph, &manifest).unwrap();
+    write_with_project_root(&out, out.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out).unwrap();
 
     if written != original {
@@ -2784,7 +3180,7 @@ snapshots:
         ..Default::default()
     };
     let out_path = dir.path().join("out.yaml");
-    write(&out_path, &graph, &manifest).unwrap();
+    write_with_project_root(&out_path, out_path.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out_path).unwrap();
 
     assert!(
@@ -3015,7 +3411,7 @@ snapshots:
         ..Default::default()
     };
     let out = dir.path().join("out.yaml");
-    write(&out, &graph, &manifest).unwrap();
+    write_with_project_root(&out, out.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out).unwrap();
 
     for needle in [
@@ -3143,7 +3539,13 @@ snapshots:
         "is-odd@3.0.1".to_string(),
         "patches/is-odd@3.0.1.patch".to_string(),
     );
-    write(&lockfile_path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let written = std::fs::read_to_string(&lockfile_path).unwrap();
     let hash = "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80";
 
@@ -3160,7 +3562,13 @@ snapshots:
 
     let reparsed = parse(&lockfile_path).unwrap();
     std::fs::remove_file(dir.path().join("patches/is-odd@3.0.1.patch")).unwrap();
-    write(&lockfile_path, &reparsed, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &reparsed,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let rewritten = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         rewritten.contains(&format!("is-odd@3.0.1: {hash}")),
@@ -3171,6 +3579,79 @@ snapshots:
         3,
         "stored patch hashes must decorate every reference without the patch file:\n{rewritten}"
     );
+}
+
+#[test]
+fn pnpm_patched_peers_keep_hashes_in_nested_and_alias_references() {
+    let yaml = r#"lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0(@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale)))
+      wrapper-alias:
+        specifier: npm:@scope/wrapper@1.0.0
+        version: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+packages:
+  consumer@1.0.0: {}
+  '@scope/wrapper@1.0.0':
+    peerDependencies:
+      react: '*'
+  react@19.0.0: {}
+snapshots:
+  consumer@1.0.0(@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))):
+    dependencies:
+      wrapper-alias: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+    optionalDependencies:
+      wrapper: '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))'
+  '@scope/wrapper@1.0.0(react@19.0.0(patch_hash=stale))':
+    dependencies:
+      react: 19.0.0(patch_hash=stale)
+  react@19.0.0(patch_hash=stale): {}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let mut graph = parse(&path).unwrap();
+    let hash = "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80";
+    graph.patched_dependencies = ["consumer@1.0.0", "@scope/wrapper@1.0.0", "react@19.0.0"]
+        .into_iter()
+        .map(|name| (name.to_string(), hash.to_string()))
+        .collect();
+    write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    let raw: yaml_serde::Value = yaml_serde::from_str(&written).unwrap();
+    let react = format!("19.0.0(patch_hash={hash})");
+    let wrapper = format!("1.0.0(patch_hash={hash})(react@{react})");
+    let consumer = format!("1.0.0(patch_hash={hash})(@scope/wrapper@{wrapper})");
+    assert_eq!(
+        raw["importers"]["."]["dependencies"]["consumer"]["version"],
+        consumer
+    );
+    assert_eq!(
+        raw["importers"]["."]["dependencies"]["wrapper-alias"]["version"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    let snapshot = &raw["snapshots"][format!("consumer@{consumer}")];
+    assert_eq!(
+        snapshot["dependencies"]["wrapper-alias"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    assert_eq!(
+        snapshot["optionalDependencies"]["wrapper"],
+        format!("@scope/wrapper@{wrapper}")
+    );
+    assert_eq!(
+        raw["snapshots"][format!("@scope/wrapper@{wrapper}")]["dependencies"]["react"],
+        react
+    );
+    assert!(!written.contains("patch_hash=stale"), "{written}");
+
+    // Parsing and writing again must retain every nested hash, with no patch files.
+    let reparsed = parse(&path).unwrap();
+    write_with_project_root(&path, dir.path(), &reparsed, &PackageJson::default()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
 }
 
 #[test]
@@ -3231,7 +3712,7 @@ fn write_pnpm_lockfile_uses_native_alias_shape() {
         ..Default::default()
     };
 
-    write(&path, &graph, &manifest).unwrap();
+    write_with_project_root(&path, path.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(written.contains("version: is-odd@3.0.1"), "{written}");
     assert!(written.contains("is-odd@3.0.1:"), "{written}");
@@ -3661,7 +4142,13 @@ fn git_resolution_integrity_roundtrips() {
     };
     let dir = tempfile::tempdir().unwrap();
     let lockfile_path = dir.path().join("pnpm-lock.yaml");
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(yaml.contains("type: git"));
     assert!(yaml.contains(&format!("integrity: {integrity}")));
@@ -3715,7 +4202,13 @@ fn writer_emits_git_hosted_for_hosted_git_resolution() {
         .dependencies
         .insert("demo".to_string(), "github:acme/demo".to_string());
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(yaml.contains("gitHosted: true"), "{yaml}");
     assert!(yaml.contains("integrity: sha512-hosted"), "{yaml}");
@@ -3768,7 +4261,13 @@ snapshots:
     assert!(git.url.contains("/acme/demo.git"), "{git:?}");
     assert_eq!(git.resolved, "abcdef0123456789abcdef0123456789abcdef01");
 
-    write(&path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &path,
+        path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(
         yaml.contains("repo: git+ssh://git@github.com/acme/demo.git"),
@@ -3889,7 +4388,13 @@ snapshots:
     };
     assert_eq!(source.integrity, "sha512-demo");
 
-    write(&path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &path,
+        path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(yaml.contains("integrity: sha512-demo"), "{yaml}");
     assert!(
@@ -4043,7 +4548,13 @@ fn writer_preserves_non_derivable_registry_tarball_url_by_default() {
         .dependencies
         .insert("@scope/pkg".to_string(), "1.0.0".to_string());
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         yaml.contains("tarball: https://npm.pkg.github.com/download/@scope/pkg/1.0.0/deadbeef"),
@@ -4091,7 +4602,13 @@ snapshots:
         Some("https://npm.pkg.github.com/download/demo/1.0.0/deadbeef")
     );
 
-    write(&path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &path,
+        path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(yaml.contains("gitHosted: true"), "{yaml}");
     assert!(
@@ -4133,7 +4650,13 @@ fn writer_preserves_non_derivable_registry_tarball_url_without_integrity() {
         .dependencies
         .insert("@scope/pkg".to_string(), "1.0.0".to_string());
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(
         yaml.contains("tarball: https://npm.pkg.github.com/download/@scope/pkg/1.0.0/deadbeef"),
@@ -4177,7 +4700,13 @@ fn writer_omits_derivable_registry_tarball_url_with_query() {
         .dependencies
         .insert("@scope/pkg".to_string(), "1.0.0".to_string());
 
-    write(&lockfile_path, &graph, &manifest).unwrap();
+    write_with_project_root(
+        &lockfile_path,
+        lockfile_path.parent().unwrap(),
+        &graph,
+        &manifest,
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&lockfile_path).unwrap();
     assert!(!yaml.contains("tarball:"), "{yaml}");
     assert!(yaml.contains("integrity: sha512-private"), "{yaml}");
@@ -4224,7 +4753,13 @@ snapshots:
     };
     assert!(source.git_hosted);
 
-    write(&path, &graph, &PackageJson::default()).unwrap();
+    write_with_project_root(
+        &path,
+        path.parent().unwrap(),
+        &graph,
+        &PackageJson::default(),
+    )
+    .unwrap();
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(yaml.contains("gitHosted: true"), "{yaml}");
 }
@@ -4381,7 +4916,7 @@ fn runtime_pin_round_trips_through_write() {
 
     let manifest = PackageJson::default();
     let out_path = dir.path().join("aube-lock.yaml");
-    write(&out_path, &graph, &manifest).unwrap();
+    write_with_project_root(&out_path, out_path.parent().unwrap(), &graph, &manifest).unwrap();
     let written = std::fs::read_to_string(&out_path).unwrap();
 
     assert!(
@@ -4462,14 +4997,16 @@ fn runtime_pin_merge_unions_variants() {
 
     let dir = tempfile::tempdir().unwrap();
     let manifest = PackageJson::default();
-    write(
+    write_with_project_root(
         &dir.path().join("aube-lock.yaml"),
+        dir.path(),
         &graph_with_pin("darwin"),
         &manifest,
     )
     .unwrap();
-    write(
+    write_with_project_root(
         &dir.path().join("aube-lock.feature.yaml"),
+        dir.path(),
         &graph_with_pin("linux"),
         &manifest,
     )
@@ -4724,4 +5261,549 @@ snapshots:
     assert_eq!(root.len(), 1, "expected one direct dep, got {root:?}");
     assert_eq!(root[0].name, "foo");
     assert_eq!(root[0].dep_type, DepType::Production);
+}
+
+#[test]
+fn member_link_version_settles_the_target() {
+    // (version, expected root-relative target) for pkg-a's `link:./vendor/x`.
+    let cases = [
+        // pnpm and aube: relative to the member, normalized.
+        ("link:vendor/x", "pkg-a/vendor/x"),
+        // Older aube: the member's own link written root-relative.
+        ("link:pkg-a/vendor/x", "pkg-a/vendor/x"),
+        // An override target, relative to the member.
+        ("link:../vendor/x", "vendor/x"),
+    ];
+    for (version, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join("pnpm-lock.yaml");
+        std::fs::write(
+            &lockfile_path,
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n  .: {{}}\n\n  pkg-a:\n    dependencies:\n      x:\n        specifier: link:./vendor/x\n        version: {version}\n"
+            ),
+        )
+        .unwrap();
+        let graph = parse(&lockfile_path).unwrap();
+        let dep = &graph.importers["pkg-a"][0];
+        assert_eq!(
+            graph.packages[&dep.dep_path].local_source,
+            Some(LocalSource::Link(expected.into())),
+            "version {version}"
+        );
+    }
+}
+
+#[test]
+fn member_link_target_ignores_a_packages_entry() {
+    // pnpm normalizes the version (`link:vendor/x` for `link:./vendor/x`).
+    // A `packages:` entry under that key must not move the member's link:
+    // its target comes from the version, relative to the member.
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(
+        &lockfile_path,
+        r#"
+lockfileVersion: '9.0'
+
+importers:
+  .: {}
+
+  pkg-a:
+    dependencies:
+      x:
+        specifier: link:./vendor/x
+        version: link:vendor/x
+
+packages:
+  x@link:vendor/x:
+    resolution: {directory: vendor/x, type: directory}
+
+snapshots:
+  x@link:vendor/x: {}
+"#,
+    )
+    .unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+    let dep = &graph.importers["pkg-a"][0];
+    assert_eq!(
+        graph.packages[&dep.dep_path].local_source,
+        Some(LocalSource::Link("pkg-a/vendor/x".into()))
+    );
+}
+
+#[test]
+fn write_takes_the_lockfile_directory_as_the_project_root() {
+    // The compatibility `write` must match `write_with_project_root` given
+    // the lockfile's own directory, member `link:` paths included.
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(
+        "pkg-a".to_string(),
+        vec![DirectDep {
+            name: "x".to_string(),
+            dep_path: "x@link:pkg-a/vendor/x".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("link:./vendor/x".to_string()),
+        }],
+    );
+    graph.packages.insert(
+        "x@link:pkg-a/vendor/x".to_string(),
+        LockedPackage {
+            name: "x".to_string(),
+            version: "0.0.0".to_string(),
+            dep_path: "x@link:pkg-a/vendor/x".to_string(),
+            local_source: Some(LocalSource::Link("pkg-a/vendor/x".into())),
+            ..Default::default()
+        },
+    );
+    let manifest = PackageJson::default();
+    let compat = tempfile::tempdir().unwrap();
+    let explicit = tempfile::tempdir().unwrap();
+    let compat_path = compat.path().join("pnpm-lock.yaml");
+    let explicit_path = explicit.path().join("pnpm-lock.yaml");
+    super::write(&compat_path, &graph, &manifest).unwrap();
+    write_with_project_root(&explicit_path, explicit.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(&compat_path).unwrap();
+    assert_eq!(written, std::fs::read_to_string(&explicit_path).unwrap());
+    assert!(written.contains("version: link:vendor/x"), "{written}");
+}
+
+#[test]
+fn snapshot_key_over_1024_chars_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    let long_dep_path = format!(
+        "@scope/foo@1.0.0({})",
+        "@scope/peer-package@1.0.0,".repeat(60)
+    );
+    assert!(long_dep_path.len() > 1024);
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "@scope/foo".to_string(),
+            dep_path: long_dep_path.clone(),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".to_string()),
+        }],
+    );
+    graph.packages.insert(
+        long_dep_path.clone(),
+        LockedPackage {
+            name: "@scope/foo".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-abc123==".to_string()),
+            dep_path: long_dep_path.clone(),
+            dependencies: BTreeMap::from([("bar".to_string(), "2.0.0".to_string())]),
+            ..Default::default()
+        },
+    );
+    super::write(&path, &graph, &PackageJson::default()).unwrap();
+    let parsed = super::parse(&path).unwrap();
+    assert!(parsed.packages.contains_key(&long_dep_path));
+    let content = std::fs::read_to_string(&path).unwrap();
+    let raw = super::raw::parse_raw_lockfile_serde(&content).unwrap();
+    assert!(raw.snapshots.contains_key(&long_dep_path));
+}
+
+proptest::proptest! {
+#[test]
+fn parse_keeps_alias_distinct_from_same_name_and_version_registry_package(major in 0u16..1000, second_alias in proptest::bool::ANY) {
+    let version = format!("{major}.0.0");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pnpm-lock.yaml");
+    let mut fixture = r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      compiler:
+        specifier: 'npm:@test/compiler@1.0.0'
+        version: '@test/compiler@1.0.0'
+  packages/plain:
+    dependencies:
+      compiler:
+        specifier: '1.0.0'
+        version: '1.0.0'
+packages:
+  parent@1.0.0:
+    resolution: {integrity: sha512-parent}
+  compiler@1.0.0:
+    resolution: {integrity: sha512-plain}
+  '@test/compiler@1.0.0':
+    resolution: {integrity: sha512-aliased}
+snapshots:
+  compiler@1.0.0: {}
+  '@test/compiler@1.0.0': {}
+  parent@1.0.0:
+    dependencies:
+      compiler: '@test/compiler@1.0.0'
+    optionalDependencies:
+      compiler: '@test/compiler@1.0.0'
+"#.to_string();
+    if second_alias {
+        fixture = fixture.replace("specifier: '1.0.0'", "specifier: 'npm:@other/compiler@1.0.0'")
+            .replace("version: '1.0.0'", "version: '@other/compiler@1.0.0'")
+            .replace("  compiler@1.0.0:", "  '@other/compiler@1.0.0':");
+    }
+    std::fs::write(&path, fixture.replace("1.0.0", &version)).unwrap();
+    let graph = parse(&path).unwrap();
+    let aliased = &graph.packages[&graph.importers["."][0].dep_path];
+    let plain = &graph.packages[&graph.importers["packages/plain"][0].dep_path];
+    assert_eq!(aliased.alias_of.as_deref(), Some("@test/compiler"));
+    assert_eq!(aliased.integrity.as_deref(), Some("sha512-aliased"));
+    assert_eq!(plain.alias_of.as_deref(), second_alias.then_some("@other/compiler"));
+    assert_eq!(plain.integrity.as_deref(), Some("sha512-plain"));
+    let parent = &graph.packages[&format!("parent@{version}")];
+    let alias_tail = &parent.dependencies["compiler"];
+    assert_eq!(format!("compiler@{alias_tail}"), graph.importers["."][0].dep_path);
+    assert_eq!(parent.optional_dependencies["compiler"], *alias_tail);
+    for filename in ["pnpm-lock.yaml", "aube-lock.yaml"] {
+        let output_path = directory.path().join(filename);
+        super::write(&output_path, &graph, &PackageJson::default()).unwrap();
+        let reparsed = parse(&output_path).unwrap();
+        for importer in [".", "packages/plain"] {
+            let original = &graph.packages[&graph.importers[importer][0].dep_path];
+            let restored = &reparsed.packages[&reparsed.importers[importer][0].dep_path];
+            assert_eq!(restored.alias_of, original.alias_of);
+            assert_eq!(restored.version, original.version);
+            assert_eq!(restored.integrity, original.integrity);
+        }
+        assert_eq!(reparsed.packages[&format!("parent@{version}")].dependencies, parent.dependencies);
+        for importer in [".", "packages/plain"] {
+            let subset = graph.subset_to_importer(importer, |_| true).unwrap();
+            assert_eq!(subset.packages.len(), 1);
+            super::write(&output_path, &subset, &PackageJson::default()).unwrap();
+            let restored = parse(&output_path).unwrap();
+            let original = &graph.packages[&graph.importers[importer][0].dep_path];
+            let package = &restored.packages[&restored.importers["."][0].dep_path];
+            assert_eq!(package.alias_of, original.alias_of);
+            assert_eq!(package.integrity, original.integrity);
+        }
+    }
+}
+}
+
+#[test]
+fn rewrite_preserves_leading_package_manager_document() {
+    let environment = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.14.0\n        version: 12.14.0\n\npackages: {}\n\nsnapshots: {}\n\n---\n";
+    let project = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n  .: {}\n";
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["pnpm-lock.yaml", "pnpm-lock.feature.yaml"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("{environment}{project}")).unwrap();
+        let graph = parse(&path).unwrap();
+        super::write::write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert!(output.starts_with(environment), "{name}: {output}");
+        assert_eq!(output.matches("\n---\n").count(), 1, "{name}: {output}");
+        parse(&path).unwrap();
+    }
+}
+
+#[test]
+fn rewrite_does_not_add_environment_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    for name in ["pnpm-lock.yaml", "aube-lock.yaml"] {
+        let path = dir.path().join(name);
+        let environment = "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.14.0\n        version: 12.14.0\n---\n";
+        let original = if name == "aube-lock.yaml" {
+            format!("{environment}{project}")
+        } else {
+            project.to_string()
+        };
+        std::fs::write(&path, original).unwrap();
+        let graph = parse(&path).unwrap();
+        super::write::write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert!(!output.contains("packageManagerDependencies"), "{name}");
+    }
+}
+
+#[test]
+fn rewrite_preserves_environment_document_with_comments_around_markers() {
+    let environment = "# generated\n\n--- # environment\nlockfileVersion: '9.0'\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.14.0\n        version: 12.14.0\n--- # project\n";
+    let project = "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, format!("{environment}{project}")).unwrap();
+    let graph = parse(&path).unwrap();
+    super::write::write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+    let output = std::fs::read_to_string(&path).unwrap();
+    assert!(output.starts_with(environment), "{output}");
+}
+
+proptest::proptest! {
+    #[test]
+    fn file_peer_edges_preserve_pnpm_spelling(
+        leaf in "[a-z]{1,12}",
+        tarball in proptest::bool::ANY,
+        own_peer in proptest::bool::ANY,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-lock.yaml");
+        let local_path = format!("app/deps/{leaf}{}", if tarball { ".tgz" } else { "" });
+        let source = if tarball {
+            LocalSource::Tarball(local_path.clone().into())
+        } else {
+            LocalSource::Directory(local_path.clone().into())
+        };
+        let suffix = if own_peer { "(bar@2.0.0)" } else { "" };
+        let resolution = if tarball {
+            format!("{{tarball: file:{local_path}}}")
+        } else {
+            format!("{{directory: {local_path}, type: directory}}")
+        };
+        let fixture = format!(r#"lockfileVersion: '9.0'
+importers:
+  .: {{}}
+  app:
+    dependencies:
+      react:
+        specifier: file:deps/{leaf}{extension}
+        version: file:{local_path}{suffix}
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0(react@file:{local_path}{suffix})
+packages:
+  react@file:{local_path}:
+    resolution: {resolution}
+  consumer@1.0.0:
+    resolution: {{integrity: sha512-consumer}}
+snapshots:
+  react@file:{local_path}{suffix}:
+    dependencies:
+      bar: 2.0.0
+  consumer@1.0.0(react@file:{local_path}{suffix}):
+    dependencies:
+      react: file:{local_path}{suffix}
+    optionalDependencies:
+      react: file:{local_path}{suffix}
+"#, extension = if tarball { ".tgz" } else { "" });
+        std::fs::write(&path, fixture).unwrap();
+        let graph = parse(&path).unwrap();
+        let key = source.dep_path("react");
+        let consumer = graph.packages.values().find(|p| p.name == "consumer").unwrap();
+        proptest::prop_assert!(graph.packages.contains_key(&key));
+        proptest::prop_assert_eq!(&graph.importers["app"].iter().find(|d| d.name == "react").unwrap().dep_path, &key);
+        let edge = format!("file:{local_path}{suffix}");
+        proptest::prop_assert_eq!(&consumer.dependencies["react"], &edge);
+        proptest::prop_assert_eq!(&consumer.optional_dependencies["react"], &edge);
+        write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+        let roundtrip = parse(&path).unwrap();
+        let consumer = roundtrip.packages.values().find(|p| p.name == "consumer").unwrap();
+        proptest::prop_assert_eq!(&consumer.dependencies["react"], &edge);
+        proptest::prop_assert_eq!(&consumer.optional_dependencies["react"], &edge);
+    }
+}
+
+#[test]
+fn pnpm_lock_keeps_unmodeled_settings_and_local_tarball_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(
+        &path,
+        "lockfileVersion: '9.0'\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n  peersSuffixMaxLength: 80\nimporters:\n  .: {}\n",
+    )
+    .unwrap();
+    let mut graph = LockfileGraph::default();
+    let source = LocalSource::Tarball("deps/bundler.tgz".into());
+    let dep_path = source.dep_path("bundler");
+    graph.importers.insert(
+        ".".into(),
+        vec![DirectDep {
+            name: "bundler".into(),
+            dep_path: dep_path.clone(),
+            dep_type: DepType::Production,
+            specifier: Some("file:deps/bundler.tgz".into()),
+        }],
+    );
+    graph.packages.insert(
+        dep_path.clone(),
+        LockedPackage {
+            name: "bundler".into(),
+            version: "1.0.0".into(),
+            integrity: Some("sha512-bundler".into()),
+            dep_path,
+            local_source: Some(source),
+            bundled_dependencies: vec!["is-number".into()],
+            ..Default::default()
+        },
+    );
+    write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let out: yaml_serde::Value =
+        yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(out["settings"]["peersSuffixMaxLength"].as_u64(), Some(80));
+    let package = &out["packages"]["bundler@file:deps/bundler.tgz"];
+    assert_eq!(package["version"].as_str(), Some("1.0.0"));
+    assert_eq!(
+        package["resolution"]["integrity"].as_str(),
+        Some("sha512-bundler")
+    );
+    assert_eq!(
+        package["bundledDependencies"][0].as_str(),
+        Some("is-number")
+    );
+    assert!(out["snapshots"]["bundler@file:deps/bundler.tgz"]["bundledDependencies"].is_null());
+
+    let parsed = parse(&path).unwrap();
+    let reparsed = parsed
+        .packages
+        .values()
+        .find(|p| p.name == "bundler")
+        .unwrap();
+    assert_eq!(reparsed.bundled_dependencies, ["is-number"]);
+}
+
+/// A tarball's absolute `file:` child sits in a snapshot as a bare
+/// `name@file:/abs` key whose parent edge is the same spec. A fresh resolve
+/// keys it by its hashed path, so the reader must too, or the parent's
+/// sibling link points at a package the graph never had.
+#[test]
+fn transitive_file_child_is_keyed_by_its_hashed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    let host = "/abs/host/host-1.0.0.tgz";
+    let child = "/abs/child/child-1.0.0.tgz";
+    std::fs::write(
+        &lockfile_path,
+        format!(
+            r#"
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      host:
+        specifier: file:{host}
+        version: file:{host}
+
+packages:
+  child@file:{child}:
+    resolution: {{tarball: file:{child}}}
+
+  host@file:{host}:
+    resolution: {{tarball: file:{host}}}
+
+snapshots:
+  child@file:{child}: {{}}
+
+  host@file:{host}:
+    dependencies:
+      child: file:{child}
+"#
+        ),
+    )
+    .unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+    let tail = format!("file:{child}");
+    let key = crate::file_dep_path("child", &tail).expect("file: spec hashes");
+    assert!(key.starts_with("child@file+"), "unexpected key: {key}");
+    let pkg = graph.packages.get(&key).unwrap_or_else(|| {
+        panic!(
+            "child must be keyed by its hashed path, got keys: {:?}",
+            graph.packages.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(pkg.dep_path, key);
+    assert_eq!(
+        pkg.local_source,
+        Some(LocalSource::Tarball(child.into())),
+        "child keeps its tarball source"
+    );
+    let host_dep_path = &graph.importers["."][0].dep_path;
+    let host_pkg = &graph.packages[host_dep_path];
+    assert_eq!(
+        crate::resolve_dep_edge("child", &host_pkg.dependencies["child"], |k| graph
+            .packages
+            .contains_key(k))
+        .as_deref(),
+        Some(key.as_str()),
+        "host's edge must resolve to the child's key"
+    );
+
+    // A `--prod` style prune walks the same edge and must keep the child.
+    let pruned = graph.filter_deps(|_| true);
+    assert!(
+        pruned.packages.contains_key(&key),
+        "pruned graph lost the file: child: {:?}",
+        pruned.packages.keys().collect::<Vec<_>>()
+    );
+
+    let out = dir.path().join("out.yaml");
+    write_with_project_root(&out, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let rewritten = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        rewritten.contains(&format!("child@file:{child}:")),
+        "child keeps its spec key on rewrite:\n{rewritten}"
+    );
+}
+
+/// A `file:` child that peers on another package carries the peer context
+/// on its key and on the parent's edge; the edge must still find it.
+#[test]
+fn transitive_file_child_with_peer_context_stays_reachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join("pnpm-lock.yaml");
+    let host = "/abs/host/host-1.0.0.tgz";
+    let child = "/abs/child/child-1.0.0.tgz";
+    std::fs::write(
+        &lockfile_path,
+        format!(
+            r#"
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      host:
+        specifier: file:{host}
+        version: file:{host}
+      react:
+        specifier: 18.2.0
+        version: 18.2.0
+
+packages:
+  child@file:{child}:
+    resolution: {{tarball: file:{child}}}
+    peerDependencies:
+      react: '*'
+
+  host@file:{host}:
+    resolution: {{tarball: file:{host}}}
+
+  react@18.2.0:
+    resolution: {{integrity: sha512-xxx}}
+
+snapshots:
+  child@file:{child}(react@18.2.0):
+    dependencies:
+      react: 18.2.0
+
+  host@file:{host}(react@18.2.0):
+    dependencies:
+      child: file:{child}(react@18.2.0)
+
+  react@18.2.0: {{}}
+"#
+        ),
+    )
+    .unwrap();
+
+    let graph = parse(&lockfile_path).unwrap();
+    let keys: Vec<_> = graph.packages.keys().collect();
+    let host_pkg = graph
+        .packages
+        .values()
+        .find(|p| p.name == "host")
+        .unwrap_or_else(|| panic!("host missing from {keys:?}"));
+    let tail = &host_pkg.dependencies["child"];
+    let found = crate::resolve_dep_edge("child", tail, |k| graph.packages.contains_key(k))
+        .unwrap_or_else(|| panic!("edge {tail} resolves to nothing in {keys:?}"));
+    assert!(found.starts_with("child@file+"), "unexpected key: {found}");
+    assert!(found.ends_with("(react@18.2.0)"), "unexpected key: {found}");
+    assert!(graph.filter_deps(|_| true).packages.contains_key(&found));
 }

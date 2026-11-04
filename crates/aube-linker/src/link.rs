@@ -14,7 +14,7 @@ use crate::sweep::{
 use crate::{Error, HoistedPlacements, LinkStats, Linker, NodeLinker, hoisted, sys};
 use aube_lockfile::{LocalSource, LockedPackage, LockfileGraph};
 use aube_store::PackageIndex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 impl Linker {
@@ -52,6 +52,15 @@ impl Linker {
         graph: &LockfileGraph,
         package_indices: &BTreeMap<String, PackageIndex>,
     ) -> Result<LinkStats, Error> {
+        // npm locks also carry physical importers for live file links in
+        // single-package projects. Their dependencies must reach the source.
+        if graph
+            .importers
+            .keys()
+            .any(|path| path != "." && is_physical_importer(path))
+        {
+            return self.link_workspace(project_dir, graph, package_indices, &BTreeMap::new());
+        }
         let project_dir = aube_util::path::normalize_lexical(project_dir);
         let modules_dir = self.checked_modules_dir(&project_dir)?;
         if matches!(self.node_linker, NodeLinker::Hoisted) {
@@ -143,16 +152,15 @@ impl Linker {
         // entries whenever the fingerprint changes.
         let prev_applied = read_applied_patches(&nm);
         let curr_applied = current_patch_hashes(&self.patches);
-        if !self.use_global_virtual_store {
-            wipe_changed_patched_entries(
-                &aube_dir,
-                graph,
-                &prev_applied,
-                &curr_applied,
-                self.virtual_store_dir_max_length,
-            );
-        }
+        wipe_changed_patched_entries(
+            &aube_dir,
+            graph,
+            &prev_applied,
+            &curr_applied,
+            self.virtual_store_dir_max_length,
+        );
 
+        let project_local_dep_paths = self.project_local_dep_paths_for_graph(graph);
         let nested_link_targets = build_nested_link_targets(&project_dir, graph);
 
         // Step 1: Populate .aube virtual store
@@ -164,13 +172,9 @@ impl Linker {
         // any `.aube/` entry at all; their top-level symlink points
         // directly at the target.
         //
-        // Git and remote-tarball sources are the exception: they're
-        // pinned to immutable content and shared across projects like
-        // registry packages. Under the global virtual store they must
-        // be materialized into the shared store (and have their
-        // `.aube/<dep_path>` entry symlinked at it) so a registry
-        // dependent that also lives in the shared store doesn't get a
-        // dangling sibling symlink to them.
+        // Git and remote-tarball sources can be shared when their
+        // dependency closure contains no project-relative source. Their
+        // registry dependents then link to the same shared-store paths.
         for (dep_path, pkg) in &graph.packages {
             let Some(ref local) = pkg.local_source else {
                 continue;
@@ -178,7 +182,10 @@ impl Linker {
             if matches!(local, LocalSource::Link(_)) {
                 continue;
             }
-            if self.use_global_virtual_store && local.is_globally_shareable() {
+            if self.use_global_virtual_store
+                && local.is_globally_shareable()
+                && !project_local_dep_paths.contains(dep_path)
+            {
                 // A git / remote-tarball dep shared globally must be
                 // materialized into its content-addressed GVS path so a
                 // registry dependent's sibling symlink resolves. The
@@ -222,7 +229,12 @@ impl Linker {
             // materialization instead of treating the path-keyed entry as a
             // cache hit. The install-state warm path prevents this work when
             // the source fingerprint is unchanged.
-            if matches!(local, LocalSource::Directory(_) | LocalSource::Portal(_)) {
+            if self.force
+                || matches!(local, LocalSource::Directory(_) | LocalSource::Portal(_))
+                || aube_entry
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+            {
                 try_remove_entry(&aube_entry);
                 if aube_entry.exists() {
                     return Err(Error::Io(
@@ -311,7 +323,7 @@ impl Linker {
                         let mut local_stats = LinkStats::default();
                         let local_aube_entry = aube_dir.join(entry_name);
                         let global_entry = self.virtual_store.join(subdir);
-                        let project_local = self.project_local_dep_paths.contains(dep_path);
+                        let project_local = project_local_dep_paths.contains(dep_path);
 
                         // Single readlink classifies the entry into one of
                         // three states and drives the whole per-package
@@ -326,6 +338,7 @@ impl Linker {
                         } else {
                             classify_entry_state(&local_aube_entry, &global_entry)
                         };
+                        let state = self.forced_entry_state(state);
 
                         if matches!(state, EntryState::Fresh) {
                             local_stats.packages_cached += 1;
@@ -397,17 +410,17 @@ impl Linker {
                             nested_link_targets.as_ref(),
                         )?;
 
-                        // Only pay the `remove_dir`/`remove_file` syscalls
-                        // when we actually have something to remove.
-                        // On Windows, `.aube/<dep_path>` is an NTFS
-                        // junction (created via `sys::create_dir_link`);
-                        // `remove_file` can't unlink those, so try
-                        // `remove_dir` first and fall back to
-                        // `remove_file` for the unix case (where
-                        // `symlink` produces a file-style link).
+                        // Only pay the removal syscalls when we actually
+                        // have something to remove. Besides a stale link
+                        // (an NTFS junction on Windows), the entry can be a
+                        // real directory: a copy of the project that
+                        // followed its links (Windows Explorer, `cp -rL`)
+                        // leaves one, and creating the link over it fails
+                        // with EEXIST. `try_remove_entry` clears every
+                        // shape without following links, as
+                        // `materialize.rs` already does.
                         if matches!(state, EntryState::Stale) {
-                            let _ = std::fs::remove_dir(&local_aube_entry)
-                                .or_else(|_| std::fs::remove_file(&local_aube_entry));
+                            try_remove_entry(&local_aube_entry);
                         }
                         // Parent dirs were pre-created above the
                         // par_iter; no per-package `mkdirp` here.
@@ -473,7 +486,7 @@ impl Linker {
                         .map(|(dep_path, pkg)| {
                             let mut local_stats = LinkStats::default();
                             let aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-                            if aube_entry.exists() {
+                            if !self.force && aube_entry.exists() {
                                 // Already in place from a previous run —
                                 // count as cached. `install.rs`
                                 // deliberately omits this dep_path from
@@ -504,14 +517,12 @@ impl Linker {
                                     &owned_index
                                 }
                             };
-                            self.materialize_at(
-                                &aube_dir.join(self.aube_dir_entry_name(dep_path)),
+                            self.materialize_replacing(
                                 &aube_dir,
                                 dep_path,
                                 pkg,
                                 index,
                                 &mut local_stats,
-                                false,
                                 nested_link_targets.as_ref(),
                             )?;
                             Ok(local_stats)
@@ -537,7 +548,7 @@ impl Linker {
         // lifecycle scripts, the state sidecar) is the install
         // driver's responsibility to skip in this mode.
         if self.virtual_store_only {
-            self.link_hidden_hoist(&aube_dir, graph)?;
+            self.link_hidden_hoist(&aube_dir, &nm, graph)?;
             if let Err(e) = write_applied_patches(&nm, &curr_applied) {
                 let sidecar = applied_patches_sidecar_name();
                 tracing::error!(
@@ -658,7 +669,7 @@ impl Linker {
         // undeclared deps) and wouldn't interact with the
         // root-level symlinks even on name clashes.
         let step4_timer = std::time::Instant::now();
-        self.link_hidden_hoist(&aube_dir, graph)?;
+        self.link_hidden_hoist(&aube_dir, &nm, graph)?;
         tracing::debug!("link:step4 (hidden hoist) {:.1?}", step4_timer.elapsed());
 
         if let Err(e) = write_applied_patches(&nm, &curr_applied) {
@@ -696,8 +707,12 @@ impl Linker {
                 // importer key (`../sibling`, possible when
                 // `pnpm-workspace.yaml#packages` uses `../**`) needs
                 // to land at the actual sibling dir before
-                // `pathdiff`/`strip_prefix` see it.
-                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                // `pathdiff`/`strip_prefix` see it. A member a symlink
+                // relocates is planned where it really is, so Node can
+                // reach what lands in its `node_modules`.
+                crate::relocated_importer_dir(root_dir, importer_path).unwrap_or_else(|| {
+                    aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                })
             };
             // Workspace deps resolve through `workspace_dirs` rather
             // than going through the placement tree, so the hoisted
@@ -736,6 +751,24 @@ impl Linker {
             &mut placements,
         )?;
 
+        // A placed package can depend on a workspace package too (the
+        // workspace peer of a `file:` package). It may have been hoisted
+        // to a directory the sibling's importer link does not cover, so
+        // link the sibling inside the package's own `node_modules`.
+        for (owner, _, name, ws_dir) in workspace_sibling_edges(graph, workspace_dirs) {
+            crate::validate_package_link_name(name)?;
+            for pkg_dir in placements.all_package_dirs(owner) {
+                let link_path = pkg_dir.join("node_modules").join(name);
+                // `link_path` always has a parent: it sits below `pkg_dir`.
+                let link_parent = link_path.parent().unwrap_or(pkg_dir);
+                mkdirp(link_parent)?;
+                try_remove_entry(&link_path);
+                let target = pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
+                sys::create_dir_link(&target, &link_path)
+                    .map_err(|e| Error::Io(link_path.clone(), e))?;
+            }
+        }
+
         // Drop workspace deps in as symlinks, same as isolated mode.
         for (importer_path, deps) in &graph.importers {
             if !is_physical_importer(importer_path) {
@@ -744,7 +777,9 @@ impl Linker {
             let importer_dir = if importer_path == "." {
                 root_dir.to_path_buf()
             } else {
-                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                crate::relocated_importer_dir(root_dir, importer_path).unwrap_or_else(|| {
+                    aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                })
             };
             let nm = self.checked_modules_dir(&importer_dir)?;
             if !self.hoist_workspace_packages {
@@ -793,7 +828,23 @@ impl Linker {
         package_indices: &BTreeMap<String, PackageIndex>,
         workspace_dirs: &BTreeMap<String, PathBuf>,
     ) -> Result<LinkStats, Error> {
-        let root_dir = aube_util::path::normalize_lexical(root_dir);
+        // A member a symlink relocates links from its real, absolute
+        // location, which a relative root or workspace dir can't be
+        // diffed against.
+        let root_dir = aube_util::path::normalize_lexical(
+            &std::path::absolute(root_dir).map_err(|e| Error::Io(root_dir.to_path_buf(), e))?,
+        );
+        let workspace_dirs = &workspace_dirs
+            .iter()
+            .map(|(name, dir)| {
+                let dir = if dir.is_relative() {
+                    std::path::absolute(dir).map_err(|e| Error::Io(dir.clone(), e))?
+                } else {
+                    dir.clone()
+                };
+                Ok((name.clone(), dir))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
         self.checked_modules_dir(&root_dir)?;
         for importer_path in graph.importers.keys() {
             if !is_physical_importer(importer_path) || importer_path == "." {
@@ -813,6 +864,10 @@ impl Linker {
         mkdirp(&aube_dir)?;
         mkdirp(&root_nm)?;
 
+        // Reclaim `.tmp-<pid>-*` dirs left by aborted installs, as
+        // `link_all` does for a single project.
+        sweep_stale_tmp_dirs(&aube_dir);
+
         let mut stats = LinkStats::default();
 
         // Patch reconciliation. Mirrors `link_all`'s logic: wipe
@@ -823,17 +878,24 @@ impl Linker {
         // name via `with_graph_hashes`.
         let prev_applied = read_applied_patches(&root_nm);
         let curr_applied = current_patch_hashes(&self.patches);
-        if !self.use_global_virtual_store {
-            wipe_changed_patched_entries(
-                &aube_dir,
-                graph,
-                &prev_applied,
-                &curr_applied,
-                self.virtual_store_dir_max_length,
-            );
-        }
+        wipe_changed_patched_entries(
+            &aube_dir,
+            graph,
+            &prev_applied,
+            &curr_applied,
+            self.virtual_store_dir_max_length,
+        );
 
-        let nested_link_targets = build_nested_link_targets(&root_dir, graph);
+        let project_local_dep_paths = self.project_local_dep_paths_for_graph(graph);
+        let nested_link_targets =
+            build_workspace_nested_link_targets(&root_dir, graph, workspace_dirs);
+        let mut workspace_peer_links: BTreeMap<&str, Vec<(&str, &PathBuf)>> = BTreeMap::new();
+        for (owner, _, name, ws_dir) in workspace_sibling_edges(graph, workspace_dirs) {
+            workspace_peer_links
+                .entry(owner)
+                .or_default()
+                .push((name, ws_dir));
+        }
 
         // Step 1a: Materialize local (`file:` dir/tarball, `portal:`,
         // `exec:`) packages straight into the shared per-project
@@ -842,12 +904,8 @@ impl Linker {
         // project. `link:` deps get no `.aube/` entry at all — step 2
         // symlinks directly to the target.
         //
-        // Git and remote-tarball sources are content-pinned and shared
-        // across projects like registry packages, so under the global
-        // virtual store they're materialized into the shared store with
-        // a `.aube/<dep_path>` symlink pointing at it — otherwise a
-        // registry dependent in the shared store would get a dangling
-        // sibling symlink to them.
+        // Git and remote-tarball sources use the shared store unless
+        // their dependency closure reaches a project-relative source.
         for (dep_path, pkg) in &graph.packages {
             let Some(ref local) = pkg.local_source else {
                 continue;
@@ -855,7 +913,10 @@ impl Linker {
             if matches!(local, LocalSource::Link(_)) {
                 continue;
             }
-            if self.use_global_virtual_store && local.is_globally_shareable() {
+            if self.use_global_virtual_store
+                && local.is_globally_shareable()
+                && !project_local_dep_paths.contains(dep_path)
+            {
                 // See the matching block in `link_isolated`: a globally
                 // shared git/tarball dep's index defines its
                 // content-addressed GVS path, so a missing index must
@@ -879,7 +940,12 @@ impl Linker {
                 continue;
             };
             let aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-            if matches!(local, LocalSource::Directory(_) | LocalSource::Portal(_)) {
+            if self.force
+                || matches!(local, LocalSource::Directory(_) | LocalSource::Portal(_))
+                || aube_entry
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+            {
                 try_remove_entry(&aube_entry);
                 if aube_entry.exists() {
                     return Err(Error::Io(
@@ -891,6 +957,23 @@ impl Linker {
                 }
             }
             if aube_entry.exists() {
+                // A cached `file:` tarball entry keeps the workspace peer
+                // link it was written with, which dangles once the workspace
+                // package moves. Repoint just those links.
+                for (name, ws_dir) in workspace_peer_links
+                    .get(dep_path.as_str())
+                    .into_iter()
+                    .flatten()
+                {
+                    let link_path = aube_entry.join("node_modules").join(name);
+                    if !reconcile_dir_link(&link_path, ws_dir)? {
+                        if let Some(parent) = link_path.parent() {
+                            mkdirp(parent)?;
+                        }
+                        sys::create_dir_link(ws_dir, &link_path)
+                            .map_err(|e| Error::Io(link_path.clone(), e))?;
+                    }
+                }
                 stats.packages_cached += 1;
                 continue;
             }
@@ -951,13 +1034,14 @@ impl Linker {
                             let mut local_stats = LinkStats::default();
                             let local_aube_entry = aube_dir.join(entry_name);
                             let global_entry = self.virtual_store.join(subdir);
-                            let project_local = self.project_local_dep_paths.contains(dep_path);
+                            let project_local = project_local_dep_paths.contains(dep_path);
 
                             let state = if project_local {
                                 classify_local_entry_state(&local_aube_entry)
                             } else {
                                 classify_entry_state(&local_aube_entry, &global_entry)
                             };
+                            let state = self.forced_entry_state(state);
 
                             if matches!(state, EntryState::Fresh) {
                                 if !project_local {
@@ -1014,9 +1098,10 @@ impl Linker {
                                 nested_link_targets.as_ref(),
                             )?;
 
+                            // A real directory is possible here too; see
+                            // the `link_all` counterpart.
                             if matches!(state, EntryState::Stale) {
-                                let _ = std::fs::remove_dir(&local_aube_entry)
-                                    .or_else(|_| std::fs::remove_file(&local_aube_entry));
+                                try_remove_entry(&local_aube_entry);
                             }
                             // Parent dirs were pre-created above the
                             // par_iter; no per-package `mkdirp` here.
@@ -1055,7 +1140,7 @@ impl Linker {
                         .map(|(dep_path, pkg)| {
                             let mut local_stats = LinkStats::default();
                             let aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-                            if aube_entry.exists() {
+                            if !self.force && aube_entry.exists() {
                                 local_stats.packages_cached += 1;
                                 return Ok(local_stats);
                             }
@@ -1076,14 +1161,12 @@ impl Linker {
                                     &owned_index
                                 }
                             };
-                            self.materialize_at(
-                                &aube_dir.join(self.aube_dir_entry_name(dep_path)),
+                            self.materialize_replacing(
                                 &aube_dir,
                                 dep_path,
                                 pkg,
                                 index,
                                 &mut local_stats,
-                                false,
                                 nested_link_targets.as_ref(),
                             )?;
                             Ok(local_stats)
@@ -1132,7 +1215,29 @@ impl Linker {
                     try_remove_entry(&entry.path());
                 }
             }
-            self.link_hidden_hoist(&aube_dir, graph)?;
+            // Physical importers (workspace members, npm file links)
+            // keep their own visible `node_modules/<name>` links.
+            for importer_path in graph.importers.keys() {
+                if importer_path == "." || !is_physical_importer(importer_path) {
+                    continue;
+                }
+                let importer_dir = crate::relocated_importer_dir(&root_dir, importer_path)
+                    .unwrap_or_else(|| {
+                        aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                    });
+                let Ok(entries) = std::fs::read_dir(importer_dir.join(&self.modules_dir_name))
+                else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if entry.path() != aube_dir
+                        && !entry.file_name().to_string_lossy().starts_with('.')
+                    {
+                        try_remove_entry(&entry.path());
+                    }
+                }
+            }
+            self.link_hidden_hoist(&aube_dir, &root_nm, graph)?;
             if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
                 let sidecar = applied_patches_sidecar_name();
                 tracing::error!(
@@ -1142,24 +1247,6 @@ impl Linker {
             }
             return Ok(stats);
         }
-
-        // Precompute root importer's direct deps keyed by name so the
-        // per-importer loop below can short-circuit on `dedupeDirectDeps`
-        // without walking the root's dep list for every child entry.
-        // Empty when the root has no direct deps (lockfile-only workspaces)
-        // or when `dedupeDirectDeps=false` — skipping the build on the
-        // common path avoids an allocation the per-dep check would
-        // never consult.
-        let root_deps_by_name: std::collections::HashMap<&str, &aube_lockfile::DirectDep> =
-            if self.dedupe_direct_deps {
-                graph
-                    .importers
-                    .get(".")
-                    .map(|deps| deps.iter().map(|d| (d.name.as_str(), d)).collect())
-                    .unwrap_or_default()
-            } else {
-                std::collections::HashMap::new()
-            };
 
         // Step 2a: Per-importer setup — ensure each importer's
         // `node_modules/` exists and sweep entries no longer in that
@@ -1231,6 +1318,9 @@ impl Linker {
         struct Step2Task<'a> {
             importer_path: &'a str,
             nm: PathBuf,
+            /// `nm` where the importer really is, when a symlink puts it
+            /// somewhere other than its workspace path.
+            real_nm: Option<PathBuf>,
             dep: &'a aube_lockfile::DirectDep,
         }
         let tasks: Vec<Step2Task<'_>> = graph
@@ -1249,9 +1339,12 @@ impl Linker {
                         &root_dir.join(importer_path).join(&self.modules_dir_name),
                     )
                 };
+                let real_nm = crate::relocated_importer_dir(&root_dir, importer_path)
+                    .map(|dir| dir.join(&self.modules_dir_name));
                 deps.iter().map(move |dep| Step2Task {
                     importer_path: importer_path.as_str(),
                     nm: nm.clone(),
+                    real_nm: real_nm.clone(),
                     dep,
                 })
             })
@@ -1266,21 +1359,40 @@ impl Linker {
                     let Step2Task {
                         importer_path,
                         nm,
+                        real_nm,
                         dep,
                     } = task;
-
                     // `dedupeDirectDeps`: non-root importer dep
                     // already covered by the root symlink +
-                    // parent-directory walk.
+                    // parent-directory walk. A link the member kept
+                    // from an earlier, different version would shadow
+                    // the root's, so clear it. A member a symlink puts
+                    // elsewhere may never reach the root's link.
                     if self.dedupe_direct_deps
-                        && *importer_path != "."
-                        && let Some(root_dep) = root_deps_by_name.get(dep.name.as_str())
-                        && root_dep.dep_path == dep.dep_path
+                        && real_nm.is_none()
+                        && crate::dedupe_skips_member_link(&graph.importers, importer_path, dep)
                     {
+                        crate::validate_package_link_name(&dep.name)?;
+                        let link_path = nm.join(&dep.name);
+                        try_remove_entry(&link_path);
+                        // Nothing recreates it, and install state tracks
+                        // only the root's link, so a survivor would go
+                        // unnoticed.
+                        if link_path.symlink_metadata().is_ok() {
+                            return Err(Error::Io(
+                                link_path,
+                                std::io::Error::other(
+                                    "failed to remove a dependency link that dedupeDirectDeps replaces with the root's",
+                                ),
+                            ));
+                        }
                         return Ok(false);
                     }
 
                     crate::validate_package_link_name(&dep.name)?;
+                    // Node resolves from where the importer really is, so
+                    // its links are made there, relative to that location.
+                    let nm = real_nm.as_ref().unwrap_or(nm);
                     let link_path = nm.join(&dep.name);
 
                     // Workspace dep (`workspace:` protocol or bare
@@ -1403,7 +1515,7 @@ impl Linker {
 
         // Hidden hoist is shared across importers, so a single sweep
         // here is sufficient for the whole workspace.
-        self.link_hidden_hoist(&aube_dir, graph)?;
+        self.link_hidden_hoist(&aube_dir, &root_nm, graph)?;
 
         if let Err(e) = write_applied_patches(&root_nm, &curr_applied) {
             let sidecar = applied_patches_sidecar_name();
@@ -1434,14 +1546,26 @@ impl Linker {
     /// toolchains canonicalize the package path into
     /// `~/.cache/aube/virtual-store/<hash>/node_modules/<name>`, so we
     /// mirror the hidden hoist under the shared virtual-store root too.
-    fn link_hidden_hoist(&self, aube_dir: &Path, graph: &LockfileGraph) -> Result<(), Error> {
-        self.link_hidden_hoist_at(aube_dir, aube_dir, graph, false, true)?;
+    fn link_hidden_hoist(
+        &self,
+        aube_dir: &Path,
+        root_nm: &Path,
+        graph: &LockfileGraph,
+    ) -> Result<(), Error> {
+        // `virtual_store_only` never creates the root links, so the
+        // parent walk would find nothing there for the root deps.
+        let reserve_root_deps =
+            !self.virtual_store_only && root_links_reachable_from(aube_dir, root_nm);
+        self.link_hidden_hoist_at(aube_dir, aube_dir, graph, false, true, reserve_root_deps)?;
         if self.use_global_virtual_store {
+            // The GVS mirror lives outside the project, so its packages
+            // never reach the root links and keep the root deps eligible.
             self.link_hidden_hoist_at(
                 &self.virtual_store,
                 &self.virtual_store,
                 graph,
                 true,
+                false,
                 false,
             )?;
         }
@@ -1455,6 +1579,7 @@ impl Linker {
         graph: &LockfileGraph,
         use_hashed_subdirs: bool,
         sweep_stale_entries: bool,
+        reserve_root_deps: bool,
     ) -> Result<(), Error> {
         let hidden = hidden_root.join("node_modules");
         // FxHashSet over the borrowed name (lives for the lockfile graph
@@ -1462,16 +1587,31 @@ impl Linker {
         // `String` clone the `HashSet<String>` version forced.
         let mut claimed: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         let packages: Vec<_> = if self.hoist {
-            graph
+            // Like pnpm's `hoistGraph`, never shadow the root importer's
+            // direct deps when a store package's parent walk reaches the
+            // root `node_modules/` after this tree. When it can't (the
+            // GVS mirror, or a `virtualStoreDir` outside the project),
+            // the direct deps (depth 0) stay eligible instead.
+            if reserve_root_deps {
+                claimed.extend(graph.root_deps().iter().map(|d| d.name.as_str()));
+            }
+            let depths = hidden_hoist_depths(graph);
+            let mut candidates: Vec<_> = graph
                 .packages
                 .iter()
-                .filter_map(|(dep_path, pkg)| {
-                    if pkg.local_source.is_some() || !self.hoist_matches(&pkg.name) {
-                        return None;
-                    }
-                    // First-writer-wins on name clashes across versions.
-                    // BTree iteration over `graph.packages` gives a
-                    // deterministic tiebreaker across runs.
+                .filter(|(_, pkg)| pkg.local_source.is_none() && self.hoist_matches(&pkg.name))
+                .map(|(dep_path, pkg)| {
+                    let depth = depths.get(dep_path.as_str()).copied().unwrap_or(u32::MAX);
+                    (depth, dep_path, pkg)
+                })
+                .collect();
+            // Shallowest version wins a name, ties broken by dep path
+            // (BTree order is already sorted, so a stable sort on depth
+            // keeps it), like pnpm's depth-then-node-id ordering.
+            candidates.sort_by_key(|(depth, _, _)| *depth);
+            candidates
+                .into_iter()
+                .filter_map(|(_, dep_path, pkg)| {
                     claimed.insert(pkg.name.as_str()).then_some((dep_path, pkg))
                 })
                 .collect()
@@ -1705,6 +1845,76 @@ impl Linker {
         }
         Ok(())
     }
+    fn project_local_dep_paths_for_graph(
+        &self,
+        graph: &LockfileGraph,
+    ) -> std::borrow::Cow<'_, BTreeSet<String>> {
+        if !self.use_global_virtual_store {
+            return std::borrow::Cow::Owned(BTreeSet::new());
+        }
+        let mut selected = match &self.precomputed_project_local_dep_paths {
+            Some(selected) => std::borrow::Cow::Borrowed(selected.as_ref()),
+            None => std::borrow::Cow::Owned(project_local_dependency_closure(graph)),
+        };
+        if !self.project_local_dep_paths.is_empty() {
+            selected
+                .to_mut()
+                .extend(self.project_local_dep_paths.iter().cloned());
+        }
+        selected
+    }
+}
+
+/// Packages with project-relative sources and all their dependents must stay
+/// in the project. Their source paths do not identify content across projects,
+/// and a shared dependent cannot link back into one project's virtual store.
+pub fn project_local_dependency_closure(graph: &LockfileGraph) -> BTreeSet<String> {
+    project_local_dependency_closure_with_seeds(graph, std::iter::empty())
+}
+
+/// Include additional project-local packages and their dependents, for
+/// compatibility transforms that cannot operate on shared store entries.
+pub fn project_local_dependency_closure_with_seeds(
+    graph: &LockfileGraph,
+    additional_seeds: impl IntoIterator<Item = String>,
+) -> BTreeSet<String> {
+    let mut selected: BTreeSet<String> = additional_seeds.into_iter().collect();
+    selected.extend(
+        graph
+            .packages
+            .iter()
+            .filter(|(_, pkg)| {
+                pkg.local_source
+                    .as_ref()
+                    .is_some_and(|s| !s.is_globally_shareable())
+            })
+            .map(|(key, _)| key.clone()),
+    );
+    if selected.is_empty() {
+        return selected;
+    }
+
+    let mut parents = rustc_hash::FxHashMap::default();
+    for (key, pkg) in &graph.packages {
+        for (name, tail) in &pkg.dependencies {
+            let child =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+                    .unwrap_or_else(|| aube_lockfile::dep_edge_key(name, tail));
+            parents.entry(child).or_insert_with(Vec::new).push(key);
+        }
+    }
+    let mut pending: VecDeque<_> = selected.iter().cloned().collect();
+    while let Some(child) = pending.pop_front() {
+        if let Some(dependents) = parents.get(&child) {
+            for parent in dependents {
+                if !selected.contains(*parent) {
+                    selected.insert((*parent).clone());
+                    pending.push_back((*parent).clone());
+                }
+            }
+        }
+    }
+    selected
 }
 
 /// Build a `dep_path → absolute on-disk target` map for every
@@ -1715,7 +1925,20 @@ pub fn build_nested_link_targets(
     project_dir: &Path,
     graph: &LockfileGraph,
 ) -> Option<BTreeMap<String, PathBuf>> {
-    let map: BTreeMap<String, PathBuf> = graph
+    build_workspace_nested_link_targets(project_dir, graph, &BTreeMap::new())
+}
+
+/// [`build_nested_link_targets`] plus every workspace package that a
+/// per-project local package (for example a `file:` directory) depends on
+/// without a `packages:` entry of its own. The resolver records only a
+/// `DirectDep` for workspace siblings, so such an edge has no other way to
+/// find its directory.
+pub fn build_workspace_nested_link_targets(
+    project_dir: &Path,
+    graph: &LockfileGraph,
+    workspace_dirs: &BTreeMap<String, PathBuf>,
+) -> Option<BTreeMap<String, PathBuf>> {
+    let mut map: BTreeMap<String, PathBuf> = graph
         .packages
         .iter()
         .filter_map(|(dp, pkg)| match pkg.local_source.as_ref() {
@@ -1723,7 +1946,93 @@ pub fn build_nested_link_targets(
             _ => None,
         })
         .collect();
+    for (_, key, _, dir) in workspace_sibling_edges(graph, workspace_dirs) {
+        map.insert(key, dir.clone());
+    }
     if map.is_empty() { None } else { Some(map) }
+}
+
+/// Whether a package materialized under `aube_dir` finds the root links
+/// in `root_nm` through Node's parent-directory walk. The walk checks
+/// `<ancestor>/node_modules` for each ancestor of the package's real
+/// path, so `root_nm` must be named `node_modules` and its parent must
+/// contain `aube_dir`.
+fn root_links_reachable_from(aube_dir: &Path, root_nm: &Path) -> bool {
+    let Some(project_dir) = root_nm.parent() else {
+        return false;
+    };
+    if root_nm.file_name() != Some(std::ffi::OsStr::new("node_modules")) {
+        return false;
+    }
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canonical(aube_dir).starts_with(canonical(project_dir))
+}
+
+/// Shortest distance of each dep path from any importer: an importer's
+/// direct deps are depth 0, their deps depth 1, and so on. Packages no
+/// importer reaches are absent.
+fn hidden_hoist_depths(graph: &LockfileGraph) -> rustc_hash::FxHashMap<&str, u32> {
+    let mut depths: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+    let mut queue = std::collections::VecDeque::new();
+    for dep in graph.importers.values().flatten() {
+        if let Some((dep_path, _)) = graph.packages.get_key_value(&dep.dep_path)
+            && !depths.contains_key(dep_path.as_str())
+        {
+            depths.insert(dep_path, 0);
+            queue.push_back(dep_path);
+        }
+    }
+    while let Some(parent) = queue.pop_front() {
+        let depth = depths[parent.as_str()] + 1;
+        for (name, tail) in &graph.packages[parent].dependencies {
+            let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            else {
+                continue;
+            };
+            if let Some((child, _)) = graph.packages.get_key_value(&child)
+                && !depths.contains_key(child.as_str())
+            {
+                depths.insert(child, depth);
+                queue.push_back(child);
+            }
+        }
+    }
+    depths
+}
+
+/// Dependency edges of per-project local packages whose target is a
+/// workspace package with no `packages:` entry:
+/// `(owner dep_path, target dep_path, name, workspace dir)`. Registry, git
+/// and tarball packages are excluded: they can live in the global virtual
+/// store, where a project-specific workspace directory must not be baked
+/// into an entry other projects share.
+fn workspace_sibling_edges<'a>(
+    graph: &'a LockfileGraph,
+    workspace_dirs: &'a BTreeMap<String, PathBuf>,
+) -> impl Iterator<Item = (&'a str, String, &'a str, &'a PathBuf)> {
+    graph
+        .packages
+        .iter()
+        .filter(|(_, pkg)| {
+            !workspace_dirs.is_empty()
+                && pkg
+                    .local_source
+                    .as_ref()
+                    .is_some_and(|local| !local.is_globally_shareable())
+        })
+        .flat_map(move |(owner, pkg)| {
+            pkg.dependencies.iter().filter_map(move |(name, tail)| {
+                let dir = workspace_dirs.get(name)?;
+                let key = format!("{name}@{tail}");
+                (!graph.packages.contains_key(&key)).then_some((
+                    owner.as_str(),
+                    key,
+                    name.as_str(),
+                    dir,
+                ))
+            })
+        })
 }
 
 /// The dependency links of a global virtual-store entry that are safe to

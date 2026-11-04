@@ -148,6 +148,7 @@ Use `aube config find <words>` to search from your terminal, or `aube config exp
 | [`strictDepBuilds`](#setting-strictdepbuilds) | `bool` | Exit with an error if dependencies have unreviewed build scripts. |
 | [`allowBuilds`](#setting-allowbuilds) | `object` | Explicitly allow or disallow script execution per package. |
 | [`dangerouslyAllowAllBuilds`](#setting-dangerouslyallowallbuilds) | `bool` | Allow all dependency build scripts automatically. |
+| [`useDefaultTrustedDependencies`](#setting-usedefaulttrusteddependencies) | `bool` | Seed the build allowlist with aube's built-in trusted-dependencies list. |
 | [`nodeVersion`](#setting-nodeversion) | `string` | Node.js version aube reports when evaluating `engines` checks. |
 | [`nodeDownloadMirrors`](#setting-nodedownloadmirrors) | `object` | Custom Node.js download mirror URLs. |
 | [`runtimeInstaller`](#setting-runtimeinstaller) | `"auto" \| "mise" \| "aube"` | Who installs a missing runtime: Node.js versions and, with `managePackageManagerVersions`, pinned aube versions. |
@@ -767,9 +768,10 @@ When `no-downgrade` (the default), aube rejects a newly resolved version that
 carries weaker trust evidence than any earlier-published version of the same
 package. Versions already present in the active lockfile are trusted without
 re-fetching their publishing evidence.
-Recognized evidence: npm staged-publish approval metadata (`approver`)
+Recognized evidence: npm staged-publish approval metadata (`_npmUser.approver`)
 outranks structured npm trusted-publisher metadata
-(`_npmUser.trustedPublisher.id`), which outranks structured SLSA provenance
+(`_npmUser.trustedPublisher.id`, counted only when the version also has
+provenance), which outranks structured SLSA provenance
 metadata (`dist.attestations.provenance.predicateType`). Set to `off` to
 disable, or use `trustPolicyExclude` to whitelist specific packages or
 versions. This policy validates registry metadata shape; it does not
@@ -962,10 +964,17 @@ everything, which mirrors pnpm's default of hoisting every
 transitive dep into the hidden tree. Only consulted when
 `hoist=true`.
 
-Matching is case-insensitive; first-writer-wins on name clashes
-across versions, using BTree iteration order for determinism. Set
-to `[]` or a list of only `!` negations to hoist nothing while
-leaving `hoist=true` (equivalent to setting `hoist=false`).
+Matching is case-insensitive. The root project's direct
+dependencies are left out of the hidden tree when packages in the
+virtual store can reach the root `node_modules/` (the default
+layout). The shared global-virtual-store mirror, a
+`virtualStoreDir` outside the project, and `virtualStoreOnly`
+installs (which create no root links) keep them eligible. When a
+name has several versions in the graph, the one closest to an
+importer wins, and equal-depth ties go to the version whose dep
+path sorts first. Set to `[]` or a list of only `!` negations to
+hoist nothing while leaving `hoist=true` (equivalent to setting
+`hoist=false`).
 
 ### `publicHoistPattern` {#setting-publichoistpattern}
 
@@ -1657,13 +1666,26 @@ Directory the lockfile is written to and read from.
 - Workspace YAML keys: `lockfileDir`
 
 By default the lockfile lives at `<project_root>/aube-lock.yaml`. Set
-this to relocate it. When the resolved path differs from the project
-root, the project becomes an importer keyed by its relative path
-(e.g. `project` if the lockfile is one directory above).
+this to relocate it for a single project or a workspace. In aube/pnpm
+lockfiles, every importer is keyed relative to the lockfile directory
+(e.g. `project` if the lockfile is one directory above). npm and Bun keep their
+native project-relative root and member paths; local dependency paths still
+resolve from the project root.
 
-Single-project relocation only — multi-project shared lockfiles
-require a `pnpm-workspace.yaml` workspace. Pointing two unrelated
-projects at the same `lockfileDir` is rejected at install time.
+In aube/pnpm formats, the guard rejects importer paths outside the workspace
+root and rejects a physical `.` root belonging to the lockfile directory.
+Stale member importers within the workspace can be pruned during normal
+resolution. Older relocated workspace lockfiles with mixed coordinates migrate
+on the next normal install. Frozen installs that require this repair report
+guidance to regenerate the lockfile.
+
+For npm and Bun, the unrelated-project guard is best-effort: their native
+formats record no physical owner. A relocated file's implicit root is treated
+as the current project, and its members follow the native path conventions.
+The guard rejects a lockfile directory containing a separate project's
+`package.json`, but cannot distinguish unrelated projects with compatible
+native lockfiles in a manifest-free shared directory. Use a separate lockfile
+directory for each project or workspace.
 
 Mirrors pnpm's `--lockfile-dir` / `lockfile-dir`. A relative path is
 resolved against the project root, not the current working directory.
@@ -1986,10 +2008,14 @@ Max time (ms) to wait for an HTTP request.
 - Environment: `npm_config_fetch_timeout`, `NPM_CONFIG_FETCH_TIMEOUT`, `AUBE_FETCH_TIMEOUT`
 - .npmrc keys: `fetch-timeout`, `fetchTimeout`
 
-Per-request HTTP timeout, applied via `reqwest`'s single-knob
-`.timeout()` so it covers headers + body together. A request that
-exceeds this limit fails with a transport error, which is then
-retriable (see `fetchRetries`). Default matches npm's 5 minutes.
+Per-request HTTP timeout. For registry metadata (packuments,
+dist-tags) it is applied via `reqwest`'s single-knob `.timeout()`, so it
+covers headers + body together. For tarball downloads it bounds
+inactivity instead: the connect, and each wait for more data, may take
+this long, but the transfer as a whole may take longer, so a slow
+connection that keeps delivering bytes is never cut off. A request that
+exceeds the limit fails with a transport error, which is then retriable
+(see `fetchRetries`). Default matches npm's 5 minutes.
 
 Examples:
 
@@ -2591,6 +2617,27 @@ Examples:
 
 - `aube install --dangerously-allow-all-builds`
 
+### `useDefaultTrustedDependencies` {#setting-usedefaulttrusteddependencies}
+
+Seed the build allowlist with aube's built-in trusted-dependencies list.
+
+- Type: `bool`
+- Default: `true`
+- Environment: `npm_config_use_default_trusted_dependencies`, `NPM_CONFIG_USE_DEFAULT_TRUSTED_DEPENDENCIES`, `AUBE_USE_DEFAULT_TRUSTED_DEPENDENCIES`
+- .npmrc keys: `useDefaultTrustedDependencies`, `use-default-trusted-dependencies`
+
+aube ships a snapshot of pnpm's trusted-dependencies list and merges it
+into the dependency lifecycle-script allowlist whenever scripts run. Set
+this to `false` to approve only the packages named in `allowBuilds`,
+`onlyBuiltDependencies`, and `trustedDependencies`, so an explicit
+allowlist means exactly what it lists. Bun treats an explicit
+`trustedDependencies` the same way. `neverBuiltDependencies` and
+`allowBuilds: { pkg: false }` still win over any approval.
+
+Examples:
+
+- `useDefaultTrustedDependencies: false`
+
 ## Node.js
 
 ### `nodeVersion` {#setting-nodeversion}
@@ -3176,8 +3223,9 @@ Explicitly mark the environment as CI.
 - .npmrc keys: `ci`
 
 aube treats the environment as CI when the `CI` environment variable
-is set. CI mode disables the global virtual store and flips the default
-install mode to `--frozen-lockfile`.
+is set to a non-empty value (an empty `CI=` is treated as not CI, matching
+pnpm; `CI=0` and `CI=false` still count as CI). CI mode disables the
+global virtual store and flips the default install mode to `--frozen-lockfile`.
 
 Examples:
 

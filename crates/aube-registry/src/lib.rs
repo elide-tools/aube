@@ -366,8 +366,6 @@ struct TolerantStringMap(
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionTrustMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approver: Option<serde_json::Value>,
     #[serde(
         default,
         rename = "_npmUser",
@@ -473,15 +471,10 @@ pub struct VersionMetadata {
     /// Deprecation message from the registry, if this version is deprecated.
     #[serde(default, deserialize_with = "deprecated_string")]
     pub deprecated: Option<String>,
-    /// npm staged-publish approval metadata. When present, the
-    /// resolver treats it as the strongest trust evidence because the
-    /// publish went through a registry-side approval flow.
-    #[serde(default)]
-    pub approver: Option<serde_json::Value>,
     /// `_npmUser` block from the packument, when present. The
-    /// trust-policy check reads `_npmUser.trustedPublisher` as the
-    /// strongest trust-evidence signal (npm's "trusted publishers"
-    /// feature, OIDC-backed). Some old packuments emit `_npmUser` as
+    /// trust-policy check reads `_npmUser.approver` (npm staged-publish
+    /// approval) and `_npmUser.trustedPublisher` (OIDC-backed trusted
+    /// publishers) from it. Some old packuments emit `_npmUser` as
     /// a `"name <email>"` string rather than an object — that shape
     /// degrades to `None` instead of failing the whole packument.
     #[serde(default, rename = "_npmUser", deserialize_with = "npm_user_tolerant")]
@@ -539,11 +532,18 @@ struct VersionMetadataRaw {
     #[serde(default, rename = "bin", deserialize_with = "bin_map")]
     bin: BTreeMap<String, String>,
     #[serde(default)]
-    has_install_script: bool,
+    has_install_script: Option<bool>,
+    /// Full packuments omit `hasInstallScript`, so it is derived from
+    /// `scripts`. npm adds the implicit `node-gyp rebuild` install script
+    /// to published manifests, so `binding.gyp` packages are covered.
+    #[serde(
+        default,
+        rename = "scripts",
+        deserialize_with = "declares_install_script"
+    )]
+    declares_install_script: bool,
     #[serde(default, deserialize_with = "deprecated_string")]
     deprecated: Option<String>,
-    #[serde(default)]
-    approver: Option<serde_json::Value>,
     #[serde(default, rename = "_npmUser", deserialize_with = "npm_user_tolerant")]
     npm_user: Option<NpmUser>,
 }
@@ -567,9 +567,10 @@ impl From<VersionMetadataRaw> for VersionMetadata {
             license: raw.license,
             funding_url: raw.funding_url,
             bin: raw.bin,
-            has_install_script: raw.has_install_script,
+            has_install_script: raw
+                .has_install_script
+                .unwrap_or(raw.declares_install_script),
             deprecated: raw.deprecated,
-            approver: raw.approver,
             npm_user: raw.npm_user,
         }
     }
@@ -583,6 +584,11 @@ pub struct PeerDepMeta {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct NpmUser {
+    /// npm staged-publish approval metadata (`_npmUser.approver`). When
+    /// present, the resolver treats it as the strongest trust evidence
+    /// because the publish went through a registry-side approval flow.
+    #[serde(default)]
+    pub approver: Option<serde_json::Value>,
     /// Structured npm trusted-publisher evidence for publishes that came
     /// through OIDC-backed automation (e.g. GitHub Actions). aube's
     /// trust-policy check requires an object with a non-empty `id`.
@@ -668,6 +674,44 @@ where
     de.deserialize_any(V)
 }
 
+/// True when a packument's `scripts:` map has a non-empty `preinstall`,
+/// `install` or `postinstall` entry, the hooks npm runs for a dependency.
+/// Any other shape degrades to `false`.
+fn declares_install_script<'de, D>(de: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a scripts object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut found = false;
+            while let Some(key) = access.next_key::<String>()? {
+                if matches!(key.as_str(), "preinstall" | "install" | "postinstall") {
+                    let MaybeString(script) = access.next_value()?;
+                    found |= script.is_some_and(|s| !s.trim().is_empty());
+                } else {
+                    let _: IgnoredAny = access.next_value()?;
+                }
+            }
+            Ok(found)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(false)
+        }
+
+        visit_primitives_to!('de, false);
+        visit_seq_to!('de, false);
+    }
+    de.deserialize_any(V)
+}
+
 /// Extract the first `url:` out of a packument's `funding:` field.
 /// The field may be a URL string, a `{url: …}` object, or an array
 /// of either — npm's lockfile normalizes to `{"url": "…"}` on each
@@ -735,8 +779,8 @@ fn extract_url_from_map<'de, A: MapAccess<'de>>(mut access: A) -> Result<Option<
 /// and degrade to `None` for anything else. Modern packuments emit an
 /// object (`{name, email, trustedPublisher?}`); pre-2010 publishes
 /// emit `"name <email>"` strings. We only care about
-/// `trustedPublisher`, so unparseable shapes don't fail the packument
-/// — they just lose the trusted-publisher signal for that version.
+/// `approver` and `trustedPublisher`, so unparseable shapes don't fail
+/// the packument — they just lose the trust signals for that version.
 fn npm_user_tolerant<'de, D>(de: D) -> Result<Option<NpmUser>, D::Error>
 where
     D: Deserializer<'de>,
@@ -749,8 +793,8 @@ where
             f.write_str("an _npmUser object or any other JSON value")
         }
 
-        // Object case: walk the map manually and pluck `trustedPublisher`
-        // — the only `NpmUser` field anyone reads (see `aube-resolver`'s
+        // Object case: walk the map manually and pluck `approver` and
+        // `trustedPublisher` — the only `NpmUser` fields anyone reads (see `aube-resolver`'s
         // trust-policy check). Deferring to `NpmUser::deserialize` on the
         // live `MapAccess` would propagate any deserialize error up and
         // fail the whole packument parse, which silently breaks the
@@ -758,15 +802,21 @@ where
         // field. New fields that need reading from the packument get
         // their extraction added here.
         fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut approver: Option<serde_json::Value> = None;
             let mut trusted_publisher: Option<serde_json::Value> = None;
             while let Some(key) = access.next_key::<String>()? {
-                if key == "trustedPublisher" && trusted_publisher.is_none() {
+                if key == "approver" && approver.is_none() {
+                    approver = access.next_value::<Option<serde_json::Value>>()?;
+                } else if key == "trustedPublisher" && trusted_publisher.is_none() {
                     trusted_publisher = access.next_value::<Option<serde_json::Value>>()?;
                 } else {
                     let _: IgnoredAny = access.next_value()?;
                 }
             }
-            Ok(Some(NpmUser { trusted_publisher }))
+            Ok(Some(NpmUser {
+                approver,
+                trusted_publisher,
+            }))
         }
 
         visit_primitives_to!('de, None);
@@ -907,7 +957,7 @@ impl<'de> Deserialize<'de> for FundingArrayEntry {
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum Error {
-    #[error("HTTP error: {0}")]
+    #[error("HTTP error: {}", format_http_error(.0))]
     Http(#[from] reqwest::Error),
     #[error("package not found: {0}")]
     #[diagnostic(code(ERR_AUBE_PACKAGE_NOT_FOUND))]
@@ -943,6 +993,25 @@ pub enum Error {
     #[error("invalid package name: {0:?}")]
     #[diagnostic(code(ERR_AUBE_INVALID_PACKAGE_NAME))]
     InvalidName(String),
+}
+
+/// Keep the transport cause when callers render a registry error as text.
+/// reqwest's Display stops at the request URL; DNS, proxy and TLS failures
+/// otherwise all look like the same "error sending request" message.
+pub(crate) fn format_http_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    use std::fmt::Write as _;
+
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    if let Some(url) = error.url() {
+        message = message.replace(url.as_str(), &aube_util::url::redact_url(url.as_str()));
+    }
+    message
 }
 
 impl Error {
@@ -987,7 +1056,7 @@ mod tests {
                     "name":"platform-package",
                     "version":"1.0.0",
                     "dependencies":{"discarded":"1"},
-                    "approver":{"name":"release-manager"}
+                    "_npmUser":{"approver":{"name":"release-manager"}}
                 },
                 "2.0.0":{
                     "name":"platform-package",
@@ -1026,6 +1095,35 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("requested version 2.0.0"));
+    }
+
+    #[test]
+    fn has_install_script_derives_from_install_hooks_when_flag_absent() {
+        for hook in ["preinstall", "install", "postinstall"] {
+            let meta = parse(&format!(
+                r#"{{"name":"x","version":"1.0.0","scripts":{{"test":"jest","{hook}":"node build.js"}}}}"#
+            ));
+            assert!(meta.has_install_script, "{hook}");
+        }
+        for json in [
+            r#"{"name":"x","version":"1.0.0"}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"test":"jest","prepare":"tsc"}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"postinstall":""}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":{"postinstall":42}}"#,
+            r#"{"name":"x","version":"1.0.0","scripts":"nope"}"#,
+        ] {
+            assert!(!parse(json).has_install_script, "{json}");
+        }
+    }
+
+    #[test]
+    fn has_install_script_keeps_registry_flag() {
+        let meta = parse(r#"{"name":"x","version":"1.0.0","hasInstallScript":true}"#);
+        assert!(meta.has_install_script);
+        let meta = parse(
+            r#"{"name":"x","version":"1.0.0","hasInstallScript":false,"scripts":{"postinstall":"node build.js"}}"#,
+        );
+        assert!(!meta.has_install_script);
     }
 
     #[test]
@@ -1086,12 +1184,13 @@ mod tests {
             r#"{
                 "name":"x",
                 "version":"1.0.0",
-                "approver":{"name":"release-manager"}
+                "_npmUser":{"approver":{"name":"release-manager"}}
             }"#,
         );
         assert_eq!(
-            v.approver
+            v.npm_user
                 .as_ref()
+                .and_then(|u| u.approver.as_ref())
                 .and_then(|a| a.get("name"))
                 .and_then(serde_json::Value::as_str),
             Some("release-manager")
@@ -1145,7 +1244,6 @@ mod tests {
             bin,
             has_install_script: false,
             deprecated: None,
-            approver: None,
             npm_user: None,
         };
         let json = serde_json::to_string(&v).unwrap();

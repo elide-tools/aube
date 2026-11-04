@@ -666,3 +666,248 @@ _setup_catalog_workspace() {
 	run cat node_modules/is-odd/package.json
 	assert_output --partial '"version": "3.0.1"'
 }
+
+@test "aube install: pnpm-lock.yaml omits catalog entries no importer references" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+		catalogs:
+		  unused:
+		    is-number: ^6.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:", "is-even": "catalog:" }
+		}
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+
+	run aube install
+	assert_success
+	run grep -E "^    (is-odd|is-even):" pnpm-lock.yaml
+	assert_success
+
+	# Stop referencing is-even; the entry must leave the lockfile too.
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:" }
+		}
+	EOF
+	run aube install
+	assert_success
+	catalogs_block=$(awk '/^catalogs:/{f=1;next} /^[^ ]/{f=0} f' pnpm-lock.yaml)
+	[[ "$catalogs_block" == *"is-odd:"* ]]
+	[[ "$catalogs_block" != *"is-even:"* ]]
+	[[ "$catalogs_block" != *"unused:"* ]]
+	[[ "$catalogs_block" != *"is-number:"* ]]
+
+	run aube install --frozen-lockfile
+	assert_success
+}
+
+@test "aube add: pnpm-lock.yaml drops stale unreferenced catalog entries" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:" }
+		}
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+	aube install
+
+	# Inject an entry no importer references, as an older writer left behind.
+	awk '{print} /^  default:$/ {print "    is-even:"; print "      specifier: ^1.0.0"; print "      version: 1.0.0"}' pnpm-lock.yaml >pnpm-lock.yaml.new
+	mv pnpm-lock.yaml.new pnpm-lock.yaml
+	run aube install
+	assert_success
+	run aube install --frozen-lockfile
+	assert_success
+
+	cd packages/lib
+	run aube add is-number
+	assert_success
+	cd ../..
+	catalogs_block=$(awk '/^catalogs:/{f=1;next} /^[^ ]/{f=0} f' pnpm-lock.yaml)
+	[[ "$catalogs_block" == *"is-odd:"* ]]
+	[[ "$catalogs_block" != *"is-even:"* ]]
+}
+
+@test "aube install: pnpm-lock.yaml omits catalog entries replaced by an override" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+		overrides:
+		  is-even: 1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:", "is-even": "catalog:" }
+		}
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+
+	run aube install
+	assert_success
+	catalogs_block=$(awk '/^catalogs:/{f=1;next} /^[^ ]/{f=0} f' pnpm-lock.yaml)
+	[[ "$catalogs_block" == *"is-odd:"* ]]
+	[[ "$catalogs_block" != *"is-even:"* ]]
+
+	run aube install --frozen-lockfile
+	assert_success
+}
+
+@test "aube install: catalogPrune keeps overridden catalog entries the manifest references" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+		overrides:
+		  is-even: 1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:", "is-even": "catalog:" }
+		}
+	EOF
+	cat >.npmrc <<-'EOF'
+		catalogPrune=true
+	EOF
+
+	run aube install
+	assert_success
+	# The lockfile omits the overridden entry, but the manifest still says
+	# `catalog:`, so the workspace yaml must keep it for the next resolve.
+	run grep -Fx '  is-even: ^1.0.0' pnpm-workspace.yaml
+	assert_success
+	run aube install --no-frozen-lockfile
+	assert_success
+}
+
+@test "aube install: ranged override keeps the catalog: importer specifier" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: 3.0.1
+		overrides:
+		  "is-odd@^3": "catalog:"
+		  "is-odd@>=3": 0.1.2
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "dependencies": { "is-odd": "catalog:" } }
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+
+	run aube install --lockfile-only
+	assert_success
+	# pnpm matches version-qualified selectors against the declared
+	# `catalog:` text, which no range intersects, so neither override
+	# applies and pnpm's frozen install accepts only `'catalog:'` here.
+	run grep -A2 -E '^      is-odd:$' pnpm-lock.yaml
+	assert_output --partial "specifier: 'catalog:'"
+	assert_output --partial "version: 3.0.1"
+	catalogs_block=$(awk '/^catalogs:/{f=1;next} /^[^ ]/{f=0} f' pnpm-lock.yaml)
+	[[ "$catalogs_block" == *"is-odd:"* ]]
+
+	run aube install --frozen-lockfile
+	assert_success
+	run cat node_modules/is-odd/package.json
+	assert_output --partial '"version": "3.0.1"'
+}
+
+@test "aube install: a catalog: override value stays out of pnpm-lock.yaml catalogs" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: 3.0.1
+		  is-number: ^7.0.0
+		overrides:
+		  is-number: "catalog:"
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "dependencies": { "is-odd": "catalog:" } }
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+
+	run aube install
+	assert_success
+	run grep -Fx "  is-number: ^7.0.0" pnpm-lock.yaml
+	assert_success
+	catalogs_block=$(awk '/^catalogs:/{f=1;next} /^[^ ]/{f=0} f' pnpm-lock.yaml)
+	[[ "$catalogs_block" == *"is-odd:"* ]]
+	[[ "$catalogs_block" != *"is-number:"* ]]
+	# is-odd@3.0.1 declares is-number ^6.0.0, so 7.0.0 proves the
+	# override applied.
+	assert_dir_exists node_modules/.aube/is-number@7.0.0
+	assert_dir_not_exists node_modules/.aube/is-number@6.0.0
+
+	run aube install --frozen-lockfile
+	assert_success
+}
+
+@test "aube install: catalogPrune keeps catalog entries an override value references" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: 3.0.1
+		  is-number: ^7.0.0
+		  is-even: ^1.0.0
+		overrides:
+		  is-number: "catalog:"
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "dependencies": { "is-odd": "catalog:" } }
+	EOF
+	cat >.npmrc <<-'EOF'
+		catalogPrune=true
+	EOF
+	printf "lockfileVersion: '9.0'\\n" >pnpm-lock.yaml
+
+	run aube install
+	assert_success
+	# The lockfile omits is-number, but the override still resolves
+	# through it, so only the unreferenced is-even is pruned.
+	run grep -Fx '  is-number: ^7.0.0' pnpm-workspace.yaml
+	assert_success
+	run grep -F 'is-even' pnpm-workspace.yaml
+	assert_failure
+	run aube install --no-frozen-lockfile
+	assert_success
+	assert_dir_exists node_modules/.aube/is-number@7.0.0
+}

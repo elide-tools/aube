@@ -313,6 +313,24 @@ impl<'a> ResolveDriver<'a> {
         Ok(contextualized)
     }
 
+    /// True when the importer, the workspace root (if peers resolve
+    /// from it), or an ancestor of `task` already supplies `dep_name`,
+    /// so the peer needs no auto-install task of its own.
+    fn peer_supplied_by_scope(&self, task: &ResolveTask, dep_name: &str) -> bool {
+        let importer_declares_peer = self
+            .importer_declared_dep_names
+            .get(&task.importer)
+            .is_some_and(|names| names.contains(dep_name));
+        let root_declares_peer = self.resolver.resolve_peers_from_workspace_root
+            && task.importer != "."
+            && self
+                .importer_declared_dep_names
+                .get(".")
+                .is_some_and(|names| names.contains(dep_name));
+        let peer_dep_is_ancestor = task.ancestors.iter().any(|(name, _)| name == dep_name);
+        importer_declares_peer || root_declares_peer || peer_dep_is_ancestor
+    }
+
     /// Fire prefetches for every seeded root dep up front, so their
     /// packuments are already in flight by the time the first task is
     /// popped.
@@ -795,7 +813,12 @@ impl<'a> ResolveDriver<'a> {
                                     .fetch_packument_with_time_cached(&registry_name, dir)
                                     .await
                             }
-                            None => self.resolver.client.fetch_packument(&registry_name).await,
+                            None => {
+                                self.resolver
+                                    .client
+                                    .fetch_packument_with_time(&registry_name)
+                                    .await
+                            }
                         }
                     } else {
                         match self.resolver.client.fetch_packument(&registry_name).await {
@@ -1173,12 +1196,11 @@ impl<'a> ResolveDriver<'a> {
         // range (debug's optional `supports-color`, typescript-eslint's
         // optional `typescript`, …). Synthesize the same `*` so peer
         // context resolves these exactly like pnpm: an optional peer that
-        // a real ancestor / the workspace root provides (typescript) gets
-        // a dep-path suffix, while one nothing on the path provides
-        // (supports-color) is left unresolved and surfaces under
-        // `transitivePeerDependencies`. The optional-peer branch in
-        // `visit_peer_context` is what keeps the graph-wide scan from
-        // binding the latter to an unrelated copy in the tree.
+        // an ancestor, the workspace root, or any satisfying version
+        // elsewhere in the graph provides gets a dep-path suffix, while
+        // one nothing in the graph satisfies is left unresolved and
+        // surfaces under `transitivePeerDependencies`. See the
+        // optional-peer branch in `visit_peer_context`.
         let mut peer_deps = version_meta.peer_dependencies.clone();
         for name in version_meta.peer_dependencies_meta.keys() {
             peer_deps
@@ -1252,27 +1274,18 @@ impl<'a> ResolveDriver<'a> {
                 yarn_checksum: None,
                 engines: version_meta.engines.clone(),
                 // Rehydrate a string-form bin (`"bin": "cli.js"`)
-                // into `{<package_name>: "cli.js"}` — registry
-                // packuments leave the name off, expecting
-                // consumers to default it to the package name.
-                // Doing it here keeps bun's per-entry meta
-                // byte-identical to bun's own output without
-                // pushing the fixup into every writer.
+                // into `{<command>: "cli.js"}` — registry packuments
+                // leave the name off, expecting consumers to default
+                // it to the package name. The command is named after
+                // the real registry package (not an alias), without
+                // its scope: `@scope/tool` installs a `tool` command,
+                // which is the key npm and bun write.
                 bin: {
                     let mut m = version_meta.bin.clone();
                     if let Some(path) = m.remove("") {
-                        // String-form `bin` in a packument
-                        // (`"bin": "cli.js"`) is implicitly
-                        // named after the real registry
-                        // package — not the alias. For an
-                        // aliased dep (`"h3-v2": "npm:h3@…"`)
-                        // the bun writer must emit the bin
-                        // under `h3`, not `h3-v2`, or the
-                        // map drifts against bun's own
-                        // output (and the shim install path
-                        // creates the wrong binary name).
-                        let bin_name = task.real_name.as_deref().unwrap_or(&task.name).to_string();
-                        m.insert(bin_name, path);
+                        let real_name = task.real_name.as_deref().unwrap_or(&task.name);
+                        let bin_name = real_name.rsplit('/').next().unwrap_or(real_name);
+                        m.insert(bin_name.to_string(), path);
                     }
                     m
                 },
@@ -1300,17 +1313,40 @@ impl<'a> ResolveDriver<'a> {
                 // `deprecated_msg`: that one is gated by
                 // `allowedDeprecatedVersions`, which only silences the
                 // install warning — pnpm still records the field.
-                extra_meta: version_meta
-                    .deprecated
-                    .as_deref()
-                    .map(|msg| {
-                        BTreeMap::from([(
+                // `hasInstallScript` rides along the same way so the npm
+                // writer can flag new entries: `npm ci` only runs a
+                // dependency's install scripts when the lock entry says so.
+                extra_meta: {
+                    let mut meta = BTreeMap::new();
+                    if let Some(msg) = version_meta.deprecated.as_deref() {
+                        meta.insert(
                             "deprecated".to_string(),
                             serde_json::Value::String(msg.to_string()),
-                        )])
-                    })
-                    .unwrap_or_default(),
-            },
+                        );
+                    }
+                    if version_meta.has_install_script {
+                        meta.insert("hasInstallScript".to_string(), true.into());
+                    }
+                    if let Some(shasum) =
+                        version_meta.dist.as_ref().and_then(|d| d.shasum.as_deref())
+                    {
+                        meta.insert(
+                            aube_lockfile::EXTRA_REGISTRY_SHASUM.to_string(),
+                            serde_json::Value::String(shasum.to_string()),
+                        );
+                    }
+                    if !bundled_names.is_empty() {
+                        // Bundled children are not resolved, so remember which
+                        // were optional for the npm writer to keep that section.
+                        meta.insert(
+                            aube_lockfile::npm::BUNDLED_OPTIONAL_KEY.to_string(),
+                            serde_json::json!(version_meta.optional_dependencies),
+                        );
+                    }
+                    meta
+                },
+            }
+            .with_declared_dependencies_known(),
         );
 
         // Enqueue transitive deps. Kick off a background
@@ -1457,18 +1493,7 @@ impl<'a> ResolveDriver<'a> {
                 if peer_optional {
                     continue;
                 }
-                let importer_declares_peer = self
-                    .importer_declared_dep_names
-                    .get(&task.importer)
-                    .is_some_and(|names| names.contains(dep_name));
-                let root_declares_peer = self.resolver.resolve_peers_from_workspace_root
-                    && task.importer != "."
-                    && self
-                        .importer_declared_dep_names
-                        .get(".")
-                        .is_some_and(|names| names.contains(dep_name));
-                let peer_dep_is_ancestor = task.ancestors.iter().any(|(name, _)| name == dep_name);
-                if importer_declares_peer || root_declares_peer || peer_dep_is_ancestor {
+                if self.peer_supplied_by_scope(&task, dep_name) {
                     continue;
                 }
                 if version_meta.dependencies.contains_key(dep_name)
@@ -1529,8 +1554,8 @@ impl<'a> ResolveDriver<'a> {
     /// transitives (and the project root for override-substituted
     /// paths, since overrides are declared at the root). Git +
     /// remote-tarball specs anchor on nothing. Transitive
-    /// `link:`/`file:` from a registry-hosted parent errors out —
-    /// there's no on-disk path to resolve against.
+    /// relative `link:`/`file:` from a registry-hosted parent errors
+    /// out because there is no on-disk path to resolve against.
     ///
     /// Side effects: wires the importer + parent edges, inserts the
     /// package into `resolved`, streams to the early-fetch consumer,
@@ -1604,20 +1629,12 @@ impl<'a> ResolveDriver<'a> {
         };
         // Git and remote-tarball specifiers don't reference a path,
         // so they pass through regardless of parent shape.
-        // `link:`/`file:` transitives only resolve when we either
-        // (a) located a parent source root or (b) inherited the
-        // path from a project-root-anchored override.
+        // Absolute paths need no parent anchor. Relative local paths
+        // require a parent source root or a project-root override.
         if !task.is_root
             && parent_source_root.is_none()
             && !task.range_from_override
-            && matches!(
-                raw_local,
-                LocalSource::Directory(_)
-                    | LocalSource::Tarball(_)
-                    | LocalSource::Link(_)
-                    | LocalSource::Portal(_)
-                    | LocalSource::Exec(_)
-            )
+            && raw_local.path().is_some_and(|path| !path.is_absolute())
         {
             return Err(Error::Registry(
                 task.name.clone(),
@@ -1627,6 +1644,10 @@ impl<'a> ResolveDriver<'a> {
                 ),
             ));
         }
+        let mut local_peers = BTreeMap::new();
+        let mut local_peers_meta = BTreeMap::new();
+        let mut local_integrity = None;
+        let mut local_bundles = Vec::new();
         let (mut local, real_version, mut target_deps, mut target_optional_deps, integrity) =
             if let LocalSource::Git(ref g) = raw_local {
                 let shallow =
@@ -1689,17 +1710,25 @@ impl<'a> ResolveDriver<'a> {
                         let manifest = read_local_manifest(&raw_local, &importer_root)
                             .unwrap_or_else(|_| crate::local_source::LocalManifest {
                                 name: task.name.clone(),
+                                integrity: None,
+                                bundled_dependencies: Vec::new(),
                                 version: "0.0.0".to_string(),
                                 dependencies: BTreeMap::new(),
                                 optional_dependencies: BTreeMap::new(),
+                                peer_dependencies: BTreeMap::new(),
+                                peer_dependencies_meta: BTreeMap::new(),
                             });
+                        local_integrity = manifest.integrity;
+                        local_bundles = manifest.bundled_dependencies;
+                        local_peers = manifest.peer_dependencies;
+                        local_peers_meta = manifest.peer_dependencies_meta;
                         (
                             manifest.version,
                             manifest.dependencies,
                             manifest.optional_dependencies,
                         )
                     };
-                (local, version, deps, optional_deps, None)
+                (local, version, deps, optional_deps, local_integrity)
             };
         attach_integrity_to_git_source(&mut local, integrity.as_deref());
         // Apply `packageExtensions` to non-registry packages too. The
@@ -1715,7 +1744,17 @@ impl<'a> ResolveDriver<'a> {
             &mut target_deps,
             &self.resolver.dependency_policy.package_extensions,
         );
+        // After the extensions: one may re-add a child the tarball already ships.
+        for name in &local_bundles {
+            target_deps.remove(name);
+            target_optional_deps.remove(name);
+        }
         target_optional_deps.retain(|name, _| !target_deps.contains_key(name));
+        let declared_dependencies: BTreeMap<String, String> = target_deps
+            .iter()
+            .chain(target_optional_deps.iter())
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect();
         let dep_path = local.dep_path(&task.name);
         let linked_name = task.name.clone();
 
@@ -1773,8 +1812,13 @@ impl<'a> ResolveDriver<'a> {
                     integrity: integrity.clone(),
                     dep_path: dep_path.clone(),
                     local_source: Some(local.clone()),
+                    peer_dependencies: local_peers,
+                    peer_dependencies_meta: local_peers_meta,
+                    bundled_dependencies: local_bundles,
+                    declared_dependencies,
                     ..Default::default()
-                },
+                }
+                .with_declared_dependencies_known(),
             );
             if let Some(ref tx) = self.resolver.resolved_tx {
                 let pending = self.queue.len()
@@ -1885,16 +1929,26 @@ impl<'a> ResolveDriver<'a> {
         // loop, so overrides can still target a catalog dep by bare
         // name. The raw `catalog:...` text stays in `original_specifier`;
         // the separate lockfile field changes only if an override fires.
+        //
+        // The pick is only recorded in the lockfile's `catalogs:` block
+        // when the catalog value survives the override pass below: pnpm
+        // drops entries whose range an override replaced.
+        //
+        // pnpm applies overrides to the declared specifier before it
+        // expands catalogs, so a version-qualified selector such as
+        // `foo@^3` is tested against the literal `catalog:` text, never
+        // intersects it, and leaves the dependency on its catalog entry.
+        // `catalog_declaration` keeps that text for override matching
+        // until an override replaces the declaration.
+        let mut catalog_pick: Option<(String, String)> = None;
+        let mut catalog_declaration: Option<String> = None;
         if let Some((catalog_name, real_range)) = self
             .resolver
             .resolve_catalog_spec(&task.name, &task.range)?
         {
             tracing::trace!("catalog: {} {} -> {}", task.name, task.range, real_range);
-            self.catalog_picks
-                .entry(catalog_name)
-                .or_default()
-                .insert(task.name.clone(), real_range.clone());
-            task.range = real_range;
+            catalog_declaration = Some(std::mem::replace(&mut task.range, real_range.clone()));
+            catalog_pick = Some((catalog_name, real_range));
         }
 
         for _ in 0..2 {
@@ -1902,7 +1956,7 @@ impl<'a> ResolveDriver<'a> {
             if let Some(override_spec) = pick_override_spec(
                 &self.resolver.override_rules,
                 &task.name,
-                &task.range,
+                catalog_declaration.as_deref().unwrap_or(&task.range),
                 &task.ancestors,
             ) {
                 // pnpm's removal marker: an override value of `"-"`
@@ -1922,42 +1976,47 @@ impl<'a> ResolveDriver<'a> {
                 // original range, so resolve the indirection here
                 // before assigning — otherwise `catalog:` leaks
                 // through to the registry resolver.
-                let (effective_spec, pending_pick) = match self
+                let effective_spec = match self
                     .resolver
                     .resolve_catalog_spec(&task.name, &override_spec)?
                 {
-                    Some((catalog_name, real_range)) => {
-                        (real_range.clone(), Some((catalog_name, real_range)))
-                    }
-                    None => (override_spec, None),
+                    Some((_, real_range)) => real_range,
+                    None => override_spec,
                 };
                 // pnpm records the override-applied specifier for direct
                 // importer dependencies. Keep ordinary `catalog:` dependencies
                 // verbatim, but once an override fires use its effective value
                 // (including catalog expansion) in the lockfile importer.
+                // A `link:`/`file:` override is recorded relative to the
+                // importer, as pnpm records it.
                 if task.is_root {
-                    task.lockfile_override_specifier = Some(effective_spec.clone());
+                    task.lockfile_override_specifier = Some(
+                        aube_lockfile::importer_relative_override(&effective_spec, &task.importer)
+                            .unwrap_or_else(|| effective_spec.clone()),
+                    );
                 }
+                // Overrides are declared at the project root, so a
+                // substituted `link:`/`file:` path is project-root-relative
+                // — mark the task so the local-source branch anchors it
+                // correctly. That holds even when the override's value
+                // equals the declaration: pnpm applies the override then
+                // too, and resolves the path from the root.
+                if is_non_registry_specifier(&effective_spec) {
+                    task.range_from_override = true;
+                }
+                // The override replaced the catalog reference, so the
+                // pre-pass pick no longer drives resolution. pnpm expands
+                // a `catalog:` override value when it reads the config and
+                // never records it in `catalogs:`, so neither does aube.
+                catalog_pick = None;
+                catalog_declaration = None;
                 if task.range != effective_spec {
-                    if let Some((catalog_name, real_range)) = pending_pick {
-                        self.catalog_picks
-                            .entry(catalog_name)
-                            .or_default()
-                            .insert(task.name.clone(), real_range);
-                    }
                     tracing::trace!(
                         "override: {}@{} -> {}",
                         task.name,
                         task.range,
                         effective_spec
                     );
-                    // Overrides are declared at the project root, so
-                    // a substituted `link:`/`file:` path is
-                    // project-root-relative — mark the task so the
-                    // local-source branch anchors it correctly.
-                    if is_non_registry_specifier(&effective_spec) {
-                        task.range_from_override = true;
-                    }
                     task.range = effective_spec;
                     // If the override replaced the spec with a bare
                     // range (not itself an `npm:`/`jsr:` alias), it's
@@ -2051,6 +2110,12 @@ impl<'a> ResolveDriver<'a> {
             if !changed {
                 break;
             }
+        }
+        if let Some((catalog_name, real_range)) = catalog_pick {
+            self.catalog_picks
+                .entry(catalog_name)
+                .or_default()
+                .insert(task.name.clone(), real_range);
         }
         Ok(true)
     }
@@ -2319,7 +2384,37 @@ impl<'a> ResolveDriver<'a> {
             for (dep_name, dep_version) in &locked_pkg.dependencies {
                 let prefix = format!("{dep_name}@");
                 let stripped = dep_version.strip_prefix(&prefix).unwrap_or(dep_version);
-                let canonical_version = stripped.split('(').next().unwrap_or(stripped).to_string();
+                let mut canonical_version =
+                    stripped.split('(').next().unwrap_or(stripped).to_string();
+                // A peer supplied by the importer or an ancestor through a
+                // `file:`/`link:`/git dep records that specifier as the
+                // snapshot edge. Re-resolving it here would be a transitive
+                // local source; the peer pass re-wires it instead. A name
+                // the package also declares as a dependency resolves from
+                // its declared range, and peers nothing else supplies keep
+                // resolving.
+                if locked_pkg.peer_dependencies.contains_key(dep_name)
+                    && is_non_registry_specifier(&canonical_version)
+                    && (task.ancestors.iter().any(|(name, _)| name == dep_name)
+                        || self
+                            .importer_declared_dep_names
+                            .get(&task.importer)
+                            .is_some_and(|names| names.contains(dep_name))
+                        || self.resolver.resolve_peers_from_workspace_root
+                            && self
+                                .importer_declared_dep_names
+                                .get(".")
+                                .is_some_and(|names| names.contains(dep_name)))
+                {
+                    let declared = locked_pkg
+                        .declared_dependencies_known()
+                        .then(|| locked_pkg.declared_dependencies.get(dep_name))
+                        .flatten();
+                    let Some(declared) = declared else {
+                        continue;
+                    };
+                    canonical_version = declared.clone();
+                }
                 let dep_type = if locked_pkg.optional_dependencies.contains_key(dep_name) {
                     DepType::Optional
                 } else {
@@ -2333,6 +2428,41 @@ impl<'a> ResolveDriver<'a> {
                     task.importer.clone(),
                     child_ancestors.clone(),
                 ));
+            }
+
+            // npm lockfiles record a hoisted peer as a plain package
+            // entry rather than an edge on the dependent, so the locked
+            // `dependencies` above never reach it. Without an edge the
+            // peer, and anything only it reaches, would vanish on the
+            // next write; queue required peers the same way a fresh
+            // resolve does.
+            if self.resolver.auto_install_peers {
+                for (dep_name, dep_range) in &locked_pkg.peer_dependencies {
+                    let peer_optional = locked_pkg
+                        .peer_dependencies_meta
+                        .get(dep_name)
+                        .is_some_and(|m| m.optional);
+                    if peer_optional
+                        || locked_pkg.dependencies.contains_key(dep_name)
+                        || locked_pkg.bundled_dependencies.contains(dep_name)
+                        || self.peer_supplied_by_scope(task, dep_name)
+                        || (self
+                            .resolver
+                            .dependency_policy
+                            .blocks_exotic_subdep(dep_name)
+                            && is_non_registry_specifier(dep_range))
+                    {
+                        continue;
+                    }
+                    self.queue.push_back(ResolveTask::transitive(
+                        dep_name.clone(),
+                        dep_range.clone(),
+                        DepType::Production,
+                        dep_path.clone(),
+                        task.importer.clone(),
+                        child_ancestors.clone(),
+                    ));
+                }
             }
         }
         self.lockfile_reuse_count += 1;
@@ -2489,7 +2619,6 @@ mod tests {
         [(
             "0.9.0".to_string(),
             aube_registry::VersionTrustMetadata {
-                approver: None,
                 npm_user: None,
                 dist: None,
             },

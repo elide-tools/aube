@@ -635,6 +635,164 @@ fn test_link_all_creates_pnpm_virtual_store() {
 }
 
 #[test]
+fn force_relink_restores_deleted_files_in_both_virtual_store_modes() {
+    for global in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let (store, indices) = setup_store_with_files(dir.path());
+        let graph = make_graph();
+        Linker::new_with_gvs(&store, LinkStrategy::Copy, global)
+            .link_all(&project_dir, &graph, &indices)
+            .unwrap();
+
+        let foo_index = project_dir.join("node_modules/foo/index.js");
+        std::fs::remove_file(&foo_index).unwrap();
+
+        Linker::new_with_gvs(&store, LinkStrategy::Copy, global)
+            .link_all(&project_dir, &graph, &indices)
+            .unwrap();
+        assert!(
+            !foo_index.exists(),
+            "a plain relink trusts the existing entry (global={global})"
+        );
+
+        let stats = Linker::new_with_gvs(&store, LinkStrategy::Copy, global)
+            .with_force(true)
+            .link_all(&project_dir, &graph, &indices)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&foo_index).unwrap(),
+            "module.exports = 'foo';",
+            "force restores the deleted file (global={global})"
+        );
+        assert_eq!(stats.packages_linked, 2, "global={global}");
+        assert!(
+            project_dir
+                .join("node_modules/.aube/foo@1.0.0/node_modules/bar")
+                .exists(),
+            "sibling dependency link survives the rebuild (global={global})"
+        );
+        let leftovers = std::fs::read_dir(store.virtual_store_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "no staging dirs left behind (global={global})"
+        );
+    }
+}
+
+#[test]
+fn gvs_link_replaces_a_real_directory_at_a_virtual_store_entry() {
+    // Copying a project in a way that follows links (Windows Explorer,
+    // `cp -rL`) leaves real directories where the `.aube/<dep_path>` links
+    // into the shared store belong. The next install must replace them
+    // instead of failing to create the link over a non-empty directory.
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let graph = make_graph();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let entry = project_dir.join("node_modules/.aube/foo@1.0.0");
+    std::fs::remove_dir(&entry)
+        .or_else(|_| std::fs::remove_file(&entry))
+        .unwrap();
+    std::fs::create_dir_all(entry.join("node_modules/foo")).unwrap();
+    std::fs::write(entry.join("node_modules/foo/index.js"), "stale copy").unwrap();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    assert!(entry.symlink_metadata().unwrap().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(entry.join("node_modules/foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+}
+
+#[test]
+fn gvs_workspace_link_replaces_a_real_directory_at_a_virtual_store_entry() {
+    // `link_workspace` clears stale entries on its own path; cover it too.
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("packages/app")).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "foo".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let workspace_dirs = BTreeMap::new();
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    linker
+        .link_workspace(&project_dir, &graph, &indices, &workspace_dirs)
+        .unwrap();
+
+    let entry = project_dir.join("node_modules/.aube/foo@1.0.0");
+    std::fs::remove_dir(&entry)
+        .or_else(|_| std::fs::remove_file(&entry))
+        .unwrap();
+    std::fs::create_dir_all(entry.join("node_modules/foo")).unwrap();
+    std::fs::write(entry.join("node_modules/foo/index.js"), "stale copy").unwrap();
+
+    linker
+        .link_workspace(&project_dir, &graph, &indices, &workspace_dirs)
+        .unwrap();
+
+    assert!(entry.symlink_metadata().unwrap().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(entry.join("node_modules/foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+}
+
+#[test]
+fn gvs_link_replacing_a_stale_entry_link_keeps_its_target() {
+    // Removing a stale `.aube/<dep_path>` link must drop only the link, never
+    // the directory it points at (which may be another shared-store entry).
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    let graph = make_graph();
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let decoy = dir.path().join("decoy");
+    std::fs::create_dir_all(decoy.join("node_modules/foo")).unwrap();
+    std::fs::write(decoy.join("node_modules/foo/keep.js"), "keep").unwrap();
+    let entry = project_dir.join("node_modules/.aube/foo@1.0.0");
+    std::fs::remove_dir(&entry)
+        .or_else(|_| std::fs::remove_file(&entry))
+        .unwrap();
+    crate::sys::create_dir_link(&decoy, &entry).unwrap();
+
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(decoy.join("node_modules/foo/keep.js")).unwrap(),
+        "keep",
+        "the stale link's target must survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(entry.join("node_modules/foo/index.js")).unwrap(),
+        "module.exports = 'foo';"
+    );
+}
+
+#[test]
 fn selected_package_materializes_locally_while_dependencies_keep_using_gvs() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
@@ -652,7 +810,10 @@ fn selected_package_materializes_locally_while_dependencies_keep_using_gvs() {
     );
 
     let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true)
-        .with_project_local_dep_paths(["foo@1.0.0".to_string()]);
+        .with_project_local_dep_paths(["foo@1.0.0".to_string()])
+        .with_precomputed_project_local_dep_paths(std::sync::Arc::new(
+            project_local_dependency_closure(&graph),
+        ));
     linker.link_all(&project_dir, &graph, &indices).unwrap();
 
     let aube_dir = project_dir.join("node_modules/.aube");
@@ -675,6 +836,129 @@ fn selected_package_materializes_locally_while_dependencies_keep_using_gvs() {
     let second = linker.link_all(&project_dir, &graph, &indices).unwrap();
     assert_eq!(second.packages_linked, 0);
     assert_eq!(second.packages_cached, 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn dedupe_reports_a_member_link_it_cannot_remove() {
+    // A member entry the linker dedupes must go, or it shadows the root's
+    // link while install state only tracks the root's. A file held open
+    // without delete sharing keeps it from being removed.
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let stale = project_dir.join("packages/app/node_modules/foo");
+    std::fs::create_dir_all(&stale).unwrap();
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "foo".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(0)
+        .open(stale.join("index.js"))
+        .unwrap();
+
+    let result = Linker::new(&store, LinkStrategy::Copy)
+        .with_dedupe_direct_deps(true)
+        .link_workspace(&project_dir, &graph, &indices, &BTreeMap::new());
+
+    assert!(stale.exists(), "the held entry should have survived");
+    assert!(result.is_err(), "surviving stale link must fail the link");
+}
+
+#[test]
+fn link_all_links_dependencies_of_physical_file_link_importers() {
+    for node_linker in [NodeLinker::Isolated, NodeLinker::Hoisted] {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+        let (store, indices) = setup_store_with_files(dir.path());
+        let mut graph = make_graph();
+        graph.importers.insert(".".to_string(), Vec::new());
+        graph.importers.insert(
+            "vendor/host".to_string(),
+            vec![DirectDep {
+                name: "bar".to_string(),
+                dep_path: "bar@2.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: None,
+            }],
+        );
+        Linker::new(&store, LinkStrategy::Copy)
+            .with_node_linker(node_linker)
+            .link_all(&project_dir, &graph, &indices)
+            .unwrap();
+
+        // Hoisted may place the dependency at the root, which the linked
+        // directory still resolves through its parent `node_modules`.
+        assert!(
+            ["vendor/host/node_modules/bar", "node_modules/bar"]
+                .iter()
+                .any(|path| project_dir.join(path).join("index.js").exists()),
+            "{node_linker:?}: the linked directory must reach its own dependency"
+        );
+    }
+}
+
+#[test]
+fn link_all_sweeps_stale_tmp_dirs_when_delegating_to_the_workspace_linker() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+    let stale = project_dir.join("node_modules/.aube/.tmp-1-0");
+    std::fs::create_dir_all(&stale).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph
+        .importers
+        .insert("vendor/host".to_string(), Vec::new());
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+
+    assert!(!stale.exists());
+}
+
+#[test]
+fn virtual_store_only_sweeps_visible_links_of_physical_file_link_importers() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "vendor/host".to_string(),
+        vec![DirectDep {
+            name: "bar".to_string(),
+            dep_path: "bar@2.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let host_bar = project_dir.join("vendor/host/node_modules/bar");
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+    assert!(host_bar.join("index.js").exists());
+
+    Linker::new(&store, LinkStrategy::Copy)
+        .with_virtual_store_only(true)
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+    assert!(!host_bar.exists());
 }
 
 #[test]
@@ -1134,6 +1418,9 @@ fn test_hidden_hoist_reconciles_on_relink() {
 
     let (store, mut indices) = setup_store_with_files(dir.path());
     let mut graph = make_graph();
+    // Root direct deps never enter the hidden hoist, so drop the importer
+    // to keep `foo` eligible.
+    graph.importers.clear();
     // A scoped package exercises the `@scope/` directories created ahead
     // of the parallel pass; `Bar` collides with `bar` by case and takes
     // the serial pass.
@@ -1217,7 +1504,6 @@ fn test_hidden_hoist_reconciles_on_relink() {
     new_foo.version = "2.0.0".to_string();
     new_foo.dep_path = "foo@2.0.0".to_string();
     graph.packages.insert(new_foo.dep_path.clone(), new_foo);
-    graph.importers.get_mut(".").unwrap()[0].dep_path = "foo@2.0.0".to_string();
 
     linker.link_all(&project_dir, &graph, &indices).unwrap();
     assert!(hidden.join(&old_foo_target).exists());
@@ -1248,7 +1534,10 @@ fn hidden_hoist_drops_link_when_package_source_is_missing() {
     std::fs::create_dir_all(&project_dir).unwrap();
     let (store, indices) = setup_store_with_files(dir.path());
     let linker = Linker::new(&store, LinkStrategy::Copy);
-    let graph = make_graph();
+    let mut graph = make_graph();
+    // Root direct deps never enter the hidden hoist, so drop the importer
+    // to keep `foo` eligible.
+    graph.importers.clear();
     linker.link_all(&project_dir, &graph, &indices).unwrap();
 
     let aube_dir = project_dir.join("node_modules/.aube");
@@ -2106,5 +2395,579 @@ fn test_recorded_gvs_dep_link_targets_match_disk() {
         assert_eq!(&std::fs::read_link(link).unwrap(), target);
         assert!(recorded["bar@2.0.0"].is_empty());
         std::fs::remove_dir_all(project_dir.join("node_modules")).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_relative_root_links_a_member_behind_a_symlink_from_where_it_really_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("ws");
+    std::fs::create_dir_all(project_dir.join("packages")).unwrap();
+    std::fs::create_dir_all(dir.path().join("outside/app")).unwrap();
+    std::os::unix::fs::symlink("../../outside/app", project_dir.join("packages/app")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "foo".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let cwd = std::env::current_dir().unwrap();
+    let relative_root = pathdiff::diff_paths(&project_dir, &cwd).unwrap();
+    assert!(relative_root.is_relative());
+
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_workspace(&relative_root, &graph, &indices, &BTreeMap::new())
+        .unwrap();
+
+    assert!(
+        dir.path()
+            .join("outside/app/node_modules/foo/index.js")
+            .exists()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_verbatim_root_links_a_member_behind_a_junction_from_where_it_really_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("ws");
+    std::fs::create_dir_all(project_dir.join("packages")).unwrap();
+    std::fs::create_dir_all(dir.path().join("outside/app")).unwrap();
+    junction::create(
+        dir.path().join("outside/app"),
+        project_dir.join("packages/app"),
+    )
+    .unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "foo".to_string(),
+            dep_path: "foo@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    // `std::fs::canonicalize` returns a `\?\` path, the same form as
+    // the member's real location.
+    let verbatim_root = std::fs::canonicalize(&project_dir).unwrap();
+
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_workspace(&verbatim_root, &graph, &indices, &BTreeMap::new())
+        .unwrap();
+
+    assert!(
+        dir.path()
+            .join("outside/app/node_modules/foo/index.js")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_workspace_dirs_link_a_member_behind_a_symlink_to_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("ws");
+    std::fs::create_dir_all(project_dir.join("packages/sib")).unwrap();
+    std::fs::write(project_dir.join("packages/sib/package.json"), b"{}").unwrap();
+    std::fs::create_dir_all(dir.path().join("outside/app")).unwrap();
+    std::os::unix::fs::symlink("../../outside/app", project_dir.join("packages/app")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![DirectDep {
+            name: "sib".to_string(),
+            dep_path: "sib@link:../sib".to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let cwd = std::env::current_dir().unwrap();
+    let relative_root = pathdiff::diff_paths(&project_dir, &cwd).unwrap();
+    let workspace_dirs = BTreeMap::from([("sib".to_string(), relative_root.join("packages/sib"))]);
+
+    Linker::new(&store, LinkStrategy::Copy)
+        .link_workspace(&relative_root, &graph, &indices, &workspace_dirs)
+        .unwrap();
+
+    assert!(
+        dir.path()
+            .join("outside/app/node_modules/sib/package.json")
+            .exists()
+    );
+}
+
+/// The discussion #1811 graph: `is-odd@3.0.1 -> is-number@6.0.0` sits
+/// at depth 1, `is-even@1.0.0 -> is-odd@0.1.2 -> is-number@3.0.0` at
+/// depth 2, and the root declares `is-even` and `is-odd@3.0.1`.
+/// `full_path_edges` stores dependency values as full dep paths, the way
+/// the Yarn Berry, npm and bun readers do, instead of pnpm's version tails.
+fn two_version_hidden_hoist_fixture(
+    store: &Store,
+    full_path_edges: bool,
+) -> (LockfileGraph, BTreeMap<String, aube_store::PackageIndex>) {
+    let mut graph = LockfileGraph::default();
+    let mut indices = BTreeMap::new();
+    for (dep_path, deps) in [
+        ("is-even@1.0.0", &[("is-odd", "0.1.2")][..]),
+        ("is-odd@0.1.2", &[("is-number", "3.0.0")]),
+        ("is-odd@3.0.1", &[("is-number", "6.0.0")]),
+        ("is-number@3.0.0", &[]),
+        ("is-number@6.0.0", &[]),
+    ] {
+        let (name, version) = dep_path.rsplit_once('@').unwrap();
+        let stored = store
+            .import_bytes(format!("module.exports = '{dep_path}';").as_bytes(), false)
+            .unwrap();
+        let mut index = PackageIndex::default();
+        index.insert("index.js".to_string(), stored);
+        indices.insert(dep_path.to_string(), index);
+        graph.packages.insert(
+            dep_path.to_string(),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: dep_path.to_string(),
+                dependencies: deps
+                    .iter()
+                    .map(|(n, v)| {
+                        let value = if full_path_edges {
+                            format!("{n}@{v}")
+                        } else {
+                            v.to_string()
+                        };
+                        (n.to_string(), value)
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let root = ["is-even@1.0.0", "is-odd@3.0.1"]
+        .into_iter()
+        .map(|dep_path| DirectDep {
+            name: dep_path.rsplit_once('@').unwrap().0.to_string(),
+            dep_path: dep_path.to_string(),
+            dep_type: DepType::Production,
+            specifier: None,
+        })
+        .collect();
+    graph.importers.insert(".".to_string(), root);
+    (graph, indices)
+}
+
+#[test]
+fn hidden_hoist_prefers_shallowest_version_and_skips_root_deps() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    let (graph, indices) = two_version_hidden_hoist_fixture(&store, false);
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("is-number/index.js")).unwrap(),
+        "module.exports = 'is-number@6.0.0';",
+        "the depth-1 version must win over the depth-2 one"
+    );
+    for name in ["is-odd", "is-even"] {
+        assert!(
+            std::fs::symlink_metadata(hidden.join(name)).is_err(),
+            "root direct dep {name} must not be hidden-hoisted"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(project_dir.join("node_modules/is-odd/index.js")).unwrap(),
+        "module.exports = 'is-odd@3.0.1';"
+    );
+}
+
+#[test]
+fn gvs_hidden_hoist_mirror_prefers_root_dep_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    let (graph, indices) = two_version_hidden_hoist_fixture(&store, false);
+    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, true);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    // The shared mirror sits outside the project, where a store
+    // package's parent walk never reaches the root `node_modules/`, so
+    // the root's own versions (depth 0) take the names there.
+    let mirror = store.virtual_store_dir().join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(mirror.join("is-odd/index.js")).unwrap(),
+        "module.exports = 'is-odd@3.0.1';"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mirror.join("is-number/index.js")).unwrap(),
+        "module.exports = 'is-number@6.0.0';"
+    );
+}
+
+#[test]
+fn hidden_hoist_depths_follow_full_dep_path_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    let (graph, indices) = two_version_hidden_hoist_fixture(&store, true);
+    let linker = Linker::new(&store, LinkStrategy::Copy);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("is-number/index.js")).unwrap(),
+        "module.exports = 'is-number@6.0.0';"
+    );
+}
+
+#[test]
+fn hidden_hoist_keeps_root_deps_for_virtual_store_outside_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    let (graph, indices) = two_version_hidden_hoist_fixture(&store, false);
+    let external = dir.path().join("external-store");
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_aube_dir_override(external.clone());
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    // Packages under the external store never walk up to the project's
+    // root `node_modules/`, so the root's own versions take the names.
+    let hidden = external.join("node_modules");
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("is-odd/index.js")).unwrap(),
+        "module.exports = 'is-odd@3.0.1';"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("is-number/index.js")).unwrap(),
+        "module.exports = 'is-number@6.0.0';"
+    );
+}
+
+#[test]
+fn hidden_hoist_keeps_root_deps_when_root_links_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    let (graph, indices) = two_version_hidden_hoist_fixture(&store, false);
+    let linker = Linker::new(&store, LinkStrategy::Copy).with_virtual_store_only(true);
+    linker.link_all(&project_dir, &graph, &indices).unwrap();
+
+    // `virtualStoreOnly` creates no root links, so the hidden tree is
+    // the only place an undeclared root-dep import can resolve.
+    assert!(std::fs::symlink_metadata(project_dir.join("node_modules/is-odd")).is_err());
+    let hidden = project_dir.join("node_modules/.aube/node_modules");
+    assert_eq!(
+        std::fs::read_to_string(hidden.join("is-odd/index.js")).unwrap(),
+        "module.exports = 'is-odd@3.0.1';"
+    );
+}
+
+#[test]
+fn virtual_store_only_keeps_a_virtual_store_dir_inside_a_physical_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(project_dir.join("vendor/host")).unwrap();
+
+    let (store, indices) = setup_store_with_files(dir.path());
+    let mut graph = make_graph();
+    graph
+        .importers
+        .insert("vendor/host".to_string(), Vec::new());
+    let virtual_store = project_dir.join("vendor/host/node_modules/store");
+    Linker::new(&store, LinkStrategy::Copy)
+        .with_virtual_store_only(true)
+        .with_aube_dir_override(virtual_store.clone())
+        .link_all(&project_dir, &graph, &indices)
+        .unwrap();
+
+    assert!(virtual_store.join("foo@1.0.0").exists());
+}
+
+#[test]
+fn project_local_closure_selects_chain_and_diamond_ancestors_only() {
+    let mut graph = project_local_chain(2_048);
+    for (name, dependencies) in [
+        ("diamond", vec!["left", "right"]),
+        ("left", vec!["p000000"]),
+        ("right", vec!["p000000"]),
+        ("cycle-a", vec!["cycle-b"]),
+        ("cycle-b", vec!["cycle-a", "diamond"]),
+        ("unrelated-a", vec!["unrelated-b"]),
+        ("unrelated-b", vec!["unrelated-a"]),
+    ] {
+        let key = format!("{name}@1.0.0");
+        graph.packages.insert(
+            key.clone(),
+            LockedPackage {
+                name: name.into(),
+                version: "1.0.0".into(),
+                dep_path: key,
+                dependencies: dependencies
+                    .into_iter()
+                    .map(|name| (name.into(), "1.0.0".into()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    // A selected package's other children must remain shareable.
+    graph
+        .packages
+        .get_mut("diamond@1.0.0")
+        .unwrap()
+        .dependencies
+        .insert("unrelated-a".into(), "1.0.0".into());
+    let source = aube_lockfile::LocalSource::Directory("deps/local".into());
+    let mut expected: std::collections::BTreeSet<_> =
+        (0..2_048).map(|i| format!("p{i:06}@1.0.0")).collect();
+    expected.insert(source.dep_path("zlocal"));
+    expected.extend(
+        ["cycle-a", "cycle-b", "diamond", "left", "right"].map(|name| format!("{name}@1.0.0")),
+    );
+    assert_eq!(project_local_dependency_closure(&graph), expected);
+    expected.extend(["unrelated-a@1.0.0".into(), "unrelated-b@1.0.0".into()]);
+    assert_eq!(
+        project_local_dependency_closure_with_seeds(&graph, ["unrelated-a@1.0.0".into()]),
+        expected,
+    );
+}
+
+#[test]
+fn project_local_closure_handles_a_hundred_thousand_parent_first_packages() {
+    let graph = project_local_chain(100_000);
+    let expected: std::collections::BTreeSet<_> = graph.packages.keys().cloned().collect();
+    assert_eq!(project_local_dependency_closure(&graph), expected);
+}
+
+fn project_local_chain(length: usize) -> LockfileGraph {
+    let source = aube_lockfile::LocalSource::Directory("deps/local".into());
+    let key = source.dep_path("zlocal");
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        key.clone(),
+        LockedPackage {
+            name: "zlocal".into(),
+            version: "1.0.0".into(),
+            dep_path: key,
+            local_source: Some(source),
+            ..Default::default()
+        },
+    );
+    for i in 0..length {
+        let name = format!("p{i:06}");
+        let key = format!("{name}@1.0.0");
+        let child = if i + 1 == length {
+            ("zlocal".into(), "file:deps/./local".into())
+        } else {
+            (format!("p{:06}", i + 1), "1.0.0".into())
+        };
+        graph.packages.insert(
+            key.clone(),
+            LockedPackage {
+                name,
+                version: "1.0.0".into(),
+                dep_path: key,
+                dependencies: BTreeMap::from([child]),
+                ..Default::default()
+            },
+        );
+    }
+    graph
+}
+
+#[test]
+fn local_peer_dependents_stay_in_each_project() {
+    use aube_lockfile::LocalSource;
+
+    for gvs in [false, true] {
+        for workspace in [false, true] {
+            for source in [
+                LocalSource::Directory("app/deps/react".into()),
+                LocalSource::Tarball("app/deps/react.tgz".into()),
+                LocalSource::Link("app/deps/react".into()),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (store, mut indices) = setup_store_with_files(dir.path());
+                let peer_key = source.dep_path("react");
+                let peer_edge = match &source {
+                    LocalSource::Directory(_) => "file:app/deps/./react".to_string(),
+                    LocalSource::Tarball(_) => "file:app/deps/react.tgz(bar@2.0.0)".to_string(),
+                    _ => peer_key[6..].to_string(),
+                };
+                let consumer_key = format!("consumer@1.0.0(react@{peer_edge})");
+                let graph = LockfileGraph {
+                    importers: BTreeMap::from([
+                        (
+                            ".".into(),
+                            if workspace {
+                                vec![]
+                            } else {
+                                vec![DirectDep {
+                                    name: "foo".into(),
+                                    dep_path: "foo@1.0.0".into(),
+                                    dep_type: DepType::Production,
+                                    specifier: None,
+                                }]
+                            },
+                        ),
+                        (
+                            "app".into(),
+                            vec![DirectDep {
+                                name: "consumer".into(),
+                                dep_path: consumer_key.clone(),
+                                dep_type: DepType::Production,
+                                specifier: None,
+                            }],
+                        ),
+                    ]),
+                    packages: BTreeMap::from([
+                        (
+                            "foo@1.0.0".into(),
+                            LockedPackage {
+                                name: "foo".into(),
+                                version: "1.0.0".into(),
+                                dep_path: "foo@1.0.0".into(),
+                                dependencies: BTreeMap::from([(
+                                    "consumer".into(),
+                                    consumer_key[9..].into(),
+                                )]),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            consumer_key.clone(),
+                            LockedPackage {
+                                name: "consumer".into(),
+                                version: "1.0.0".into(),
+                                dep_path: consumer_key.clone(),
+                                dependencies: BTreeMap::from([("react".into(), peer_edge.clone())]),
+                                peer_dependencies: BTreeMap::from([("react".into(), "*".into())]),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            peer_key.clone(),
+                            LockedPackage {
+                                name: "react".into(),
+                                version: "1.0.0".into(),
+                                dep_path: peer_key.clone(),
+                                local_source: Some(source.clone()),
+                                dependencies: BTreeMap::from([("bar".into(), "2.0.0".into())]),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "bar@2.0.0".into(),
+                            LockedPackage {
+                                name: "bar".into(),
+                                version: "2.0.0".into(),
+                                dep_path: "bar@2.0.0".into(),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
+                    ..Default::default()
+                };
+                indices.insert(consumer_key.clone(), indices["foo@1.0.0"].clone());
+                let hashes =
+                    aube_lockfile::graph_hash::compute_graph_hashes(&graph, &|_| false, None);
+                let mut installed_peers = Vec::new();
+                for generation in ["first", "second"] {
+                    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, gvs)
+                        .with_hoist(false)
+                        .with_graph_hashes(hashes.clone());
+                    let linker = if generation == "second" {
+                        linker.with_precomputed_project_local_dep_paths(std::sync::Arc::new(
+                            project_local_dependency_closure(&graph),
+                        ))
+                    } else {
+                        linker
+                    };
+                    let project = dir.path().join(generation);
+                    let peer_source = project.join("app/deps/react");
+                    std::fs::create_dir_all(&peer_source).unwrap();
+                    std::fs::write(peer_source.join("index.js"), generation).unwrap();
+                    let mut peer_index = PackageIndex::default();
+                    peer_index.insert(
+                        "index.js".into(),
+                        store.import_bytes(generation.as_bytes(), false).unwrap(),
+                    );
+                    indices.insert(peer_key.clone(), peer_index);
+                    for _ in 0..2 {
+                        if workspace {
+                            linker
+                                .link_workspace(&project, &graph, &indices, &BTreeMap::new())
+                                .unwrap();
+                        } else {
+                            linker.link_all(&project, &graph, &indices).unwrap();
+                        }
+                    }
+                    let aube_dir = project.join("node_modules/.aube");
+                    let consumer_entry = aube_dir.join(linker.aube_dir_entry_name(&consumer_key));
+                    let peer_link = consumer_entry.join("node_modules/react");
+                    assert_eq!(
+                        std::fs::read_to_string(peer_link.join("index.js")).unwrap(),
+                        generation
+                    );
+                    assert!(
+                        !std::fs::symlink_metadata(&consumer_entry)
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    );
+                    assert!(
+                        !std::fs::symlink_metadata(aube_dir.join("foo@1.0.0"))
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    );
+                    if !matches!(source, LocalSource::Link(_)) {
+                        assert!(
+                            aube_dir
+                                .join(linker.aube_dir_entry_name(&peer_key))
+                                .join("node_modules/bar/index.js")
+                                .exists()
+                        );
+                    }
+                    if gvs {
+                        assert!(
+                            std::fs::symlink_metadata(aube_dir.join("bar@2.0.0"))
+                                .unwrap()
+                                .file_type()
+                                .is_symlink()
+                        );
+                        assert!(
+                            !store
+                                .virtual_store_dir()
+                                .join(linker.virtual_store_subdir(&consumer_key))
+                                .exists()
+                        );
+                    }
+                    installed_peers.push(peer_link);
+                }
+                assert_eq!(
+                    std::fs::read_to_string(installed_peers[0].join("index.js")).unwrap(),
+                    "first"
+                );
+            }
+        }
     }
 }

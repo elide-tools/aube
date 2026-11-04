@@ -675,6 +675,13 @@ fn default_launch_for_target(target: &Path, content: &[u8], allow_direct: bool) 
         Some("sh") => BinLaunch::Interpreter("sh".to_string()),
         Some(ext) if allow_direct && ext.eq_ignore_ascii_case("exe") => BinLaunch::Direct,
         _ if allow_direct && has_native_executable_magic(content) => BinLaunch::Direct,
+        // Only a hashbang may start JavaScript with `#`, so a file that
+        // opens with a `#` comment but no `#!` is a shebang-less shell
+        // script (pnpm 12's placeholder bin), which the kernel would
+        // hand to `sh` after ENOEXEC.
+        None if content.starts_with(b"#") && !content.starts_with(b"#!") => {
+            BinLaunch::Interpreter("sh".to_string())
+        }
         _ => BinLaunch::Interpreter("node".to_string()),
     }
 }
@@ -1195,18 +1202,7 @@ pub fn resolve_bin_shim_with_node(path: &Path) -> io::Result<Option<ResolvedBinS
             )
         })
     };
-    let binding = content
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("@REM ")
-                .unwrap_or(line)
-                .strip_prefix(NODE_SHIM_MARKER)
-        })
-        .map(|value| {
-            let bytes = hex::decode(value.trim()).map_err(io::Error::other)?;
-            serde_json::from_slice::<NodeShimBinding>(&bytes).map_err(io::Error::other)
-        })
-        .transpose()?;
+    let binding = node_shim_binding(content)?;
     let parsed = parsed.or_else(|| {
         binding.as_ref().map(|binding| {
             (
@@ -1243,6 +1239,126 @@ pub fn resolve_bin_shim_with_node(path: &Path) -> io::Result<Option<ResolvedBinS
         node,
         node_args,
     }))
+}
+
+fn node_shim_binding(content: &str) -> io::Result<Option<NodeShimBinding>> {
+    content
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("@REM ")
+                .unwrap_or(line)
+                .strip_prefix(NODE_SHIM_MARKER)
+        })
+        .map(|value| {
+            let bytes = hex::decode(value.trim()).map_err(io::Error::other)?;
+            serde_json::from_slice::<NodeShimBinding>(&bytes).map_err(io::Error::other)
+        })
+        .transpose()
+}
+
+/// The forward-slash target of a generated direct-launch `.cmd` wrapper
+/// (`@SETLOCAL`, an optional `NODE_PATH`, then one invocation line), or
+/// `None` for anything else.
+fn direct_cmd_shim_target(path: &Path) -> io::Result<Option<String>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BIN_SHIM_BYTES {
+        return Ok(None);
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    Ok(parse_direct_cmd_shim_target(&content).map(|target| target.replace('\\', "/")))
+}
+
+fn parse_direct_cmd_shim_target(content: &str) -> Option<&str> {
+    let mut lines = content.lines().map(|line| line.trim_end_matches('\r'));
+    if lines.next()? != "@SETLOCAL" {
+        return None;
+    }
+    let mut line = lines.next()?;
+    if line.starts_with("@SET NODE_PATH=") {
+        line = lines.next()?;
+    }
+    let target = line.strip_prefix("@\"%~dp0\\")?.strip_suffix("\" %*")?;
+    (!target.is_empty() && !target.contains('"') && lines.next().is_none()).then_some(target)
+}
+
+/// Whether `path` is a launcher `create_bin_shim` wrote for a Windows
+/// command: the `<name>.cmd` wrapper, or the extensionless / `<name>.ps1`
+/// sibling of one. The `.cmd` wrapper is the only member that is always
+/// decodable, so it vouches for the family; a sibling additionally has to
+/// mention the same relative target, which a replaced file will not. A
+/// direct-launch (native target) wrapper carries no marker, so its target
+/// must additionally resolve under one of `roots`.
+pub fn is_generated_windows_launcher(path: &Path, roots: &[&Path]) -> io::Result<bool> {
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(false);
+    };
+    let stem = file_name
+        .strip_suffix(".cmd")
+        .or_else(|| file_name.strip_suffix(".ps1"))
+        .unwrap_or(file_name);
+    let cmd_path = dir.join(format!("{stem}.cmd"));
+    let rel = match resolve_bin_shim(&cmd_path) {
+        Ok(Some(shim)) => relative_bin_target(dir, &shim.target),
+        // Native targets get a direct-launch wrapper that `resolve_bin_shim`
+        // deliberately does not decode.
+        Ok(None) => match direct_cmd_shim_target(&cmd_path)? {
+            // That format has no aube-specific marker, so a foreign wrapper
+            // written in the same shape would pass. Only claim it when its
+            // target sits under one of the caller's install roots.
+            Some(rel)
+                if resolve_shim_relative_path(dir, &rel, BinShimStyle::Posix)
+                    .is_some_and(|target| roots.iter().any(|root| target.starts_with(root))) =>
+            {
+                rel
+            }
+            _ => return Ok(false),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if file_name.ends_with(".cmd") {
+        return Ok(true);
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BIN_SHIM_BYTES {
+        return Ok(false);
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    Ok(if file_name.ends_with(".ps1") {
+        sibling_launcher_matches(&content, "#!/usr/bin/env pwsh", ("& ", " $args"), &rel)
+    } else {
+        sibling_launcher_matches(&content, "#!/bin/sh", ("exec ", " \"$@\""), &rel)
+    })
+}
+
+/// Structural match of a generated `.ps1` / extensionless launcher against
+/// the relative target its `.cmd` wrapper records. A bound-Node launcher
+/// names its target in metadata that is compared as data; an ordinary one
+/// must carry the generated shebang and an invocation line that ends in the
+/// quoted target. Merely mentioning the path does not qualify.
+fn sibling_launcher_matches(
+    content: &str,
+    shebang: &str,
+    (call_prefix, call_suffix): (&str, &str),
+    rel: &str,
+) -> bool {
+    if content.lines().next().map(|l| l.trim_end_matches('\r')) != Some(shebang) {
+        return false;
+    }
+    if let Ok(Some(binding)) = node_shim_binding(content) {
+        return binding.target == rel;
+    }
+    let quoted = format!("\"$basedir/{rel}\"{call_suffix}");
+    content.lines().any(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("$input | ").unwrap_or(line);
+        line.starts_with(call_prefix) && line.ends_with(&quoted)
+    })
 }
 
 fn parse_cmd_shim_target(content: &str) -> Option<&str> {
@@ -1825,6 +1941,28 @@ process.exit(17);
     }
 
     #[test]
+    fn detect_launch_runs_shebangless_hash_comment_script_with_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("pnpm");
+        std::fs::write(&target, b"# placeholder\nexec node \"$0.mjs\" \"$@\"\n").unwrap();
+        assert_eq!(
+            detect_bin_launch(&target),
+            BinLaunch::Interpreter("sh".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_launch_keeps_hash_comment_file_with_unknown_extension_on_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cli.custom");
+        std::fs::write(&target, b"# comment\n").unwrap();
+        assert_eq!(
+            detect_bin_launch(&target),
+            BinLaunch::Interpreter("node".to_string())
+        );
+    }
+
+    #[test]
     fn detect_launch_keeps_unknown_text_extension_on_node() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("cli.custom");
@@ -1904,6 +2042,134 @@ process.exit(17);
         create_dir_link(&rel, &link).unwrap();
 
         assert_eq!(std::fs::read(link.join("marker.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn direct_cmd_shim_parser_accepts_only_the_generated_shape() {
+        assert_eq!(
+            parse_direct_cmd_shim_target("@SETLOCAL\r\n@\"%~dp0\\..\\pkg\\tool.exe\" %*\r\n"),
+            Some("..\\pkg\\tool.exe")
+        );
+        assert_eq!(
+            parse_direct_cmd_shim_target(
+                "@SETLOCAL\r\n@SET NODE_PATH=%~dp0\\..\r\n@\"%~dp0\\t.exe\" %*\r\n"
+            ),
+            Some("t.exe")
+        );
+        assert_eq!(
+            parse_direct_cmd_shim_target("@SETLOCAL\r\n@\"%~dp0\\t.exe\" %*\r\necho extra\r\n"),
+            None
+        );
+        assert_eq!(parse_direct_cmd_shim_target("echo hi\r\n"), None);
+    }
+
+    #[test]
+    fn direct_windows_launcher_needs_a_target_under_an_install_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let write_family = |name: &str, rel: &str| {
+            let back = rel.replace('/', "\\");
+            std::fs::write(
+                bin_dir.join(format!("{name}.cmd")),
+                format!("@SETLOCAL\r\n@\"%~dp0\\{back}\" %*\r\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                bin_dir.join(format!("{name}.ps1")),
+                format!("#!/usr/bin/env pwsh\n  & \"$basedir/{rel}\" $args\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                bin_dir.join(name),
+                format!("#!/bin/sh\nexec \"$basedir/{rel}\" \"$@\"\n"),
+            )
+            .unwrap();
+        };
+        write_family("ours", "../.aube/p@1.0.0/node_modules/p/t.exe");
+        write_family("foreign", "../../tools/t.exe");
+        let roots = normalize_path(&dir.path().join("node_modules/.aube"));
+
+        for file in ["ours", "ours.cmd", "ours.ps1"] {
+            assert!(is_generated_windows_launcher(&bin_dir.join(file), &[&roots]).unwrap());
+        }
+        for file in ["foreign", "foreign.cmd", "foreign.ps1"] {
+            assert!(!is_generated_windows_launcher(&bin_dir.join(file), &[&roots]).unwrap());
+        }
+    }
+
+    #[test]
+    fn sibling_launcher_matches_requires_the_generated_shape() {
+        let rel = "../.aube/it's@1.0.0/node_modules/it's/cli.js";
+        let ps1 = format!(
+            "#!/usr/bin/env pwsh\n$ret=0\nif ($MyInvocation.ExpectingInput) {{\n  $input | & \"$basedir/node$exe\" \"$basedir/{rel}\" $args\n}} else {{\n  & \"$basedir/node$exe\" \"$basedir/{rel}\" $args\n}}\n"
+        );
+        let shebang = "#!/usr/bin/env pwsh";
+        let call = ("& ", " $args");
+        assert!(sibling_launcher_matches(&ps1, shebang, call, rel));
+        assert!(!sibling_launcher_matches(
+            &ps1,
+            shebang,
+            call,
+            "../other.js"
+        ));
+
+        // Mentioning the path in a comment or variable is not enough.
+        let replaced =
+            format!("#!/usr/bin/env pwsh\n# was \"$basedir/{rel}\" $args\n$old = '{rel}'\n");
+        assert!(!sibling_launcher_matches(&replaced, shebang, call, rel));
+        let no_shebang = ps1.replacen("#!/usr/bin/env pwsh\n", "", 1);
+        assert!(!sibling_launcher_matches(&no_shebang, shebang, call, rel));
+
+        // Bound-Node launchers carry the target as metadata, so quoting in
+        // the script body (a doubled apostrophe) is irrelevant.
+        let binding = NodeShimBinding {
+            target: rel.to_string(),
+            node: PathBuf::from("/usr/bin/node"),
+            args: Vec::new(),
+        };
+        let metadata = hex::encode(serde_json::to_vec(&binding).unwrap());
+        let bound = format!(
+            "#!/usr/bin/env pwsh\n{NODE_SHIM_MARKER}{metadata}\n$target=Join-Path $basedir 'it''s'\n"
+        );
+        assert!(sibling_launcher_matches(&bound, shebang, call, rel));
+        assert!(!sibling_launcher_matches(
+            &bound,
+            shebang,
+            call,
+            "../other.js"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_windows_launcher_recognizes_family_but_not_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules/.bin");
+        let pkg_dir = dir
+            .path()
+            .join("node_modules/.aube/tool@1.0.0/node_modules/tool");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let script = pkg_dir.join("cli.js");
+        std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+        create_bin_shim(&bin_dir, "tool", &script, BinShimOptions::default()).unwrap();
+        let roots = normalize_path(&dir.path().join("node_modules"));
+
+        for file in ["tool", "tool.cmd", "tool.ps1"] {
+            assert!(is_generated_windows_launcher(&bin_dir.join(file), &[&roots]).unwrap());
+        }
+
+        let native = pkg_dir.join("native.exe");
+        std::fs::write(&native, b"MZ").unwrap();
+        create_bin_shim(&bin_dir, "native", &native, BinShimOptions::default()).unwrap();
+        for file in ["native", "native.cmd", "native.ps1"] {
+            assert!(is_generated_windows_launcher(&bin_dir.join(file), &[&roots]).unwrap());
+        }
+
+        std::fs::write(bin_dir.join("tool.ps1"), "Write-Host 'mine'\n").unwrap();
+        assert!(!is_generated_windows_launcher(&bin_dir.join("tool.ps1"), &[&roots]).unwrap());
+        std::fs::write(bin_dir.join("other.ps1"), "Write-Host 'mine'\n").unwrap();
+        assert!(!is_generated_windows_launcher(&bin_dir.join("other.ps1"), &[&roots]).unwrap());
     }
 
     #[cfg(windows)]

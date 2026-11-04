@@ -40,6 +40,14 @@ pub(super) struct RawNpmPackage {
     #[serde(default)]
     pub(super) link: bool,
     #[serde(default)]
+    pub(super) peer: bool,
+    #[serde(default)]
+    pub(super) optional: bool,
+    #[serde(default)]
+    pub(super) in_bundle: bool,
+    #[serde(default, alias = "bundledDependencies")]
+    pub(super) bundle_dependencies: Vec<String>,
+    #[serde(default)]
     pub(super) dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub(super) dev_dependencies: BTreeMap<String, String>,
@@ -84,7 +92,25 @@ pub(super) struct RawNpmPackage {
     pub(super) license: Option<RawNpmLicense>,
     #[serde(default)]
     pub(super) funding: Option<RawNpmFunding>,
+    #[serde(default)]
+    pub(super) has_install_script: bool,
+    #[serde(default)]
+    pub(super) deprecated: Option<String>,
 }
+
+pub const BUNDLED_OPTIONAL_KEY: &str = "__aube_npm_bundled_optional";
+
+pub(super) const BUNDLED_ENTRIES_KEY: &str = "__aube_npm_bundled_entries";
+
+pub(super) const RETAINED_ENTRIES_KEY: &str = "__aube_npm_retained_entries";
+
+pub(super) const ENTRY_METADATA_KEY: &str = "__aube_npm_entry_metadata";
+
+pub(super) const WORKSPACES_KEY: &str = "__aube_npm_workspaces";
+
+/// `LockedPackage::extra_meta` key carrying npm's `hasInstallScript: true`
+/// so a parse/write cycle keeps it.
+pub(super) const HAS_INSTALL_SCRIPT_KEY: &str = "hasInstallScript";
 
 /// npm's `license:` field on a package entry. Modern npm writes the
 /// SPDX expression as a bare string, but older packages (e.g. `tv4`)
@@ -182,13 +208,13 @@ impl<'de> Deserialize<'de> for RawNpmLicense {
 /// 2. object: `"funding": {"url": "…", "type": "github"}`
 /// 3. mixed array: `"funding": ["https://…", {"url": "…"}]`
 ///
-/// Aube only carries a single `funding_url: Option<String>` on
-/// `LockedPackage`, so on read we collapse to the first URL we find;
-/// on write we always emit the single-key `{"url": …}` form (which
-/// npm itself accepts on a re-read).
-#[derive(Debug, Clone, Default)]
+/// `url` is the first URL found, which is what `LockedPackage::funding_url`
+/// models. `raw` keeps the value verbatim so the npm writer can re-emit
+/// it unchanged, `type` keys and every array element included.
+#[derive(Debug, Clone)]
 pub(super) struct RawNpmFunding {
     pub(super) url: Option<String>,
+    pub(super) raw: serde_json::Value,
 }
 
 impl<'de> Deserialize<'de> for RawNpmFunding {
@@ -196,68 +222,22 @@ impl<'de> Deserialize<'de> for RawNpmFunding {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::{MapAccess, SeqAccess, Visitor};
-        use std::fmt;
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(RawNpmFunding {
+            url: funding_url(&raw),
+            raw,
+        })
+    }
+}
 
-        struct FundingVisitor;
-
-        impl<'de> Visitor<'de> for FundingVisitor {
-            type Value = RawNpmFunding;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a funding URL string, a {url: ...} object, or an array of either")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(RawNpmFunding {
-                    url: Some(v.to_owned()),
-                })
-            }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(RawNpmFunding { url: Some(v) })
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut url: Option<String> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    if key == "url" {
-                        url = map.next_value::<Option<String>>()?;
-                    } else {
-                        // Skip unknown fields (e.g. `type`).
-                        let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                    }
-                }
-                Ok(RawNpmFunding { url })
-            }
-
-            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-            where
-                S: SeqAccess<'de>,
-            {
-                // Pick the first usable URL from the array; aube's
-                // single-URL model can't represent a list. Drain the
-                // rest so the deserializer state stays consistent.
-                let mut chosen: Option<String> = None;
-                while let Some(item) = seq.next_element::<RawNpmFunding>()? {
-                    if chosen.is_none() {
-                        chosen = item.url;
-                    }
-                }
-                Ok(RawNpmFunding { url: chosen })
-            }
-        }
-
-        deserializer.deserialize_any(FundingVisitor)
+/// First URL in a `funding` value: the string itself, an object's `url`,
+/// or the first array element that yields one.
+fn funding_url(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(url) => Some(url.clone()),
+        serde_json::Value::Object(map) => map.get("url")?.as_str().map(str::to_owned),
+        serde_json::Value::Array(items) => items.iter().find_map(funding_url),
+        _ => None,
     }
 }
 

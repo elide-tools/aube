@@ -1,4 +1,7 @@
-use super::bin_linking::{LinkAllBinsInput, ManagedBinLinks, link_all_bins};
+use super::bin_linking::{
+    BinLinkSnapshot, LinkAllBinsInput, ManagedBinLinks, link_all_bins, remove_unclaimed_bin_links,
+    snapshot_bin_links,
+};
 use super::sweep::invalidate_changed_aube_entries;
 use super::{InstallPhaseTimings, lifecycle::resolve_link_strategy};
 use super::{delta, gvs};
@@ -24,6 +27,7 @@ pub(super) struct LinkPhaseInput<'a> {
         std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>,
         Vec<String>,
     )>,
+    pub(super) project_local_dep_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
     pub(super) aube_dir: &'a std::path::Path,
     pub(super) modules_dir_name: &'a str,
     pub(super) virtual_store_dir_max_length: usize,
@@ -34,6 +38,7 @@ pub(super) struct LinkPhaseInput<'a> {
     pub(super) dep_selection_filtered: bool,
     pub(super) workspace_filter_empty: bool,
     pub(super) ignore_scripts: bool,
+    pub(super) force: bool,
     pub(super) prog_ref: Option<&'a crate::progress::InstallProgress>,
     pub(super) phase_timings: &'a mut InstallPhaseTimings,
 }
@@ -46,6 +51,9 @@ pub(super) struct LinkPhaseOutput {
     pub(super) current_subtree_hashes: Option<BTreeMap<String, String>>,
     pub(super) patch_hashes: BTreeMap<String, String>,
     pub(super) managed_bin_links: ManagedBinLinks,
+    /// The bins linked in the `.bin` directories the stale-bin sweep
+    /// visited, saved once the install succeeds.
+    pub(super) bin_link_snapshot: BinLinkSnapshot,
     pub(super) gvs_dep_link_targets: Option<aube_linker::GvsDepLinkTargets>,
 }
 
@@ -63,6 +71,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         node_version,
         prewarm_graph_hashes,
         prewarm_placed,
+        project_local_dep_paths,
         aube_dir,
         modules_dir_name,
         virtual_store_dir_max_length,
@@ -73,6 +82,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         dep_selection_filtered,
         workspace_filter_empty,
         ignore_scripts,
+        force,
         prog_ref,
         phase_timings,
     } = input;
@@ -142,11 +152,13 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         .with_node_linker(node_linker)
         .with_link_concurrency(link_concurrency_setting)
         .with_virtual_store_only(virtual_store_only)
+        .with_force(force)
         .with_modules_dir_name(modules_dir_name.to_string())
         .with_aube_dir_override(aube_dir.to_path_buf());
     if planned_gvs && node_linker == aube_linker::NodeLinker::Isolated {
-        linker = linker
-            .with_project_local_dep_paths(gvs::legacy_vite_project_local_closure(graph_for_link));
+        let selected = project_local_dep_paths
+            .unwrap_or_else(|| std::sync::Arc::new(gvs::project_local_closure(graph_for_link)));
+        linker = linker.with_precomputed_project_local_dep_paths(selected);
     }
     if let Some(enabled) = use_global_virtual_store_override {
         linker = linker.with_use_global_virtual_store(enabled);
@@ -393,7 +405,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     //    invoke their own dependencies. Approved builds get a refresh pass in
     //    finalize because a lifecycle may replace its bin target.
     let phase_start = std::time::Instant::now();
-    let managed_bin_links = if !virtual_store_only {
+    let (managed_bin_links, bin_link_snapshot) = if !virtual_store_only {
         let managed = link_all_bins(LinkAllBinsInput {
             project_dir: cwd,
             settings_ctx,
@@ -411,11 +423,20 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
             capture_managed: !ignore_scripts && build_policy.has_any_allow_rule(),
             preserved: None,
         })?;
+        let swept = remove_unclaimed_bin_links(
+            cwd,
+            modules_dir_name,
+            aube_dir,
+            graph_for_link,
+            has_workspace.then_some(ws_dirs),
+            &managed,
+        )?;
         tracing::debug!("phase:link_bins {:.1?}", phase_start.elapsed());
+        let snapshot = snapshot_bin_links(cwd, swept, &managed)?;
         phase_timings.record("link_bins", phase_start.elapsed());
-        managed
+        (managed, snapshot)
     } else {
-        ManagedBinLinks::default()
+        (ManagedBinLinks::default(), BinLinkSnapshot::default())
     };
     Ok(LinkPhaseOutput {
         stats,
@@ -425,6 +446,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         current_subtree_hashes,
         patch_hashes,
         managed_bin_links,
+        bin_link_snapshot,
         gvs_dep_link_targets,
     })
 }

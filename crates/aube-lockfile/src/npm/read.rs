@@ -2,11 +2,13 @@ use crate::{DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::raw::{InstallPathInfo, RawNpmLockfile, RawNpmPackage};
+use super::raw::{HAS_INSTALL_SCRIPT_KEY, InstallPathInfo, RawNpmLockfile, RawNpmPackage};
 /// Parse a package-lock.json or npm-shrinkwrap.json file into a LockfileGraph.
 pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
-    let raw: RawNpmLockfile = crate::parse_json(path, content)?;
+    let document: serde_json::Value = crate::parse_json(path, content)?;
+    let raw = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
+        .map_err(|e| Error::parse(path, e.to_string()))?;
 
     if raw.lockfile_version < 2 {
         return Err(Error::parse(
@@ -63,10 +65,19 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut install_path_info: BTreeMap<String, InstallPathInfo> = BTreeMap::new();
 
     for (install_path, entry) in &raw.packages {
-        if install_path.is_empty() {
-            continue; // root project, handled separately
+        if install_path.is_empty() || entry.in_bundle {
+            continue;
         }
         if link_targets.contains(install_path) {
+            continue;
+        }
+        // npm keeps entries outside `node_modules` for folders it never
+        // installs: a symlinked member's real location, a deleted member, or
+        // the parent of a nested workspace member. They are not packages.
+        if !install_path
+            .split('/')
+            .any(|segment| segment == "node_modules")
+        {
             continue;
         }
 
@@ -107,12 +118,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                     format!("linked package '{install_name}' points to missing target '{target}'"),
                 )
             })?;
-            let version = target_entry.version.clone().ok_or_else(|| {
-                Error::parse(
-                    path,
-                    format!("linked package '{install_name}' target '{target}' has no version"),
-                )
-            })?;
+            // npm writes a workspace member without a `version` in its
+            // package.json as an entry with no version. Use the same
+            // `0.0.0` placeholder as the pnpm reader.
+            let version = target_entry
+                .version
+                .clone()
+                .unwrap_or_else(|| "0.0.0".to_string());
             let local = LocalSource::Link(PathBuf::from(target));
             (
                 target_entry,
@@ -161,6 +173,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             .dependencies
             .keys()
             .chain(package_entry.optional_dependencies.keys())
+            .chain(package_entry.peer_dependencies.keys())
         {
             // Forward references — we'll resolve them in a second pass using
             // the node nested-resolution walk.
@@ -230,12 +243,38 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 alias_of,
                 tarball_url,
                 declared_dependencies: declared,
+                bundled_dependencies: package_entry.bundle_dependencies.clone(),
                 engines: package_entry.engines.clone(),
                 bin: package_entry.bin.clone(),
                 license: package_entry.license.as_ref().and_then(|l| l.value.clone()),
                 funding_url: package_entry.funding.as_ref().and_then(|f| f.url.clone()),
+                extra_meta: package_entry
+                    .has_install_script
+                    .then(|| (HAS_INSTALL_SCRIPT_KEY.to_string(), true.into()))
+                    .into_iter()
+                    .chain((!package_entry.bundle_dependencies.is_empty()).then(|| {
+                        (
+                            super::raw::BUNDLED_OPTIONAL_KEY.to_string(),
+                            serde_json::json!(package_entry.optional_dependencies),
+                        )
+                    }))
+                    .chain(
+                        package_entry
+                            .deprecated
+                            .as_ref()
+                            .filter(|msg| !msg.is_empty())
+                            .map(|msg| ("deprecated".to_string(), msg.as_str().into())),
+                    )
+                    .chain(
+                        package_entry
+                            .funding
+                            .as_ref()
+                            .map(|f| (crate::EXTRA_NPM_FUNDING.to_string(), f.raw.clone())),
+                    )
+                    .collect(),
                 ..Default::default()
-            },
+            }
+            .with_declared_dependencies_known(),
         );
     }
 
@@ -261,7 +300,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut resolved_by_dep_path: BTreeMap<String, (ResolvedDepMap, ResolvedDepMap)> =
         BTreeMap::new();
     for (install_path, entry) in &raw.packages {
-        if install_path.is_empty() {
+        if install_path.is_empty() || entry.in_bundle {
             continue;
         }
         if link_targets.contains(install_path) {
@@ -306,7 +345,26 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                     .keys()
                     .map(|name| (name, true)),
             )
+            .chain(
+                package_entry
+                    .peer_dependencies
+                    .keys()
+                    .filter(|name| {
+                        !package_entry.dependencies.contains_key(*name)
+                            && !package_entry.optional_dependencies.contains_key(*name)
+                    })
+                    .map(|name| {
+                        let optional = package_entry
+                            .peer_dependencies_meta
+                            .get(name)
+                            .is_some_and(|meta| meta.optional);
+                        (name, optional)
+                    }),
+            )
         {
+            if package_entry.bundle_dependencies.contains(dep_name) {
+                continue;
+            }
             if let Some(target_install_path) =
                 crate::npm::layout::resolve_nested(lookup_path, dep_name, &install_path_info)
                 && let Some(target_info) = install_path_info.get(&target_install_path)
@@ -320,6 +378,77 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             }
         }
         resolved_by_dep_path.insert(dep_path, (resolved, resolved_optional));
+    }
+    // Bundled children are not resolved from the registry, but an edge that
+    // leaves the bundle (such as a peer on a root-level `react`) must keep its
+    // target reachable from the owning tarball.
+    let mut bundle_added: BTreeSet<(String, String)> = BTreeSet::new();
+    for (install_path, entry) in raw.packages.iter().filter(|(_, e)| e.in_bundle) {
+        let mut owner_path = install_path.as_str();
+        let owner = loop {
+            let Some((parent, _)) = owner_path.rsplit_once("/node_modules/") else {
+                break None;
+            };
+            owner_path = parent;
+            if let Some(info) = install_path_info.get(owner_path) {
+                break Some(info);
+            }
+        };
+        let Some(info_dep_path) = owner.map(|info| info.dep_path.clone()) else {
+            continue;
+        };
+        let Some((resolved, resolved_optional)) = resolved_by_dep_path.get_mut(&info_dep_path)
+        else {
+            continue;
+        };
+        for (dep_name, is_optional) in entry
+            .dependencies
+            .keys()
+            .map(|name| (name, false))
+            .chain(entry.optional_dependencies.keys().map(|name| (name, true)))
+            .chain(entry.peer_dependencies.keys().map(|name| {
+                (
+                    name,
+                    entry
+                        .peer_dependencies_meta
+                        .get(name)
+                        .is_some_and(|m| m.optional),
+                )
+            }))
+        {
+            let mut base = install_path.as_str();
+            let target = loop {
+                let candidate = format!("{base}/node_modules/{dep_name}");
+                if let Some(found) = raw.packages.get(&candidate) {
+                    break (!found.in_bundle).then_some(candidate);
+                }
+                let Some((parent, _)) = base.rsplit_once("/node_modules/") else {
+                    break Some(format!("node_modules/{dep_name}"))
+                        .filter(|path| raw.packages.get(path).is_some_and(|e| !e.in_bundle));
+                };
+                base = parent;
+            };
+            let Some(target_info) = target.and_then(|path| install_path_info.get(&path)) else {
+                continue;
+            };
+            let tail = crate::npm::dep_path_tail(&target_info.name, &target_info.dep_path);
+            // An edge the owner already declares keeps the owner's own
+            // required/optional classification.
+            if resolved.contains_key(dep_name) {
+                // A later bundled child that requires what an earlier one only
+                // optionally used makes the edge required again.
+                if !is_optional && bundle_added.contains(&(info_dep_path.clone(), dep_name.clone()))
+                {
+                    resolved_optional.remove(dep_name);
+                }
+                continue;
+            }
+            bundle_added.insert((info_dep_path.clone(), dep_name.clone()));
+            resolved.insert(dep_name.clone(), tail.to_string());
+            if is_optional {
+                resolved_optional.insert(dep_name.clone(), tail.to_string());
+            }
+        }
     }
     for (dep_path, (deps, optional_deps)) in resolved_by_dep_path {
         if let Some(pkg) = graph.packages.get_mut(&dep_path) {
@@ -489,6 +618,89 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             }
         }
         graph.importers.insert(target.clone(), direct);
+    }
+    // Bundled children belong to the tarball, not the registry resolution graph.
+    // Keep their complete per-placement entries on the owning package.
+    if raw.packages.values().any(|entry| entry.in_bundle) {
+        for (install_path, _) in raw.packages.iter().filter(|(_, entry)| entry.in_bundle) {
+            let mut owner_path = install_path.as_str();
+            while let Some((parent, _)) = owner_path.rsplit_once("/node_modules/") {
+                owner_path = parent;
+                if let Some(info) = install_path_info.get(owner_path) {
+                    if let Some(pkg) = graph.packages.get_mut(&info.dep_path) {
+                        let entries = pkg
+                            .extra_meta
+                            .entry(super::raw::BUNDLED_ENTRIES_KEY.into())
+                            .or_insert_with(|| serde_json::json!({}));
+                        entries[&install_path[owner_path.len()..]] =
+                            document["packages"][install_path].clone();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let ordinary = super::layout::non_peer_placements(&document["packages"]);
+    for (install_path, info) in &install_path_info {
+        let Some(pkg) = graph.packages.get_mut(&info.dep_path) else {
+            continue;
+        };
+        let metadata = pkg
+            .extra_meta
+            .entry(super::raw::ENTRY_METADATA_KEY.into())
+            .or_insert_with(|| serde_json::json!({}));
+        metadata[install_path] = serde_json::json!({
+            "peer": raw.packages[install_path].peer,
+            "nonPeer": ordinary.contains(install_path),
+        });
+        if let Some(workspaces) = document["packages"][install_path].get("workspaces") {
+            pkg.extra_meta
+                .insert(super::raw::WORKSPACES_KEY.into(), workspaces.clone());
+        }
+    }
+    // npm can retain a nested optional placement with no current incoming
+    // edge. Keep it with its owner, without inventing new resolver edges.
+    let reached = super::layout::reachable_placements(&document["packages"], true);
+    let canonical = crate::build_canonical_map(&graph);
+    let mut retained = Vec::new();
+    for (install_path, info) in &install_path_info {
+        if reached.contains(install_path) || !raw.packages[install_path].optional {
+            continue;
+        }
+        let Some((owner_path, _)) = install_path.rsplit_once("/node_modules/") else {
+            continue;
+        };
+        let Some(owner) = install_path_info.get(owner_path) else {
+            continue;
+        };
+        let owner_key = super::canonical_key_from_dep_path(&owner.dep_path);
+        let key = super::canonical_key_from_dep_path(&info.dep_path);
+        let mut guards =
+            super::layout::dependency_snapshot(&canonical, vec![owner_key.clone(), key.clone()]);
+        let signature = guards.get(&key).cloned();
+        if key != owner_key {
+            guards.remove(&key);
+        }
+        retained.push((
+            owner.dep_path.clone(),
+            install_path.clone(),
+            serde_json::json!({
+                "owner": owner_path,
+                "key": key,
+                "signature": signature,
+                "guards": guards,
+                "entry": document["packages"][install_path],
+            }),
+        ));
+    }
+    for (owner, install_path, entry) in retained {
+        if let Some(pkg) = graph.packages.get_mut(&owner) {
+            let entries = pkg
+                .extra_meta
+                .entry(super::raw::RETAINED_ENTRIES_KEY.into())
+                .or_insert_with(|| serde_json::json!({}));
+            entries[install_path] = entry;
+        }
     }
     Ok(graph)
 }

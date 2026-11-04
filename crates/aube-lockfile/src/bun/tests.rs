@@ -1308,6 +1308,116 @@ fn test_parse_rebases_workspace_scoped_local_tarball() {
     );
 }
 
+proptest::proptest! {
+    #[test]
+    fn parse_rebases_tarballs_from_the_declaring_workspace(
+        depth in 1usize..6,
+        scoped in proptest::bool::ANY,
+        nested in proptest::bool::ANY,
+        climbs in proptest::bool::ANY,
+        file_prefix in proptest::bool::ANY,
+        section in proptest::sample::select(vec!["dependencies", "devDependencies", "optionalDependencies"]),
+    ) {
+        let ws_path = format!("{}app", "projects/".repeat(depth - 1));
+        let name = if scoped { "@scope/local" } else { "local" };
+        let ws_name = "@members/app";
+        let relative = if climbs {
+            format!("{}vendor/local.tgz", "../".repeat(depth))
+        } else {
+            "assets/local.tgz".to_string()
+        };
+        let expected = if climbs {
+            PathBuf::from("vendor/local.tgz")
+        } else {
+            Path::new(&ws_path).join(&relative)
+        };
+        let ident = format!("{name}@{}{relative}", if file_prefix { "file:" } else { "" });
+        let key = if nested { format!("{ws_name}/{name}") } else { name.to_string() };
+        let mut packages = serde_json::json!({ws_name: [format!("{ws_name}@workspace:{ws_path}")]});
+        packages[&key] = serde_json::json!([ident, {}]);
+        if nested {
+            packages[name] = serde_json::json!([format!("{name}@1.0.0"), "", {}]);
+        }
+        let specifier = format!("file:{relative}");
+        let content = serde_json::json!({
+            "lockfileVersion": 2,
+            "workspaces": {
+                "": {"name": "root"},
+                ws_path.clone(): {"name": ws_name, section: {name: specifier}}
+            },
+            "packages": packages
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("bun.lock");
+        let member = tmp.path().join(&ws_path);
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), content["workspaces"][&ws_path].to_string()).unwrap();
+        std::fs::write(&lock_path, content.to_string()).unwrap();
+        let graph = parse(&lock_path).unwrap();
+        let dep = &graph.importers[&ws_path][0];
+        let pkg = &graph.packages[&dep.dep_path];
+        proptest::prop_assert_eq!(&pkg.local_source, &Some(LocalSource::Tarball(expected)));
+        proptest::prop_assert_eq!(dep.specifier.as_deref(), Some(specifier.as_str()));
+
+        write(&lock_path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+        let reloaded = parse(&lock_path).unwrap();
+        let dep = &reloaded.importers[&ws_path][0];
+        let reloaded_path = reloaded.packages[&dep.dep_path].local_source.as_ref().unwrap().path().unwrap();
+        proptest::prop_assert_eq!(aube_util::path::normalize_lexical(reloaded_path), pkg.local_source.as_ref().unwrap().path().unwrap());
+    }
+}
+
+#[test]
+fn parse_local_sources_keep_their_native_base() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = serde_json::json!({
+        "lockfileVersion": 2,
+        "workspaces": {
+            "": {"dependencies": {"shared": "file:../shared.tgz"}},
+            "apps/a": {"name": "a", "dependencies": {
+                "shared": "file:../shared.tgz",
+                "same": "file:../../same.tgz",
+                "override": "*",
+                "rewritten": "file:../../rewritten.tgz",
+                "directory": "file:../../vendor/directory",
+                "absolute": "file:/vendor/absolute.tgz"
+            }},
+            "apps/b": {"name": "b", "dependencies": {"same": "file:../../same.tgz"}}
+        },
+        "packages": {
+            "shared": ["shared@../shared.tgz", {}],
+            "same": ["same@../../same.tgz", {}],
+            "a/override": ["override@../override.tgz", {}],
+            "a/rewritten": ["rewritten@rewritten.tgz", {}],
+            "a/directory": ["directory@file:../vendor/directory", {}],
+            "absolute": ["absolute@/vendor/absolute.tgz", {}]
+        }
+    });
+    std::fs::write(tmp.path(), content.to_string()).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+    for (name, expected) in [
+        ("shared", LocalSource::Tarball("../shared.tgz".into())),
+        ("same", LocalSource::Tarball("same.tgz".into())),
+        ("override", LocalSource::Tarball("../override.tgz".into())),
+        ("rewritten", LocalSource::Tarball("rewritten.tgz".into())),
+        (
+            "directory",
+            LocalSource::Directory("../vendor/directory".into()),
+        ),
+        (
+            "absolute",
+            LocalSource::Tarball("/vendor/absolute.tgz".into()),
+        ),
+    ] {
+        let pkg = graph
+            .packages
+            .values()
+            .find(|pkg| pkg.name == name)
+            .unwrap();
+        assert_eq!(pkg.local_source, Some(expected), "{name}");
+    }
+}
+
 /// Top-level `overrides` / `patchedDependencies` / `trustedDependencies`
 /// and the unnamed `catalog` / named `catalogs` blocks must round-trip
 /// verbatim — bun preserves all five on re-emit, so aube dropping any
@@ -1649,6 +1759,132 @@ fn test_roundtrip_peer_and_platform_metadata() {
     assert_eq!(foo2.libc, foo.libc);
 }
 
+/// The resolver links a resolved peer through the package's
+/// `dependencies`, but bun keeps peers out of that map. Writing the
+/// pin there makes bun treat the peer as a hard dependency: after a
+/// later `bun add react@<newer>`, bun nests the old react under
+/// react-dom. A dependency the package also declares stays.
+#[test]
+fn test_write_keeps_resolved_peers_out_of_dependencies() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "dependencies": { "react": "19.2.0", "react-dom": "19.2.0" } } },
+  "packages": {
+    "react": ["react@19.2.0", "", {}, "SRI_R"],
+    "react-dom": ["react-dom@19.2.0", "", { "dependencies": { "scheduler": "^0.27.0" }, "peerDependencies": { "react": "^19.2.0" } }, "SRI_D"],
+    "scheduler": ["scheduler@0.27.0", "", {}, "SRI_S"]
+  }
+}"#
+    .replace("SRI_R", &fake_sri('r'))
+    .replace("SRI_D", &fake_sri('d'))
+    .replace("SRI_S", &fake_sri('s'));
+    std::fs::write(tmp.path(), &content).unwrap();
+    let mut graph = parse(tmp.path()).unwrap();
+    // What a re-resolve hands the writer: the peer resolved into
+    // `dependencies` with no declared range.
+    let dom = graph.packages.get_mut("react-dom@19.2.0").unwrap();
+    assert!(!dom.declared_dependencies.contains_key("react"));
+    dom.dependencies
+        .insert("react".to_string(), "19.2.0".to_string());
+
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [
+            ("react".to_string(), "19.2.0".to_string()),
+            ("react-dom".to_string(), "19.2.0".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        written.contains(r#""react-dom": ["react-dom@19.2.0", "", { "dependencies": { "scheduler": "^0.27.0" }, "peerDependencies": { "react": "^19.2.0" } }"#),
+        "resolved peer written into dependencies:\n{written}"
+    );
+
+    // A package that declares the same name as a dependency and a
+    // peer keeps the dependency.
+    let dom = graph.packages.get_mut("react-dom@19.2.0").unwrap();
+    dom.declared_dependencies
+        .insert("react".to_string(), "^19.2.0".to_string());
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        written.contains(r#""dependencies": { "react": "^19.2.0", "scheduler": "^0.27.0" }"#),
+        "declared dependency dropped:\n{written}"
+    );
+
+    // A package whose declared set is unknown (read from pnpm-lock.yaml)
+    // keeps the entry, since it may be a real dependency.
+    let dom = graph.packages.get_mut("react-dom@19.2.0").unwrap();
+    dom.declared_dependencies.clear();
+    dom.extra_meta
+        .remove(crate::EXTRA_DECLARED_DEPENDENCIES_KNOWN);
+    write(out.path(), &graph, &manifest).unwrap();
+    let written = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        written.contains(r#""dependencies": { "react": "19.2.0", "scheduler": "0.27.0" }"#),
+        "dependency with unknown declarations dropped:\n{written}"
+    );
+}
+
+/// A fresh resolve leaves `declared_dependencies` empty for local
+/// (`file:`, git, tarball) packages, so the writer can't tell a resolved peer from a dependency
+/// the package also declares, and keeps the entry.
+#[test]
+fn test_write_keeps_local_package_dependency_that_is_also_a_peer() {
+    let local = LocalSource::Directory(PathBuf::from("vendor/x"));
+    let x_path = local.dep_path("x");
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        x_path.clone(),
+        LockedPackage {
+            name: "x".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: x_path.clone(),
+            local_source: Some(local),
+            dependencies: BTreeMap::from([("react".to_string(), "19.2.0".to_string())]),
+            peer_dependencies: BTreeMap::from([("react".to_string(), "^19.2.0".to_string())]),
+            ..Default::default()
+        },
+    );
+    graph.packages.insert(
+        "react@19.2.0".to_string(),
+        LockedPackage {
+            name: "react".to_string(),
+            version: "19.2.0".to_string(),
+            dep_path: "react@19.2.0".to_string(),
+            integrity: Some(fake_sri('r')),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![DirectDep {
+            name: "x".to_string(),
+            dep_path: x_path,
+            dep_type: DepType::Production,
+            specifier: None,
+        }],
+    );
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bun.lock");
+    write(&path, &graph, &manifest).unwrap();
+
+    assert_eq!(
+        written_packages(&path)["x"],
+        serde_json::json!(["x@file:vendor/x", { "dependencies": { "react": "19.2.0" }, "peerDependencies": { "react": "^19.2.0" } }])
+    );
+}
+
 #[test]
 fn test_parse_scalar_platform_metadata() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1773,4 +2009,1113 @@ fn dev_and_optional_overlap_yields_one_direct_dep() {
     assert_eq!(root.len(), 1, "expected one direct dep, got {root:?}");
     assert_eq!(root[0].name, "foo");
     assert_eq!(root[0].dep_type, DepType::Dev);
+}
+
+/// The `packages` section of the `bun.lock` at `path`.
+fn written_packages(path: &Path) -> serde_json::Value {
+    let written = std::fs::read_to_string(path).unwrap();
+    let mut lockfile: serde_json::Value = serde_json::from_str(&strip_jsonc(&written)).unwrap();
+    lockfile["packages"].take()
+}
+
+/// A fresh resolve keys `file:` packages by a path-hash dep_path and
+/// keeps no declared specs for them. The writer must still emit them in
+/// bun's shape, or `bun install --frozen-lockfile` sees them missing.
+#[test]
+fn test_write_file_directory_and_tarball_packages() {
+    let dir = LocalSource::Directory(PathBuf::from("vendor/x"));
+    let nested = LocalSource::Directory(PathBuf::from("vendor/y"));
+    let tarball = LocalSource::Tarball(PathBuf::from("vendor/t.tgz"));
+    let (x_path, y_path, t_path) = (
+        dir.dep_path("x"),
+        nested.dep_path("y"),
+        tarball.dep_path("t"),
+    );
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        x_path.clone(),
+        LockedPackage {
+            name: "x".to_string(),
+            version: "1.2.3".to_string(),
+            dep_path: x_path.clone(),
+            local_source: Some(dir),
+            dependencies: BTreeMap::from([(
+                "y".to_string(),
+                y_path.strip_prefix("y@").unwrap().to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+    for (name, version, dep_path, local) in [
+        ("y", "0.1.0", &y_path, nested),
+        ("t", "3.0.0", &t_path, tarball),
+    ] {
+        graph.packages.insert(
+            dep_path.clone(),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: dep_path.clone(),
+                local_source: Some(local),
+                ..Default::default()
+            },
+        );
+    }
+    graph.importers.insert(
+        ".".to_string(),
+        [("x", &x_path), ("t", &t_path)]
+            .into_iter()
+            .map(|(name, dep_path)| DirectDep {
+                name: name.to_string(),
+                dep_path: dep_path.clone(),
+                dep_type: DepType::Production,
+                specifier: None,
+            })
+            .collect(),
+    );
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bun.lock");
+    write(&path, &graph, &manifest).unwrap();
+
+    assert_eq!(
+        written_packages(&path),
+        serde_json::json!({
+            "t": ["t@./vendor/t.tgz", {}, ""],
+            "x": ["x@file:vendor/x", { "dependencies": { "y": "file:../y" } }],
+            "y": ["y@file:vendor/y", {}],
+        })
+    );
+
+    let reparsed = parse(&path).unwrap();
+    let local_sources: Vec<_> = reparsed
+        .packages
+        .values()
+        .filter_map(|pkg| pkg.local_source.clone())
+        .collect();
+    assert!(local_sources.contains(&LocalSource::Directory(PathBuf::from("vendor/x"))));
+    assert!(local_sources.contains(&LocalSource::Directory(PathBuf::from("vendor/y"))));
+    assert!(local_sources.contains(&LocalSource::Tarball(PathBuf::from("./vendor/t.tgz"))));
+}
+
+/// bun keeps an absolute `file:` tarball absolute, and writes a local
+/// child's spec relative to its parent even when the parent sits outside
+/// the project.
+#[test]
+fn test_write_file_packages_with_absolute_and_outside_paths() {
+    let project = tempfile::tempdir().unwrap();
+    let archive = project.path().join("elsewhere").join("t.tgz");
+    let tarball = LocalSource::Tarball(archive.clone());
+    let parent = LocalSource::Directory(PathBuf::from("../x"));
+    let child = LocalSource::Directory(PathBuf::from("vendor/y"));
+    let (t_path, x_path, y_path) = (
+        tarball.dep_path("t"),
+        parent.dep_path("x"),
+        child.dep_path("y"),
+    );
+    let mut graph = LockfileGraph::default();
+    for (name, dep_path, local, deps) in [
+        ("t", &t_path, tarball, BTreeMap::new()),
+        (
+            "x",
+            &x_path,
+            parent,
+            BTreeMap::from([(
+                "y".to_string(),
+                y_path.strip_prefix("y@").unwrap().to_string(),
+            )]),
+        ),
+        ("y", &y_path, child, BTreeMap::new()),
+    ] {
+        graph.packages.insert(
+            dep_path.clone(),
+            LockedPackage {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: dep_path.clone(),
+                local_source: Some(local),
+                dependencies: deps,
+                ..Default::default()
+            },
+        );
+    }
+    graph.importers.insert(
+        ".".to_string(),
+        [("t", &t_path), ("x", &x_path)]
+            .into_iter()
+            .map(|(name, dep_path)| DirectDep {
+                name: name.to_string(),
+                dep_path: dep_path.clone(),
+                dep_type: DepType::Production,
+                specifier: None,
+            })
+            .collect(),
+    );
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        ..Default::default()
+    };
+    let path = project.path().join("app").join("bun.lock");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    write(&path, &graph, &manifest).unwrap();
+
+    let absolute = archive.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        written_packages(&path),
+        serde_json::json!({
+            "t": [format!("t@{absolute}"), {}, ""],
+            "x": ["x@file:../x", { "dependencies": { "y": "file:../app/vendor/y" } }],
+            "y": ["y@file:vendor/y", {}],
+        })
+    );
+}
+
+/// With a relative lockfile path, a local child under the project still
+/// gets a spec that leads to it from an absolute parent directory.
+#[test]
+fn test_local_child_spec_from_an_absolute_parent_with_a_relative_project_dir() {
+    let parent_dir = std::env::temp_dir().join("elsewhere").join("x");
+    let parent = LockedPackage {
+        local_source: Some(LocalSource::Directory(parent_dir.clone())),
+        ..Default::default()
+    };
+    let child = LockedPackage {
+        local_source: Some(LocalSource::Directory(PathBuf::from("vendor/y"))),
+        ..Default::default()
+    };
+    let spec = super::write::local_child_spec(Path::new("proj"), &parent, &child).unwrap();
+
+    let target = std::path::absolute(Path::new("proj/vendor/y")).unwrap();
+    let relative = spec.strip_prefix("file:").unwrap();
+    assert_eq!(
+        aube_util::path::normalize_lexical(&parent_dir.join(relative)),
+        aube_util::path::normalize_lexical(&target),
+        "{spec}"
+    );
+}
+
+/// bun.lock lists no version for `file:` directories or workspace
+/// members; reading it fills the real ones from their package.json, and
+/// writing that graph back must still reproduce what bun wrote.
+#[test]
+fn test_parse_fills_local_versions_and_writes_bun_lock_back_unchanged() {
+    let project = tempfile::tempdir().unwrap();
+    let dir = project.path();
+    for (path, manifest) in [
+        (
+            "package.json",
+            r#"{"name":"root","private":true,"workspaces":["packages/*","lib"],"dependencies":{"x":"file:./vendor/x"}}"#,
+        ),
+        (
+            "packages/a/package.json",
+            r#"{"name":"a","version":"1.0.0","dependencies":{"b":"workspace:*","lib":"workspace:*"}}"#,
+        ),
+        (
+            "packages/b/package.json",
+            r#"{"name":"b","version":"2.0.0"}"#,
+        ),
+        ("lib/package.json", r#"{"name":"lib","version":"3.1.4"}"#),
+        (
+            "vendor/x/package.json",
+            r#"{"name":"x","version":"1.2.3","dependencies":{"y":"file:../y"}}"#,
+        ),
+        ("vendor/y/package.json", r#"{"name":"y","version":"0.1.0"}"#),
+    ] {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, manifest).unwrap();
+    }
+    // What bun 1.4 writes for this project.
+    let original = r#"{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "root",
+      "dependencies": {
+        "x": "file:./vendor/x",
+      },
+    },
+    "lib": {
+      "name": "lib",
+      "version": "3.1.4",
+    },
+    "packages/a": {
+      "name": "a",
+      "version": "1.0.0",
+      "dependencies": {
+        "b": "workspace:*",
+        "lib": "workspace:*",
+      },
+    },
+    "packages/b": {
+      "name": "b",
+      "version": "2.0.0",
+    },
+  },
+  "packages": {
+    "a": ["a@workspace:packages/a"],
+
+    "b": ["b@workspace:packages/b"],
+
+    "lib": ["lib@workspace:lib"],
+
+    "x": ["x@file:vendor/x", { "dependencies": { "y": "file:../y" } }],
+
+    "x/y": ["y@file:vendor/y", {}],
+  }
+}
+"#;
+    std::fs::write(dir.join("bun.lock"), original).unwrap();
+    let manifest = aube_manifest::PackageJson::from_path(&dir.join("package.json")).unwrap();
+
+    let graph = crate::parse_lockfile(dir, &manifest).unwrap();
+    let version_of = |name: &str| {
+        graph
+            .packages
+            .values()
+            .find(|pkg| pkg.name == name)
+            .map(|pkg| pkg.version.as_str())
+    };
+    // aube hoists `y` where bun nests it under `x`; bun accepts both.
+    let out = dir.join("bun.lock.out");
+    write(&out, &graph, &manifest).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        original.replace(r#""x/y":"#, r#""y":"#)
+    );
+    assert_eq!(version_of("x"), Some("1.2.3"));
+    assert_eq!(version_of("y"), Some("0.1.0"));
+    assert_eq!(version_of("b"), Some("2.0.0"));
+    assert_eq!(version_of("lib"), Some("3.1.4"));
+}
+
+/// A fresh resolve reaches a sibling workspace by version, so the graph
+/// has no `link:` package for any member. The writer must still list
+/// every member, or installs from the lockfile skip workspace links.
+#[test]
+fn test_write_lists_workspace_members_without_link_packages() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (dir, manifest) in [
+        (
+            "packages/a",
+            r#"{"name":"a","version":"1.0.0","dependencies":{"b":"workspace:*"}}"#,
+        ),
+        ("packages/b", r#"{"name":"b","version":"1.0.0"}"#),
+    ] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        std::fs::write(tmp.path().join(dir).join("package.json"), manifest).unwrap();
+    }
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(".".to_string(), Vec::new());
+    graph.importers.insert(
+        "packages/a".to_string(),
+        vec![DirectDep {
+            name: "b".to_string(),
+            dep_path: "b@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("workspace:*".to_string()),
+        }],
+    );
+    graph.importers.insert("packages/b".to_string(), Vec::new());
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        ..Default::default()
+    };
+    let path = tmp.path().join("bun.lock");
+    write(&path, &graph, &manifest).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""a": ["a@workspace:packages/a"]"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#""b": ["b@workspace:packages/b"]"#),
+        "{written}"
+    );
+
+    let reparsed = parse(&path).unwrap();
+    let a_deps = &reparsed.importers["packages/a"];
+    assert!(a_deps.iter().any(|dep| dep.name == "b"), "{a_deps:?}");
+}
+
+/// bun keeps a resolved package under a name a workspace member also
+/// has, and nests the member under each member that asks for it with
+/// `workspace:`. A second top-level key would replace one on reparse.
+#[test]
+fn test_write_nests_workspace_members_named_like_a_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (dir, manifest) in [
+        (
+            "packages/is-number",
+            r#"{"name":"is-number","version":"1.0.0"}"#,
+        ),
+        (
+            "packages/a",
+            r#"{"name":"a","version":"1.0.0","dependencies":{"is-number":"workspace:*"}}"#,
+        ),
+    ] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        std::fs::write(tmp.path().join(dir).join("package.json"), manifest).unwrap();
+    }
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        "is-number@7.0.0".to_string(),
+        LockedPackage {
+            name: "is-number".to_string(),
+            version: "7.0.0".to_string(),
+            dep_path: "is-number@7.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    let direct = |dep_path: &str, specifier: &str| DirectDep {
+        name: "is-number".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    };
+    graph
+        .importers
+        .insert(".".to_string(), vec![direct("is-number@7.0.0", "^7.0.0")]);
+    graph.importers.insert(
+        "packages/a".to_string(),
+        vec![direct("is-number@1.0.0", "workspace:*")],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [("is-number".to_string(), "^7.0.0".to_string())].into(),
+        ..Default::default()
+    };
+    let path = tmp.path().join("bun.lock");
+    write(&path, &graph, &manifest).unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(written.matches(r#""is-number": ["#).count(), 1, "{written}");
+    assert!(
+        written.contains(r#""a/is-number": ["is-number@workspace:packages/is-number"]"#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(reparsed.importers["."][0].dep_path, "is-number@7.0.0");
+    let member_dep = &reparsed.importers["packages/a"][0];
+    assert!(
+        matches!(
+            reparsed.packages[&member_dep.dep_path].local_source,
+            Some(LocalSource::Link(_))
+        ),
+        "{member_dep:?}"
+    );
+}
+
+/// Writes `graph` for a workspace whose member manifests are `members`
+/// (path, package.json) and whose root declares `root_deps`.
+fn write_workspace(
+    graph: &LockfileGraph,
+    members: &[(&str, &str)],
+    root_deps: &[(&str, &str)],
+) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    for (dir, manifest) in members {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        std::fs::write(tmp.path().join(dir).join("package.json"), manifest).unwrap();
+    }
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: root_deps
+            .iter()
+            .map(|(name, spec)| (name.to_string(), spec.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let path = tmp.path().join("bun.lock");
+    write(&path, graph, &manifest).unwrap();
+    (tmp, path)
+}
+
+fn is_number_dep(dep_path: &str, specifier: &str) -> DirectDep {
+    DirectDep {
+        name: "is-number".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    }
+}
+
+/// A package keyed like the dependent member would read the nested
+/// member as its own dependency, so the member is not nested there.
+#[test]
+fn test_write_does_not_nest_members_under_a_package_key() {
+    let mut graph = LockfileGraph::default();
+    for (name, version, deps) in [
+        ("is-number", "6.0.0", vec![]),
+        ("is-odd", "3.0.1", vec![("is-number", "6.0.0")]),
+    ] {
+        graph.packages.insert(
+            format!("{name}@{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    graph.importers.insert(
+        ".".to_string(),
+        vec![
+            is_number_dep("is-number@6.0.0", "^6.0.0"),
+            DirectDep {
+                name: "is-odd".to_string(),
+                dep_path: "is-odd@3.0.1".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("^3.0.1".to_string()),
+            },
+        ],
+    );
+    graph.importers.insert(
+        "packages/is-odd".to_string(),
+        vec![is_number_dep("is-number@1.0.0", "workspace:*")],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            (
+                "packages/is-number",
+                r#"{"name":"is-number","version":"1.0.0"}"#,
+            ),
+            (
+                "packages/is-odd",
+                r#"{"name":"is-odd","version":"1.0.0","dependencies":{"is-number":"workspace:*"}}"#,
+            ),
+        ],
+        &[("is-number", "^6.0.0"), ("is-odd", "^3.0.1")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains(r#""is-odd/is-number""#), "{written}");
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(
+        reparsed.packages["is-odd@3.0.1"].dependencies["is-number"],
+        "6.0.0"
+    );
+}
+
+/// A member whose path is the dependent's name would read the nested
+/// member through its path scope, so the member is not nested there.
+#[test]
+fn test_write_does_not_nest_members_under_another_members_path() {
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        "is-number@7.0.0".to_string(),
+        LockedPackage {
+            name: "is-number".to_string(),
+            version: "7.0.0".to_string(),
+            dep_path: "is-number@7.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![is_number_dep("is-number@7.0.0", "^7.0.0")],
+    );
+    graph.importers.insert(
+        "packages/a".to_string(),
+        vec![is_number_dep("is-number@1.0.0", "workspace:*")],
+    );
+    graph.importers.insert(
+        "a".to_string(),
+        vec![is_number_dep("is-number@7.0.0", "^7.0.0")],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            (
+                "packages/is-number",
+                r#"{"name":"is-number","version":"1.0.0"}"#,
+            ),
+            (
+                "packages/a",
+                r#"{"name":"a","version":"1.0.0","dependencies":{"is-number":"workspace:*"}}"#,
+            ),
+            (
+                "a",
+                r#"{"name":"c","version":"1.0.0","dependencies":{"is-number":"^7.0.0"}}"#,
+            ),
+        ],
+        &[("is-number", "^7.0.0")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(!written.contains(r#""a/is-number""#), "{written}");
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(reparsed.importers["a"][0].dep_path, "is-number@7.0.0");
+}
+
+/// bun gives the top-level slot of a member the root asks for with
+/// `workspace:` to that member, and nests a registry package of the same
+/// name under the package that depends on it.
+#[test]
+fn test_write_keeps_the_root_workspace_dep_at_the_top_level() {
+    let mut graph = LockfileGraph::default();
+    for (name, version, deps) in [
+        ("is-number", "6.0.0", vec![]),
+        ("is-odd", "3.0.1", vec![("is-number", "6.0.0")]),
+    ] {
+        graph.packages.insert(
+            format!("{name}@{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    graph.importers.insert(
+        ".".to_string(),
+        vec![
+            is_number_dep("is-number@1.0.0", "workspace:*"),
+            DirectDep {
+                name: "is-odd".to_string(),
+                dep_path: "is-odd@3.0.1".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("^3.0.1".to_string()),
+            },
+        ],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[(
+            "packages/is-number",
+            r#"{"name":"is-number","version":"1.0.0"}"#,
+        )],
+        &[("is-number", "workspace:*"), ("is-odd", "^3.0.1")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""is-number": ["is-number@workspace:packages/is-number"]"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#""is-odd/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    let root_dep = reparsed.importers["."]
+        .iter()
+        .find(|dep| dep.name == "is-number")
+        .unwrap();
+    assert!(
+        matches!(
+            reparsed.packages[&root_dep.dep_path].local_source,
+            Some(LocalSource::Link(_))
+        ),
+        "{root_dep:?}"
+    );
+    assert_eq!(
+        reparsed.packages["is-odd@3.0.1"].dependencies["is-number"],
+        "6.0.0"
+    );
+}
+
+/// A member's own registry dep on a name the root reserves for a
+/// workspace member goes under that member, as bun writes it.
+#[test]
+fn test_write_nests_a_members_registry_dep_on_a_reserved_name() {
+    let mut graph = LockfileGraph::default();
+    graph.packages.insert(
+        "is-number@6.0.0".to_string(),
+        LockedPackage {
+            name: "is-number".to_string(),
+            version: "6.0.0".to_string(),
+            dep_path: "is-number@6.0.0".to_string(),
+            ..Default::default()
+        },
+    );
+    graph.importers.insert(
+        ".".to_string(),
+        vec![is_number_dep("is-number@1.0.0", "workspace:*")],
+    );
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![is_number_dep("is-number@6.0.0", "^6.0.0")],
+    );
+    graph
+        .importers
+        .insert("packages/is-number".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            (
+                "packages/is-number",
+                r#"{"name":"is-number","version":"1.0.0"}"#,
+            ),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"is-number":"^6.0.0"}}"#,
+            ),
+        ],
+        &[("is-number", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""is-number": ["is-number@workspace:packages/is-number"]"#),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#""app/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(
+        reparsed.importers["packages/app"][0].dep_path,
+        "is-number@6.0.0"
+    );
+    let root_dep = &reparsed.importers["."][0];
+    assert!(
+        matches!(
+            reparsed.packages[&root_dep.dep_path].local_source,
+            Some(LocalSource::Link(_))
+        ),
+        "{root_dep:?}"
+    );
+}
+
+/// The deps of a member's nested registry package go below that package,
+/// so they don't shadow the member's own direct deps.
+#[test]
+fn test_write_nests_the_deps_of_a_members_nested_package_below_it() {
+    let mut graph = LockfileGraph::default();
+    for (name, version, deps) in [
+        ("is-number", "6.0.0", vec![]),
+        ("is-number", "7.0.0", vec![]),
+        ("is-odd", "3.0.1", vec![("is-number", "6.0.0")]),
+    ] {
+        graph.packages.insert(
+            format!("{name}@{version}"),
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                dep_path: format!("{name}@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let is_odd_dep = |dep_path: &str, specifier: &str| DirectDep {
+        name: "is-odd".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    };
+    graph.importers.insert(
+        ".".to_string(),
+        vec![is_odd_dep("is-odd@1.0.0", "workspace:*")],
+    );
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![
+            is_odd_dep("is-odd@3.0.1", "^3.0.1"),
+            is_number_dep("is-number@7.0.0", "^7.0.0"),
+        ],
+    );
+    graph
+        .importers
+        .insert("packages/is-odd".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            ("packages/is-odd", r#"{"name":"is-odd","version":"1.0.0"}"#),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"is-odd":"^3.0.1","is-number":"^7.0.0"}}"#,
+            ),
+        ],
+        &[("is-odd", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""app/is-odd/is-number": ["is-number@6.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    let app_number = reparsed.importers["packages/app"]
+        .iter()
+        .find(|dep| dep.name == "is-number")
+        .unwrap();
+    assert_eq!(app_number.dep_path, "is-number@7.0.0", "{written}");
+    assert_eq!(
+        reparsed.packages["is-odd@3.0.1"].dependencies["is-number"],
+        "6.0.0"
+    );
+}
+
+/// A member's nested package that depends on another version of its own
+/// name keeps that version one level below it.
+#[test]
+fn test_write_keeps_a_nested_packages_same_name_dep_one_level_below() {
+    let mut graph = LockfileGraph::default();
+    for (version, deps) in [("1.0.0", vec![]), ("2.0.0", vec![("foo", "1.0.0")])] {
+        graph.packages.insert(
+            format!("foo@{version}"),
+            LockedPackage {
+                name: "foo".to_string(),
+                version: version.to_string(),
+                dep_path: format!("foo@{version}"),
+                dependencies: deps
+                    .into_iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let foo_dep = |dep_path: &str, specifier: &str| DirectDep {
+        name: "foo".to_string(),
+        dep_path: dep_path.to_string(),
+        dep_type: DepType::Production,
+        specifier: Some(specifier.to_string()),
+    };
+    graph
+        .importers
+        .insert(".".to_string(), vec![foo_dep("foo@0.1.0", "workspace:*")]);
+    graph.importers.insert(
+        "packages/app".to_string(),
+        vec![foo_dep("foo@2.0.0", "^2.0.0")],
+    );
+    graph
+        .importers
+        .insert("packages/foo".to_string(), Vec::new());
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            ("packages/foo", r#"{"name":"foo","version":"0.1.0"}"#),
+            (
+                "packages/app",
+                r#"{"name":"app","version":"1.0.0","dependencies":{"foo":"^2.0.0"}}"#,
+            ),
+        ],
+        &[("foo", "workspace:*")],
+    );
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains(r#""app/foo/foo": ["foo@1.0.0""#),
+        "{written}"
+    );
+    let reparsed = parse(&path).unwrap();
+    assert_eq!(reparsed.importers["packages/app"][0].dep_path, "foo@2.0.0");
+    assert_eq!(reparsed.packages["foo@2.0.0"].dependencies["foo"], "1.0.0");
+}
+
+#[test]
+fn test_write_absolute_directory_idents_relative_to_lockfile_inside_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    for target in ["assets/child", "../child"] {
+        for direct in [false, true] {
+            let directory = LocalSource::Directory(project.join(target));
+            let child_key = directory.dep_path("child");
+            let spec = format!("file:{}", project.join(target).display());
+            let tarball = LocalSource::Tarball(project.join("host.tgz"));
+            let host_key = tarball.dep_path("host");
+            let mut graph = LockfileGraph::default();
+            graph.packages.insert(
+                child_key.clone(),
+                LockedPackage {
+                    name: "child".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: child_key.clone(),
+                    local_source: Some(directory),
+                    ..Default::default()
+                },
+            );
+            graph.packages.insert(
+                host_key.clone(),
+                LockedPackage {
+                    name: "host".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: host_key.clone(),
+                    local_source: Some(tarball),
+                    dependencies: BTreeMap::from([(
+                        "child".to_string(),
+                        child_key.strip_prefix("child@").unwrap().to_string(),
+                    )]),
+                    declared_dependencies: BTreeMap::from([("child".to_string(), spec.clone())]),
+                    ..Default::default()
+                },
+            );
+            let (name, dep_path, declared) = if direct {
+                ("child", child_key, spec.clone())
+            } else {
+                ("host", host_key, "file:host.tgz".to_string())
+            };
+            graph.importers.insert(
+                ".".to_string(),
+                vec![DirectDep {
+                    name: name.to_string(),
+                    dep_path,
+                    dep_type: DepType::Production,
+                    specifier: Some(declared.clone()),
+                }],
+            );
+            let manifest = aube_manifest::PackageJson {
+                dependencies: BTreeMap::from([(name.to_string(), declared)]),
+                ..Default::default()
+            };
+            let lock = project.join("bun.lock");
+            write(&lock, &graph, &manifest).unwrap();
+            let packages = written_packages(&lock);
+            let expected = if target.starts_with("..") {
+                temp.path()
+                    .join("child")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            } else {
+                target.to_string()
+            };
+            assert_eq!(packages["child"][0], format!("child@file:{expected}"));
+            if !direct {
+                assert_eq!(packages["host"][1]["dependencies"]["child"], spec);
+                assert_eq!(
+                    packages["host"][0],
+                    format!(
+                        "host@{}",
+                        project
+                            .join("host.tgz")
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    )
+                );
+            }
+            let relative_lock =
+                pathdiff::diff_paths(&lock, std::env::current_dir().unwrap()).unwrap();
+            write(&relative_lock, &graph, &manifest).unwrap();
+            assert_eq!(written_packages(&lock), packages);
+            let reread = parse(&lock).unwrap();
+            let child = reread
+                .packages
+                .values()
+                .find(|pkg| pkg.name == "child")
+                .unwrap();
+            assert_eq!(
+                child.local_source,
+                Some(LocalSource::Directory(expected.clone().into()))
+            );
+        }
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn parse_restores_provided_peers_at_their_bun_placement(
+        major in 1u16..1000,
+        optional in proptest::bool::ANY,
+        scoped in proptest::bool::ANY,
+        local in proptest::bool::ANY,
+    ) {
+        let name = if scoped { "@scope/consumer" } else { "consumer" };
+        let peer = if scoped { "@scope/peer" } else { "peer" };
+        let version = if local { "file:provider.tgz".to_string() } else { format!("{major}.0.0") };
+        let metadata = serde_json::json!({
+            "peerDependencies": {peer: "*", "missing": "*"},
+            "optionalPeers": if optional { vec![peer, "missing"] } else { vec![] },
+        });
+        let mut packages = serde_json::Map::new();
+        packages.insert(name.into(), serde_json::json!([format!("{name}@1.0.0"), "", metadata, fake_sri('a')]));
+        packages.insert(peer.into(), serde_json::json!([format!("{peer}@0.0.0"), "", {}, fake_sri('b')]));
+        packages.insert(format!("{name}/{peer}"), serde_json::json!([format!("{peer}@{version}"), "", {}, fake_sri('c')]));
+        let input = serde_json::json!({"lockfileVersion": 2, "packages": packages});
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), input.to_string()).unwrap();
+        let graph = parse(tmp.path()).unwrap();
+        let consumer = &graph.packages[&format!("{name}@1.0.0")];
+        proptest::prop_assert_eq!(&consumer.dependencies[peer], &version);
+        proptest::prop_assert!(!consumer.dependencies.contains_key("missing"));
+        proptest::prop_assert!(!consumer.declared_dependencies.contains_key(peer));
+        proptest::prop_assert_eq!(consumer.optional_dependencies.contains_key(peer), optional);
+        proptest::prop_assert!(!consumer.optional_dependencies.contains_key("missing"));
+        proptest::prop_assert_eq!(consumer.peer_dependencies_meta.get(peer).is_some_and(|m| m.optional), optional);
+    }
+}
+
+#[test]
+fn write_preserves_conflicting_workspace_direct_providers() {
+    let mut graph = LockfileGraph::default();
+    for version in ["18.0.0", "19.0.0"] {
+        let key = format!("react@{version}");
+        graph.packages.insert(
+            key.clone(),
+            LockedPackage {
+                name: "react".into(),
+                version: version.into(),
+                dep_path: key,
+                ..Default::default()
+            },
+        );
+    }
+    let direct = |version: &str| DirectDep {
+        name: "react".into(),
+        dep_path: format!("react@{version}"),
+        dep_type: DepType::Production,
+        specifier: Some(version.into()),
+    };
+    graph.importers.insert(".".into(), vec![direct("18.0.0")]);
+    graph
+        .importers
+        .insert("apps/app".into(), vec![direct("19.0.0")]);
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[(
+            "apps/app",
+            r#"{"name":"@scope/app","dependencies":{"react":"19.0.0"}}"#,
+        )],
+        &[("react", "18.0.0")],
+    );
+    let reloaded = parse(&path).unwrap();
+    assert_eq!(reloaded.importers["."][0].dep_path, "react@18.0.0");
+    assert_eq!(reloaded.importers["apps/app"][0].dep_path, "react@19.0.0");
+}
+
+#[test]
+fn write_preserves_conflicting_provider_of_nameless_member() {
+    let mut graph = LockfileGraph::default();
+    for version in ["18.0.0", "19.0.0"] {
+        let key = format!("react@{version}");
+        graph.packages.insert(
+            key.clone(),
+            LockedPackage {
+                name: "react".into(),
+                version: version.into(),
+                dep_path: key,
+                ..Default::default()
+            },
+        );
+    }
+    let direct = |version: &str| DirectDep {
+        name: "react".into(),
+        dep_path: format!("react@{version}"),
+        dep_type: DepType::Production,
+        specifier: Some(version.into()),
+    };
+    graph.importers.insert(".".into(), vec![direct("18.0.0")]);
+    graph
+        .importers
+        .insert("apps/app".into(), vec![direct("19.0.0")]);
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[("apps/app", r#"{"dependencies":{"react":"19.0.0"}}"#)],
+        &[("react", "18.0.0")],
+    );
+    let reloaded = parse(&path).unwrap();
+    assert_eq!(reloaded.importers["."][0].dep_path, "react@18.0.0");
+    assert_eq!(reloaded.importers["apps/app"][0].dep_path, "react@19.0.0");
+}
+
+#[test]
+fn write_keeps_path_scope_off_a_member_named_like_it() {
+    let mut graph = LockfileGraph::default();
+    for version in ["18.0.0", "19.0.0"] {
+        let key = format!("react@{version}");
+        graph.packages.insert(
+            key.clone(),
+            LockedPackage {
+                name: "react".into(),
+                version: version.into(),
+                dep_path: key,
+                ..Default::default()
+            },
+        );
+    }
+    let direct = |version: &str| DirectDep {
+        name: "react".into(),
+        dep_path: format!("react@{version}"),
+        dep_type: DepType::Production,
+        specifier: Some(version.into()),
+    };
+    graph.importers.insert(".".into(), vec![direct("18.0.0")]);
+    graph.importers.insert("foo".into(), vec![direct("19.0.0")]);
+    graph
+        .importers
+        .insert("packages/app".into(), vec![direct("18.0.0")]);
+    let (_tmp, path) = write_workspace(
+        &graph,
+        &[
+            ("foo", r#"{"dependencies":{"react":"19.0.0"}}"#),
+            (
+                "packages/app",
+                r#"{"name":"foo","dependencies":{"react":"18.0.0"}}"#,
+            ),
+        ],
+        &[("react", "18.0.0")],
+    );
+    let reloaded = parse(&path).unwrap();
+    assert_eq!(
+        reloaded.importers["packages/app"][0].dep_path,
+        "react@18.0.0"
+    );
+}
+
+/// The resolver records a registry package's optional bundled children
+/// under `__aube_npm_bundled_optional` for the npm writer. bun never
+/// writes it, so it must not reach `bun.lock`.
+#[test]
+fn test_write_omits_internal_npm_bundled_optional_meta() {
+    let lock = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{ "": {{ "dependencies": {{ "bundler": "1.0.0" }} }} }},
+  "packages": {{
+    "bundler": ["bundler@1.0.0", "", {{}}, "{}"]
+  }}
+}}"#,
+        fake_sri('b')
+    );
+    let (_project, pj, lock_path) = write_project(&lock);
+    let mut graph = parse(&lock_path).unwrap();
+    graph
+        .packages
+        .get_mut("bundler@1.0.0")
+        .unwrap()
+        .extra_meta
+        .insert(
+            crate::npm::BUNDLED_OPTIONAL_KEY.to_string(),
+            serde_json::json!({ "opt": "1.0.0" }),
+        );
+    let written = rewrite(&lock_path, &pj, &graph);
+    assert!(
+        !written.contains("__aube_"),
+        "internal metadata leaked into bun.lock:\n{written}"
+    );
 }

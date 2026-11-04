@@ -7,7 +7,7 @@ use crate::sweep::{
     try_remove_entry,
 };
 use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
-use aube_lockfile::{LockedPackage, shared_local_dep_path};
+use aube_lockfile::LockedPackage;
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
 use std::io;
@@ -71,6 +71,44 @@ fn place_materialized_entry(src: &Path, dst: &Path) -> io::Result<MaterializePla
                 attempt += 1;
             }
             Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Swap a freshly staged entry over an existing one (`install --force`).
+/// The old entry is renamed aside first, so the shared path is never
+/// half-written; if the final rename fails the old entry is put back.
+fn replace_materialized_entry(
+    src: &Path,
+    dst: &Path,
+    aside: &Path,
+) -> io::Result<MaterializePlacement> {
+    match std::fs::rename(dst, aside) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return place_materialized_entry(src, dst);
+        }
+        Err(e) => return Err(e),
+    }
+    match place_materialized_entry(src, dst) {
+        Ok(MaterializePlacement::Placed) => {
+            let _ = std::fs::remove_dir_all(aside);
+            Ok(MaterializePlacement::Placed)
+        }
+        other => {
+            if dst.exists() {
+                // Another installer published its entry first; ours is stale.
+                let _ = std::fs::remove_dir_all(aside);
+                return other;
+            }
+            match std::fs::rename(aside, dst) {
+                Ok(()) => other,
+                Err(rollback) => Err(io::Error::other(format!(
+                    "could not place the new entry and could not restore the previous one \
+                     (kept at {}): {rollback}",
+                    aside.display()
+                ))),
+            }
         }
     }
 }
@@ -271,7 +309,10 @@ impl Linker {
             .join("node_modules")
             .join(&pkg.name);
 
-        if pkg_nm_dir.exists() {
+        // Under `--force` an existing entry is only trusted when this very
+        // install just placed it.
+        let trust_existing = !self.force || self.fresh_virtual_store_entries.contains(dep_path);
+        if trust_existing && pkg_nm_dir.exists() {
             if !self.fresh_virtual_store_entries.contains(dep_path) {
                 self.reconcile_virtual_store_entry(dep_path, pkg, nested_link_targets)?;
             }
@@ -312,7 +353,16 @@ impl Linker {
             return Err(e);
         }
 
-        match place_materialized_entry(&tmp_entry, &final_entry) {
+        let placement = if self.force && final_entry.exists() {
+            replace_materialized_entry(
+                &tmp_entry,
+                &final_entry,
+                &self.virtual_store.join(materialize_tmp_name()),
+            )
+        } else {
+            place_materialized_entry(&tmp_entry, &final_entry)
+        };
+        match placement {
             Ok(MaterializePlacement::Placed) => {
                 trace!("atomically placed {subdir} in virtual store");
             }
@@ -387,8 +437,7 @@ impl Linker {
                 continue;
             }
             validate_package_link_name(dep_name)?;
-            let dep_dep_path = shared_local_dep_path(dep_name, dep_version)
-                .unwrap_or_else(|| format!("{dep_name}@{dep_version}"));
+            let dep_dep_path = aube_lockfile::dep_edge_key(dep_name, dep_version);
             let target = if let Some(abs_target) =
                 nested_link_targets.and_then(|targets| targets.get(&dep_dep_path))
             {
@@ -420,23 +469,63 @@ impl Linker {
         Ok(targets)
     }
 
+    /// Materialize a per-project `.aube` entry. Under `--force` an existing
+    /// entry is set aside first and only deleted once the replacement is
+    /// complete; if materializing fails, the partial entry is dropped and
+    /// the original is restored.
+    pub(crate) fn materialize_replacing(
+        &self,
+        aube_dir: &Path,
+        dep_path: &str,
+        pkg: &LockedPackage,
+        index: &PackageIndex,
+        stats: &mut LinkStats,
+        nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
+    ) -> Result<(), Error> {
+        let entry = &aube_dir.join(self.aube_dir_entry_name(dep_path));
+        let aside = if self.force && entry.symlink_metadata().is_ok() {
+            let aside = aube_dir.join(materialize_tmp_name());
+            std::fs::rename(entry, &aside).map_err(|e| Error::Io(entry.to_path_buf(), e))?;
+            Some(aside)
+        } else {
+            None
+        };
+        let result = self.materialize_at(
+            entry,
+            aube_dir,
+            dep_path,
+            pkg,
+            index,
+            stats,
+            false,
+            nested_link_targets,
+        );
+        if let Some(aside) = aside {
+            if result.is_ok() {
+                let _ = std::fs::remove_dir_all(&aside);
+            } else {
+                try_remove_entry(entry);
+                if let Err(e) = std::fs::rename(&aside, entry) {
+                    tracing::warn!(
+                        "could not restore {} after a failed --force relink (kept at {}): {e}",
+                        entry.display(),
+                        aside.display()
+                    );
+                }
+            }
+        }
+        result
+    }
+
     /// Materialize a globally-reproducible local source (a `git`
     /// dependency or a remote `.tgz`) into the shared virtual store and
     /// point the per-project `.aube/<dep_path>` entry at it — the exact
     /// arrangement Step 1 produces for a registry package.
     ///
-    /// Used by the isolated linker in global-virtual-store mode. Plain
-    /// `file:` / `link:` / `portal:` / `exec:` sources resolve against
-    /// a path inside the project and are materialized per-project
-    /// instead (see `materialize_at` with `apply_hashes = false`),
-    /// but git and remote-tarball sources are content-pinned and shared
-    /// like registry packages. They MUST live in the shared store when
-    /// it is enabled: a registry dependent in the shared store links
-    /// its dependency siblings to the hashed global path
-    /// (`virtual_store_subdir(dep_path)`), so a git/tarball dep that
-    /// only existed in the per-project `.aube/` would leave that
-    /// sibling symlink dangling — and Node would resolve whatever
-    /// unrelated `<name>` it found walking up the tree.
+    /// Used when both the source and its dependency closure are globally
+    /// shareable, so shared dependents can link to the same global paths.
+    /// Project-relative sources and their dependents instead materialize
+    /// per-project with `apply_hashes = false`.
     pub(crate) fn ensure_shared_local_in_global_store(
         &self,
         aube_dir: &Path,
@@ -448,7 +537,7 @@ impl Linker {
     ) -> Result<(), Error> {
         let local_aube_entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
         let global_entry = self.virtual_store.join(self.virtual_store_subdir(dep_path));
-        let state = classify_entry_state(&local_aube_entry, &global_entry);
+        let state = self.forced_entry_state(classify_entry_state(&local_aube_entry, &global_entry));
         if matches!(state, EntryState::Fresh) {
             self.reconcile_virtual_store_entry(dep_path, pkg, nested_link_targets)?;
             stats.packages_cached += 1;
@@ -747,13 +836,7 @@ impl Linker {
         // a per-project `.aube/<dep_path>` that the caller just
         // ensured is empty), so nothing can be in the way.
         for (dep_name, dep_version) in &pkg.dependencies {
-            // Git / remote-tarball deps are recorded by their resolved
-            // URL spec but keyed in the graph under the short
-            // `name@git+<hash>` / `name@url+<hash>` form. Translate so the
-            // sibling symlink targets the same `dep_path` the package was
-            // materialized under; everything else keeps `name@version`.
-            let dep_dep_path = shared_local_dep_path(dep_name, dep_version)
-                .unwrap_or_else(|| format!("{dep_name}@{dep_version}"));
+            let dep_dep_path = aube_lockfile::dep_edge_key(dep_name, dep_version);
             // Skip any dep whose name matches the package being
             // materialized, regardless of version. The symlink would
             // land at `pkg_nm_parent.join(dep_name)` which is exactly

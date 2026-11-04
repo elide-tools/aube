@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0](https://github.com/aubepkg/aube/compare/aube-settings-v2.8.5...aube-settings-v2.9.0) - 2026-11-01
+
+### Fixed
+
+- *(resolver)* read npm staged-publish approver from _npmUser, require provenance ([#1899](https://github.com/aubepkg/aube/pull/1899))
+
+## [2.8.4](https://github.com/aubepkg/aube/compare/aube-settings-v2.8.3...aube-settings-v2.8.4) - 2026-10-27
+
+### Fixed
+
+- *(install)* keep workspace and native lockfiles usable with --lockfile-dir ([#1856](https://github.com/aubepkg/aube/pull/1856))
+
+## [2.8.2](https://github.com/aubepkg/aube/compare/aube-settings-v2.8.1...aube-settings-v2.8.2) - 2026-10-22
+
+### Fixed
+
+- *(linker)* hidden-hoist shallowest version first like pnpm ([#1815](https://github.com/aubepkg/aube/pull/1815))
+- *(registry)* keep large tarball downloads going while data is flowing ([#1804](https://github.com/aubepkg/aube/pull/1804))
+
+## [2.8.1](https://github.com/aubepkg/aube/compare/aube-settings-v2.8.0...aube-settings-v2.8.1) - 2026-10-20
+
+### Fixed
+
+- *(install)* treat an empty CI env var as not CI ([#1786](https://github.com/aubepkg/aube/pull/1786))
+
+## [2.8.0](https://github.com/aubepkg/aube/compare/aube-settings-v2.7.2...aube-settings-v2.8.0) - 2026-10-19
+
+### Added
+
+- *(install)* add useDefaultTrustedDependencies to opt out of the built-in trust list ([#1767](https://github.com/aubepkg/aube/pull/1767))
+
+## [2.7.2](https://github.com/aubepkg/aube/compare/aube-settings-v2.7.1...aube-settings-v2.7.2) - 2026-10-17
+
+### Fixed
+
+- *(deps)* bump zip to 9 ([#1756](https://github.com/aubepkg/aube/pull/1756))
+
+## [2.7.1](https://github.com/aubepkg/aube/compare/aube-settings-v2.7.0...aube-settings-v2.7.1) - 2026-10-15
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [2.7.0](https://github.com/aubepkg/aube/compare/aube-settings-v2.6.1...aube-settings-v2.7.0) - 2026-10-07
+
+### Other
+
+- refresh benchmarks for v2.6.1 ([#1675](https://github.com/aubepkg/aube/pull/1675))
+
 ## [2.6.1](https://github.com/aubepkg/aube/compare/aube-settings-v2.6.0...aube-settings-v2.6.1) - 2026-09-29
 
 ### Other

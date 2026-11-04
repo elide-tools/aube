@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0](https://github.com/aubepkg/aube/compare/aube-resolver-v2.8.5...aube-resolver-v2.9.0) - 2026-11-01
+
+### Fixed
+
+- *(resolver)* read npm staged-publish approver from _npmUser, require provenance ([#1899](https://github.com/aubepkg/aube/pull/1899))
+- *(resolver)* carry dist.shasum through the metadata primer ([#1892](https://github.com/aubepkg/aube/pull/1892))
+- *(lockfile)* keep yarn classic #sha1 fragments on update and new entries ([#1886](https://github.com/aubepkg/aube/pull/1886))
+
+## [2.8.4](https://github.com/aubepkg/aube/compare/aube-resolver-v2.8.3...aube-resolver-v2.8.4) - 2026-10-27
+
+### Fixed
+
+- *(lockfile)* keep existing npm lock entries intact on unrelated adds ([#1851](https://github.com/aubepkg/aube/pull/1851))
+- *(lockfile)* keep pnpm settings and local tarball metadata on rewrite ([#1857](https://github.com/aubepkg/aube/pull/1857))
+- *(resolver)* match pnpm peer suffixes for peer-cycle providers ([#1859](https://github.com/aubepkg/aube/pull/1859))
+- *(lockfile)* keep npm local dependency specs of linked packages ([#1855](https://github.com/aubepkg/aube/pull/1855))
+- *(lockfile)* write deprecated and unscoped string bin on npm lock entries ([#1858](https://github.com/aubepkg/aube/pull/1858))
+- *(resolver)* keep required peers of locked packages on re-resolve ([#1863](https://github.com/aubepkg/aube/pull/1863))
+- *(resolver)* match pnpm peer suffixes for aliased and out-of-range optional peers ([#1849](https://github.com/aubepkg/aube/pull/1849))
+- *(resolver)* omit a package's own peers from its transitivePeerDependencies ([#1860](https://github.com/aubepkg/aube/pull/1860))
+- *(resolver)* resolve absolute local children of tarball dependencies ([#1852](https://github.com/aubepkg/aube/pull/1852))
+- *(resolver)* write hasInstallScript on new npm lockfile entries ([#1846](https://github.com/aubepkg/aube/pull/1846))
+
+## [2.8.2](https://github.com/aubepkg/aube/compare/aube-resolver-v2.8.1...aube-resolver-v2.8.2) - 2026-10-22
+
+### Fixed
+
+- *(resolver)* keep catalog: specifier when a ranged override targets a catalog ([#1816](https://github.com/aubepkg/aube/pull/1816))
+- *(lockfile)* carry descendant peers through peer-declaring packages like pnpm 11 ([#1805](https://github.com/aubepkg/aube/pull/1805))
+
+## [2.8.1](https://github.com/aubepkg/aube/compare/aube-resolver-v2.8.0...aube-resolver-v2.8.1) - 2026-10-20
+
+### Fixed
+
+- *(lockfile)* omit unreferenced catalog entries from pnpm-lock.yaml ([#1788](https://github.com/aubepkg/aube/pull/1788))
+- *(lockfile)* resolve optional peers like pnpm 11 ([#1793](https://github.com/aubepkg/aube/pull/1793))
+- *(resolver)* honor minimumReleaseAge in update and dedupe on npmjs.org ([#1791](https://github.com/aubepkg/aube/pull/1791))
+- *(lockfile)* sort peer suffix by full name@version like pnpm ([#1792](https://github.com/aubepkg/aube/pull/1792))
+- *(lockfile)* keep npm optional flags and re-resolve file: peers on add ([#1775](https://github.com/aubepkg/aube/pull/1775))
+
+## [2.7.1](https://github.com/aubepkg/aube/compare/aube-resolver-v2.7.0...aube-resolver-v2.7.1) - 2026-10-15
+
+### Fixed
+
+- *(lockfile)* keep resolved peers out of bun.lock dependencies ([#1727](https://github.com/aubepkg/aube/pull/1727))
+- *(resolver)* apply link: overrides to workspace members like pnpm ([#1729](https://github.com/aubepkg/aube/pull/1729))
+
+## [2.7.0](https://github.com/aubepkg/aube/compare/aube-resolver-v2.6.1...aube-resolver-v2.7.0) - 2026-10-07
+
+### Fixed
+
+- *(install)* link workspace peers of file: dependencies ([#1679](https://github.com/aubepkg/aube/pull/1679))
+
+### Other
+
+- refresh benchmarks for v2.6.1 ([#1675](https://github.com/aubepkg/aube/pull/1675))
+
 ## [2.6.1](https://github.com/aubepkg/aube/compare/aube-resolver-v2.6.0...aube-resolver-v2.6.1) - 2026-09-29
 
 ### Fixed

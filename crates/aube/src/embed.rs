@@ -17,6 +17,7 @@ pub use crate::commands::install::{
     InstallProgressSnapshot, InstallPrompt, InstallPromptDecision, InstallPromptDecisionFuture,
     InstallPromptDecisionHandler, InstallPromptFuture, InstallPromptHandler, InstallReporter,
     InstallTaskUnit, set_default_install_control,
+    InstallProvenanceFuture, InstallProvenanceSubject, InstallProvenanceVerifier,
 };
 pub use crate::commands::pm_execpath::CLI_TRAMPOLINE_ARG;
 pub use crate::runtime::{EmbedderRuntime, set_embedder_runtime};

@@ -49,6 +49,7 @@ pub use control::{
     InstallOutputMode, InstallPhase, InstallProgressSnapshot, InstallPrompt, InstallPromptDecision,
     InstallPromptDecisionFuture, InstallPromptDecisionHandler, InstallPromptFuture,
     InstallPromptHandler, InstallReporter, InstallTaskUnit, set_default_install_control,
+    InstallProvenanceFuture, InstallProvenanceSubject, InstallProvenanceVerifier,
 };
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
@@ -70,7 +71,8 @@ pub(crate) fn resolve_active_lockfile_dir(
     manifest: &aube_manifest::PackageJson,
     settings_ctx: &aube_settings::ResolveCtx<'_>,
 ) -> miette::Result<std::path::PathBuf> {
-    layout::resolve_lockfile_location(cwd, manifest, settings_ctx).map(|(dir, _)| dir)
+    layout::resolve_lockfile_location(cwd, manifest, settings_ctx, FrozenMode::No)
+        .map(|(dir, _)| dir)
 }
 use lockfile_dir::{
     parse_lockfile_dir_remapped_with_kind_and_options, write_lockfile_dir_remapped,
@@ -456,6 +458,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         &settings_ctx,
         opts.lockfile_only,
         opts.strict_no_lockfile,
+        mode,
     )?;
 
     if !opts.dry_run {
@@ -547,6 +550,12 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 lifecycle_manifests.iter().map(|(_, manifest)| manifest),
                 &ws_config_shared,
                 dangerously_allow_all_builds,
+                // A nested git-prepare install inherits the outer project's
+                // finished policy, which already holds the defaults when the
+                // outer project wants them. Re-adding them here would undo an
+                // opt-out the scratch clone's settings cannot see.
+                opts.inherited_build_policy.is_none()
+                    && aube_settings::resolved::use_default_trusted_dependencies(&settings_ctx),
             );
             if let Some(inherited) = opts.inherited_build_policy.as_deref() {
                 build_policy.merge(inherited);
@@ -773,7 +782,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             if source_kind_before.is_none()
                 && hidden_lockfile::seed_allowed(mode, opts.strict_no_lockfile) =>
         {
-            lockfile_pre_parse = hidden_lockfile::read(path, lockfile_parse_options)
+            lockfile_pre_parse = hidden_lockfile::read(path, &cwd, lockfile_parse_options)
                 .map(|graph| (graph, aube_lockfile::LockfileKind::Aube));
             lockfile_pre_parse.is_some()
         }
@@ -928,6 +937,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>,
         Vec<String>,
     )>;
+    let prewarm_project_local_dep_paths;
     // The cold-install lockfile write runs on a `spawn_blocking` task so it
     // overlaps `filter_graph` + the link phase (see
     // `lockfile_write_overlap`). The handle escapes the resolve match arm
@@ -1001,8 +1011,9 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 ) {
                     let hidden_graph = graph.clone();
                     let hidden_manifest = manifest.clone();
+                    let hidden_cwd = cwd.clone();
                     hidden_lockfile_write_handle = Some(tokio::task::spawn_blocking(move || {
-                        hidden_lockfile::write(&path, &hidden_graph, &hidden_manifest);
+                        hidden_lockfile::write(&path, &hidden_cwd, &hidden_graph, &hidden_manifest);
                     }));
                 } else {
                     hidden_lockfile::remove(&path);
@@ -1113,10 +1124,13 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 build_policy: lock_build_policy,
             })
             .await?;
+            prewarm_project_local_dep_paths =
+                lock_virtual_store_plan.project_local_dep_paths().cloned();
             let lock_prewarm_inputs = GvsPrewarmInputs {
                 graph: lock_materialize_graph,
                 store: store.clone(),
                 cwd: cwd.clone(),
+                workspace_dirs: ws_dirs.clone(),
                 virtual_store_dir_max_length,
                 link_strategy: lock_strategy,
                 link_concurrency: link_concurrency_setting,
@@ -1126,10 +1140,14 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             };
             let lock_materialize_handle =
                 spawn_gvs_prewarm(lock_prewarm_inputs, lock_materialize_rx);
-            let lock_project_local_dep_paths = if planned_gvs {
-                gvs::legacy_vite_project_local_closure(&graph)
+            let lock_project_local_dep_paths = if planned_gvs
+                && (opts.dep_selection.is_filtered()
+                    || !opts.workspace_filter.is_empty()
+                    || (has_workspace && !link_all_workspace_importers))
+            {
+                std::sync::Arc::new(gvs::project_local_closure(&graph))
             } else {
-                Default::default()
+                prewarm_project_local_dep_paths.clone().unwrap_or_default()
             };
 
             let fetch_result = fetch_packages_with_root(
@@ -1323,7 +1341,12 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             let fetch_ignore_scripts = opts.ignore_scripts;
             let fetch_git_prepare_depth = opts.git_prepare_depth;
             let fetch_inherited_build_policy = inherited_build_policy_for_git_prepare.clone();
-            let fetch_verify_integrity = verify_store_integrity_setting;
+            // The task-local control does not follow `tokio::spawn`, so the
+            // streaming loop holds its own handle to the host's verifier.
+            let fetch_control = opts.control.clone();
+            let fetch_scope_control = opts.control.clone();
+            let fetch_verify_integrity =
+                verify_store_integrity_setting || fetch_control.has_provenance_verifier();
             let fetch_strict_integrity = strict_store_integrity_setting;
             let fetch_strict_pkg_content_check = strict_store_pkg_content_check_setting;
             let fetch_git_shallow_hosts = resolve_git_shallow_hosts(&settings_ctx);
@@ -1527,6 +1550,16 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                         }
                         continue;
                     }
+
+                    // Registry packages go past the host's provenance
+                    // verifier before anything is loaded or downloaded.
+                    fetch_control
+                        .verify_provenance(vec![control::InstallProvenanceSubject::registry(
+                            pkg.registry_name(),
+                            &pkg.version,
+                            pkg.integrity.as_deref(),
+                        )])
+                        .await?;
 
                     // Check index cache first. `registry_name()` is
                     // the real package name on the registry — equal
@@ -1760,6 +1793,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
             });
             let fetch = crate::runtime::scope_current(fetch);
             let fetch = aube_scripts::scope_current(fetch);
+            let fetch = control::scope(fetch_scope_control, fetch);
             let fetch_handle = tokio::spawn(fetch);
 
             // Run resolution (this streams packages to the fetch coordinator).
@@ -1935,6 +1969,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 graph: materialize_graph_arc.clone(),
                 store: store.clone(),
                 cwd: cwd.clone(),
+                workspace_dirs: ws_dirs.clone(),
                 virtual_store_dir_max_length,
                 link_strategy: materialize_strategy,
                 link_concurrency: link_concurrency_setting,
@@ -2152,6 +2187,11 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 &install_ignored_optional,
             );
 
+            // Platform pruning can remove an edge while keeping its target
+            // via another importer. Recompute the final selection on this
+            // surviving graph rather than reusing the prewarm closure.
+            prewarm_project_local_dep_paths = None;
+
             // Reconcile the progress denominator and the running
             // estimated-download total. The streaming pass bumped
             // `inc_total` once per *resolved* package and recorded
@@ -2205,7 +2245,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 let cwd_for_catchup_client = cwd.clone();
                 let catchup_network_mode = opts.network_mode;
                 let project_local_dep_paths = if planned_gvs {
-                    gvs::legacy_vite_project_local_closure(&graph)
+                    gvs::project_local_closure(&graph)
                 } else {
                     Default::default()
                 };
@@ -2263,7 +2303,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                             .into_diagnostic()
                             .wrap_err("failed to write lockfile with computed integrity")?;
                             if let Some(path) = &hidden_lockfile_path {
-                                hidden_lockfile::write(path, lock_graph, &manifest);
+                                hidden_lockfile::write(path, &cwd, lock_graph, &manifest);
                             }
                         } else {
                             write_per_project_lockfiles(
@@ -2404,6 +2444,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         current_subtree_hashes,
         patch_hashes,
         managed_bin_links,
+        bin_link_snapshot,
         gvs_dep_link_targets,
     } = link::run_link_phase(link::LinkPhaseInput {
         cwd: &cwd,
@@ -2418,6 +2459,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         node_version: node_version.as_deref(),
         prewarm_graph_hashes: prewarm_graph_hashes.as_ref(),
         prewarm_placed: prewarm_placed.as_ref(),
+        project_local_dep_paths: prewarm_project_local_dep_paths,
         aube_dir: &aube_dir,
         modules_dir_name: &modules_dir_name,
         virtual_store_dir_max_length,
@@ -2428,6 +2470,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         dep_selection_filtered: opts.dep_selection.is_filtered(),
         workspace_filter_empty: opts.workspace_filter.is_empty(),
         ignore_scripts: opts.ignore_scripts,
+        force: opts.force,
         prog_ref,
         phase_timings: &mut phase_timings,
     })?;
@@ -2459,6 +2502,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         jail_policy: &jail_policy,
         stats: &stats,
         managed_bin_links: &managed_bin_links,
+        bin_link_snapshot,
         gvs_dep_link_targets,
         node_linker,
         has_workspace,

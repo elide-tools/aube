@@ -25,14 +25,20 @@ mod tests;
 
 pub use error::Error;
 pub use hoisted::HoistedPlacements;
-pub use link::build_nested_link_targets;
+pub use link::{
+    build_nested_link_targets, build_workspace_nested_link_targets,
+    project_local_dependency_closure, project_local_dependency_closure_with_seeds,
+};
 pub(crate) use materialize::{
     invalidate_stale_index_for_package, validate_index_key, validate_package_link_name,
 };
 pub use patches::Patches;
 pub(crate) use patches::apply_multi_file_patch;
 pub use pool::default_linker_parallelism;
-pub use sweep::{is_physical_importer, mkdirp, remove_dir_all_with_retry, sweep_stale_tmp_dirs};
+pub use sweep::{
+    dedupe_skips_member_link, is_physical_importer, mkdirp, relocated_importer_dir,
+    remove_dir_all_with_retry, sweep_stale_tmp_dirs,
+};
 pub(crate) use sweep::{sweep_stale_top_level_entries, try_remove_entry};
 pub use sys::{
     BinShimOptions, create_bin_shim, create_dir_link, normalize_path, parse_posix_shim_target,
@@ -100,6 +106,7 @@ pub struct Linker {
     /// virtual store. This is reserved for compatibility transforms
     /// that need to mutate one package without touching shared bytes.
     project_local_dep_paths: rustc_hash::FxHashSet<String>,
+    precomputed_project_local_dep_paths: Option<std::sync::Arc<std::collections::BTreeSet<String>>>,
     /// Dep paths whose global virtual-store entry this install placed
     /// itself moments earlier (the fetch-time prewarm), under the same
     /// graph hashes. Their dependency links were just written from the
@@ -237,6 +244,9 @@ pub struct Linker {
     /// `NodeLinker::Hoisted` — that layout *is* a flat top-level
     /// materialization, so "only the virtual store" doesn't apply.
     virtual_store_only: bool,
+    /// `install --force`: rebuild every virtual-store entry instead of
+    /// trusting entries that already exist on disk.
+    force: bool,
 }
 
 /// Strategy for linking files from the store to node_modules.

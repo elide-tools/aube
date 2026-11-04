@@ -1,14 +1,41 @@
 use crate::LockedPackage;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn version_to_dep_path(name: &str, version: &str) -> String {
     format!("{name}@{version}")
 }
 
 pub(super) fn dep_path_tail<'a>(dep_path: &'a str, name: &str) -> &'a str {
-    dep_path
+    let tail = dep_path
         .strip_prefix(&format!("{name}@"))
-        .unwrap_or(dep_path)
+        .unwrap_or(dep_path);
+    if tail.starts_with("npm:") {
+        let head = tail.split('(').next().unwrap_or(tail);
+        if let Some(separator) = head.rfind('@') {
+            return &tail[separator + 1..];
+        }
+    }
+    tail
+}
+
+pub(super) fn alias_dep_path(
+    name: &str,
+    real_dep_path: &str,
+    version: &str,
+    reserved_package_keys: &BTreeSet<String>,
+) -> String {
+    let qualified = format!("{name}@npm:{real_dep_path}");
+    if reserved_package_keys.contains(&format!("{name}@{version}"))
+        || reserved_package_keys.contains(qualified.split('(').next().unwrap_or(&qualified))
+    {
+        qualified
+    } else {
+        let peer_suffix = real_dep_path
+            .find('(')
+            .map(|index| &real_dep_path[index..])
+            .unwrap_or("");
+        format!("{name}@{version}{peer_suffix}")
+    }
 }
 
 pub(super) fn peerless_dep_path(name: &str, value: &str) -> String {
@@ -66,11 +93,11 @@ fn outer_paren_segments(s: &str) -> Vec<&str> {
 
 /// Rewrite the peer-suffix references of a dep_path (or a dep *value*,
 /// which is a headless `version{suffix}`) by passing each peer
-/// reference's flat `name@version` head through `translate`. The head
+/// reference through `translate` after rewriting its nested suffix. The head
 /// before the first `(` is left untouched — only the parenthesized peer
 /// references are rewritten, and nested suffixes recurse.
 ///
-/// `translate(head)` returns `Some(new_head)` to replace a *flat* peer
+/// `translate(reference)` returns `Some(new_reference)` to replace a peer
 /// reference, or `None` to keep it verbatim. The two boundary passes use
 /// it in opposite directions:
 ///
@@ -80,8 +107,7 @@ fn outer_paren_segments(s: &str) -> Vec<&str> {
 ///   keeping the in-memory graph FS-safe so a round-trip matches a fresh
 ///   resolve byte-for-byte.
 ///
-/// Registry peers (`react@18.2.0`) translate to `None` and pass through
-/// unchanged, so this is a no-op on graphs with no git / tarball peers.
+/// The writer also decorates registry peers with their patch identities.
 pub(super) fn rewrite_peer_suffix(s: &str, translate: &impl Fn(&str) -> Option<String>) -> String {
     let Some(head_end) = s.find('(') else {
         return s.to_string();
@@ -120,8 +146,8 @@ fn warn_unbalanced_peer_suffix(s: &str) {
 /// Rewrite a single peer reference (the contents between one pair of
 /// suffix parens). A flat reference (`request@url+<hash>`) is handed to
 /// `translate`; a reference that carries its own nested suffix
-/// (`request-promise@4.2.6(request@url+<hash>)`) keeps its head and
-/// recurses, so the nested git / tarball peer is still translated.
+/// (`request-promise@4.2.6(request@url+<hash>)`) recurses before translation,
+/// so both the outer peer's patch and the inner peer's source are handled.
 fn rewrite_peer_reference(inner: &str, translate: &impl Fn(&str) -> Option<String>) -> String {
     let Some(nested_start) = inner.find('(') else {
         return translate(inner).unwrap_or_else(|| inner.to_string());
@@ -138,7 +164,7 @@ fn rewrite_peer_reference(inner: &str, translate: &impl Fn(&str) -> Option<Strin
         out.push_str(&rewrite_peer_reference(&seg[1..seg.len() - 1], translate));
         out.push(')');
     }
-    out
+    translate(&out).unwrap_or(out)
 }
 
 pub(super) fn peerless_alias_target<'a>(
@@ -210,38 +236,26 @@ pub(super) fn registry_name_from_qualified_version(version: &str) -> Option<&str
     Some(registry_name)
 }
 
-/// Detect npm-aliased entries inside a snapshot's `dependencies` /
-/// `optionalDependencies` map and rewrite them to aube's internal shape.
-///
-/// pnpm encodes a transitive npm alias as `<alias>: <real>@<resolved>(peers…)`
-/// (e.g. `@isaacs/cliui@8.0.2` records `string-width-cjs: string-width@4.2.3`
-/// for its `"string-width-cjs": "npm:string-width@^4.2.0"` dep). Aube's
-/// linker keys sibling symlinks against `<dep_name>@<dep_value>`, so a raw
-/// pnpm value yields a broken `string-width-cjs@string-width@4.2.3` virtual
-/// store path. This helper rewrites the value to the bare resolved version
-/// (preserving any peer-context suffix) and pushes onto `alias_remaps` so
-/// the synthesis loop creates a `<alias>@<resolved>` `LockedPackage` with
-/// `alias_of=Some(real)`. After that the linker resolves the alias symlink
-/// to the synthetic dir and the resolver's lockfile-reuse path enqueues
-/// transitives with `range = <resolved>` (not the malformed
-/// `<real>@<resolved>` that no `<alias>` packument can satisfy).
+/// Rewrite registry alias references to synthetic graph keys, preserving colliding targets.
 pub(super) fn rewrite_snapshot_alias_deps(
     deps: &mut BTreeMap<String, String>,
     alias_remaps: &mut Vec<(String, String, String, String)>,
+    reserved_package_keys: &BTreeSet<String>,
 ) {
     for (dep_name, dep_value) in deps.iter_mut() {
-        let bare = dep_value.split('(').next().unwrap_or(dep_value);
+        let reference = dep_value.strip_prefix("npm:").unwrap_or(dep_value);
+        let bare = reference.split('(').next().unwrap_or(reference);
         let Some((real_name, resolved)) = parse_dep_path(bare) else {
             continue;
         };
         if real_name == *dep_name {
             continue;
         }
-        let peer_suffix = dep_value.find('(').map(|i| &dep_value[i..]).unwrap_or("");
-        let alias_dep_path = format!("{dep_name}@{resolved}{peer_suffix}");
-        let real_dep_path = dep_value.clone();
+        let real_dep_path = reference.to_string();
+        let alias_dep_path =
+            alias_dep_path(dep_name, &real_dep_path, &resolved, reserved_package_keys);
+        *dep_value = alias_dep_path[dep_name.len() + 1..].to_string();
         alias_remaps.push((alias_dep_path, real_dep_path, dep_name.clone(), real_name));
-        *dep_value = format!("{resolved}{peer_suffix}");
     }
 }
 

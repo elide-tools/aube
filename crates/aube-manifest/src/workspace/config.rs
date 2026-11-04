@@ -33,6 +33,22 @@ pub fn workspace_yaml_names() -> &'static [&'static str] {
     })
 }
 
+fn bool_or_ignored_map<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrMap {
+        Bool(bool),
+        Map(#[allow(dead_code)] BTreeMap<String, yaml_serde::Value>),
+    }
+    Ok(match Option::<BoolOrMap>::deserialize(deserializer)? {
+        Some(BoolOrMap::Bool(b)) => Some(b),
+        Some(BoolOrMap::Map(_)) | None => None,
+    })
+}
+
 fn find_and_read(project_dir: &Path) -> Result<Option<(PathBuf, String)>, crate::Error> {
     for name in workspace_yaml_names().iter().copied() {
         let path = project_dir.join(name);
@@ -196,8 +212,10 @@ pub struct WorkspaceConfig {
     pub global_virtual_store_dir: Option<String>,
 
     // -- Lockfile Settings --
-    /// Whether to use a lockfile (default: true).
-    #[serde(default)]
+    /// Whether to use a lockfile (default: true). pnpm also accepts a
+    /// nested settings map here (`lockfile.includeResolutionSettings`);
+    /// that form is tolerated and reads as unset.
+    #[serde(default, deserialize_with = "bool_or_ignored_map")]
     pub lockfile: Option<bool>,
 
     /// Format to create when no supported lockfile exists: "aube" or
@@ -637,17 +655,131 @@ pub struct WorkspaceConfig {
 /// pnpm-workspace.yaml. Same three-axis shape pnpm uses; each entry
 /// can be a concrete token (`"linux"`) or the literal `"current"`,
 /// which the resolver expands to the host triple.
-#[derive(Debug, Clone, Default, Deserialize)]
+///
+/// pnpm 12.5 also accepts a flat platform list (`linux-x64`,
+/// `linux-x64-musl`, `aarch64-apple-darwin`, `current`). Aube's
+/// filter works on the three axes, so a list is folded into the union
+/// of its entries' axes.
+#[derive(Debug, Clone, Default)]
 pub struct SupportedArchitectures {
-    #[serde(default)]
     pub os: Vec<String>,
-    #[serde(default)]
     pub cpu: Vec<String>,
-    #[serde(default)]
     pub libc: Vec<String>,
 }
 
+impl<'de> Deserialize<'de> for SupportedArchitectures {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Axes {
+                #[serde(default)]
+                os: Vec<String>,
+                #[serde(default)]
+                cpu: Vec<String>,
+                #[serde(default)]
+                libc: Vec<String>,
+            },
+            List(Vec<String>),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Axes { os, cpu, libc } => Self { os, cpu, libc },
+            Raw::List(entries) => Self::from_platforms(&entries),
+        })
+    }
+}
+
 impl SupportedArchitectures {
+    /// Fold pnpm's platform-list form into per-axis sets. Entries are
+    /// `<os>-<cpu>[-<libc>]` or Rust target triples; unrecognized
+    /// entries are skipped.
+    fn from_platforms(entries: &[String]) -> Self {
+        fn push(axis: &mut Vec<String>, value: &str) {
+            if !axis.iter().any(|v| v == value) {
+                axis.push(value.to_string());
+            }
+        }
+        fn libc_token(token: &str) -> Option<&'static str> {
+            match token {
+                t if t.starts_with("musl") => Some("musl"),
+                t if t.starts_with("gnu") || t == "glibc" => Some("glibc"),
+                t if t.starts_with("manylinux") => Some("glibc"),
+                _ => None,
+            }
+        }
+        fn rust_cpu(arch: &str) -> &str {
+            match arch {
+                "x86_64" => "x64",
+                "aarch64" => "arm64",
+                "i386" | "i486" | "i586" | "i686" => "ia32",
+                "powerpc" => "ppc",
+                "powerpc64" | "powerpc64le" => "ppc64",
+                "riscv64gc" | "riscv64imac" => "riscv64",
+                a if a.starts_with("arm") || a.starts_with("thumb") => "arm",
+                other => other,
+            }
+        }
+        let mut out = Self::default();
+        for entry in entries {
+            if entry == "current" {
+                for axis in [&mut out.os, &mut out.cpu, &mut out.libc] {
+                    push(axis, "current");
+                }
+                continue;
+            }
+            let parts: Vec<&str> = entry.split('-').collect();
+            let is_node_os = matches!(
+                parts[0],
+                "linux"
+                    | "darwin"
+                    | "win32"
+                    | "freebsd"
+                    | "openbsd"
+                    | "netbsd"
+                    | "sunos"
+                    | "aix"
+                    | "android"
+            );
+            let (os, cpu, libc) = if parts.len() >= 3 && !is_node_os {
+                // Rust triple: <arch>[-<vendor>]-<os>[-<env>], vendor free-form
+                let Some(at) = parts[1..].iter().position(|p| {
+                    matches!(
+                        *p,
+                        "linux"
+                            | "darwin"
+                            | "windows"
+                            | "freebsd"
+                            | "openbsd"
+                            | "netbsd"
+                            | "solaris"
+                            | "illumos"
+                    )
+                }) else {
+                    continue;
+                };
+                let at = at + 1;
+                let env = parts.get(at + 1).copied();
+                let os = match parts[at] {
+                    "windows" => "win32",
+                    "solaris" | "illumos" => "sunos",
+                    "linux" if env.is_some_and(|e| e.starts_with("android")) => "android",
+                    other => other,
+                };
+                (os, rust_cpu(parts[0]), env.and_then(libc_token))
+            } else if parts.len() >= 2 {
+                (parts[0], parts[1], parts.get(2).and_then(|t| libc_token(t)))
+            } else {
+                continue;
+            };
+            push(&mut out.os, os);
+            push(&mut out.cpu, cpu);
+            if os == "linux" {
+                push(&mut out.libc, libc.unwrap_or("glibc"));
+            }
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.os.is_empty() && self.cpu.is_empty() && self.libc.is_empty()
     }
@@ -900,5 +1032,22 @@ pub fn config_write_target(project_dir: &Path) -> ConfigWriteTarget {
     match workspace_yaml_existing(project_dir) {
         Some(path) => ConfigWriteTarget::WorkspaceYaml(path),
         None => ConfigWriteTarget::PackageJson,
+    }
+}
+
+#[cfg(test)]
+mod lockfile_setting_tests {
+    use super::*;
+
+    #[test]
+    fn lockfile_accepts_bool_and_nested_settings_map() {
+        let cfg: WorkspaceConfig = yaml_serde::from_str("lockfile: false\n").unwrap();
+        assert_eq!(cfg.lockfile, Some(false));
+
+        let cfg: WorkspaceConfig = yaml_serde::from_str(
+            "packages:\n  - apps/*\nlockfile:\n  includeResolutionSettings: true\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.lockfile, None);
     }
 }

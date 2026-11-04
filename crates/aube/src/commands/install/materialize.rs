@@ -7,6 +7,7 @@ pub(super) struct GvsPrewarmInputs {
     pub graph: std::sync::Arc<aube_lockfile::LockfileGraph>,
     pub store: std::sync::Arc<aube_store::Store>,
     pub cwd: std::path::PathBuf,
+    pub workspace_dirs: std::collections::BTreeMap<String, std::path::PathBuf>,
     pub virtual_store_dir_max_length: usize,
     pub link_strategy: aube_linker::LinkStrategy,
     pub link_concurrency: Option<usize>,
@@ -39,6 +40,7 @@ pub(super) enum VirtualStorePlan {
     Global {
         virtual_store: std::path::PathBuf,
         hashes: std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>,
+        project_local: std::sync::Arc<std::collections::BTreeSet<String>>,
     },
     /// `.aube/<dep_path>` entries are per-project directories keyed by
     /// dep_path alone. Only unchanged subtrees survive the link phase's
@@ -65,6 +67,7 @@ impl VirtualStorePlan {
             Self::Global {
                 virtual_store,
                 hashes,
+                ..
             } => {
                 let expected = virtual_store.join(dep_path_to_filename(
                     &hashes.hashed_dep_path(dep_path),
@@ -78,6 +81,15 @@ impl VirtualStorePlan {
                     && entry.exists()
             }
             Self::PerProject { reusable } => reusable.contains(dep_path) && entry.exists(),
+        }
+    }
+
+    pub(super) fn project_local_dep_paths(
+        &self,
+    ) -> Option<&std::sync::Arc<std::collections::BTreeSet<String>>> {
+        match self {
+            Self::Global { project_local, .. } => Some(project_local),
+            Self::PerProject { .. } => None,
         }
     }
 
@@ -185,7 +197,7 @@ pub(super) async fn plan_virtual_store(
     );
     // CPU-bound BLAKE3 walk over every package; keep it off the tokio
     // worker so the caller's remaining setup keeps making progress.
-    let hashes = tokio::task::spawn_blocking(move || {
+    let (hashes, project_local) = tokio::task::spawn_blocking(move || {
         let _diag = aube_util::diag::Span::new(
             aube_util::diag::Category::Materialize,
             "graph_hash_compute",
@@ -197,12 +209,13 @@ pub(super) async fn plan_virtual_store(
             let key = format!("{name}@{version}");
             patch_hashes.get(&key).cloned()
         };
-        aube_lockfile::graph_hash::compute_graph_hashes_with_patches(
+        let hashes = aube_lockfile::graph_hash::compute_graph_hashes_with_patches(
             &graph,
             &allow,
             engine.as_ref(),
             &patch_hash_fn,
-        )
+        );
+        (hashes, super::gvs::project_local_closure(&graph))
     })
     .await
     .into_diagnostic()
@@ -211,6 +224,7 @@ pub(super) async fn plan_virtual_store(
     Ok(VirtualStorePlan::Global {
         virtual_store,
         hashes: std::sync::Arc::new(hashes),
+        project_local: std::sync::Arc::new(project_local),
     })
 }
 
@@ -299,6 +313,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
         graph,
         store,
         cwd,
+        workspace_dirs,
         virtual_store_dir_max_length,
         link_strategy,
         link_concurrency,
@@ -315,12 +330,20 @@ pub(super) async fn run_gvs_prewarm_materializer(
         probe = probe.with_use_global_virtual_store(enabled);
     }
     let Some(graph_hashes_arc) = virtual_store_plan.hashes().cloned() else {
-        return run_aube_dir_materializer(probe, graph, cwd, link_concurrency, materialize_rx)
-            .await;
+        return run_aube_dir_materializer(
+            probe,
+            graph,
+            cwd,
+            &workspace_dirs,
+            link_concurrency,
+            materialize_rx,
+        )
+        .await;
     };
 
     let nested_link_targets =
-        aube_linker::build_nested_link_targets(&cwd, &graph).map(std::sync::Arc::new);
+        aube_linker::build_workspace_nested_link_targets(&cwd, &graph, &workspace_dirs)
+            .map(std::sync::Arc::new);
 
     // Channel emits `pkg.dep_path` (canonical on resolver first-pass,
     // contextualized on post-pass). When the received key is canonical
@@ -336,7 +359,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
         if pkg.local_source.is_some() {
             continue;
         }
-        let canonical = pkg.spec_key();
+        let canonical = pkg.canonical_dep_path();
         if canonical != *dep_path {
             canonical_to_contextualized
                 .entry(canonical)
@@ -356,6 +379,10 @@ pub(super) async fn run_gvs_prewarm_materializer(
     // whole set to the link phase, which materializes every node at its
     // final content-ful path.
     let content_affected = aube_lockfile::graph_hash::content_affected_dep_paths(&graph);
+    let project_local = virtual_store_plan
+        .project_local_dep_paths()
+        .cloned()
+        .unwrap_or_default();
 
     aube_util::diag::instant(
         aube_util::diag::Category::Materialize,
@@ -427,7 +454,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
             if pkg.local_source.is_some() {
                 continue;
             }
-            if content_affected.contains(&dep_path) {
+            if content_affected.contains(&dep_path) || project_local.contains(&dep_path) {
                 continue;
             }
             let linker = linker.clone();
@@ -514,13 +541,15 @@ async fn run_aube_dir_materializer(
     linker: aube_linker::Linker,
     graph: std::sync::Arc<aube_lockfile::LockfileGraph>,
     cwd: std::path::PathBuf,
+    workspace_dirs: &std::collections::BTreeMap<String, std::path::PathBuf>,
     link_concurrency: Option<usize>,
     materialize_rx: tokio::sync::mpsc::Receiver<(String, aube_store::PackageIndex)>,
 ) -> miette::Result<PrewarmOutcome> {
     let aube_dir = std::sync::Arc::new(linker.aube_dir_for(&cwd));
     aube_linker::mkdirp(&aube_dir).map_err(|e| miette!("create {}: {e}", aube_dir.display()))?;
     let nested_link_targets =
-        aube_linker::build_nested_link_targets(&cwd, &graph).map(std::sync::Arc::new);
+        aube_linker::build_workspace_nested_link_targets(&cwd, &graph, workspace_dirs)
+            .map(std::sync::Arc::new);
 
     // Channel emits `pkg.dep_path` (canonical on the resolver's
     // first-pass packages, contextualized on post-pass). When the
@@ -537,7 +566,7 @@ async fn run_aube_dir_materializer(
         if pkg.local_source.is_some() {
             continue;
         }
-        let canonical = pkg.spec_key();
+        let canonical = pkg.canonical_dep_path();
         if canonical != *dep_path {
             canonical_to_contextualized
                 .entry(canonical)

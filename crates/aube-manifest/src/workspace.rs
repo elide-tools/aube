@@ -145,6 +145,76 @@ supportedArchitectures:
     }
 
     #[test]
+    fn test_supported_architectures_platform_list() {
+        let yaml = r#"
+supportedArchitectures:
+  - darwin-arm64
+  - linux-x64-manylinux_2_28
+  - linux-arm64-musl
+  - x86_64-pc-windows-msvc
+  - aarch64-unknown-linux-gnu
+  - current
+"#;
+        let config: WorkspaceConfig = yaml_serde::from_str(yaml).unwrap();
+        let sa = config.supported_architectures.as_ref().unwrap();
+        assert_eq!(sa.os, vec!["darwin", "linux", "win32", "current"]);
+        assert_eq!(sa.cpu, vec!["arm64", "x64", "current"]);
+        assert_eq!(sa.libc, vec!["glibc", "musl", "current"]);
+    }
+
+    #[test]
+    fn test_supported_architectures_rust_triple_cpu_names() {
+        let yaml = r#"
+supportedArchitectures:
+  - armv7-unknown-linux-gnueabihf
+  - powerpc64le-unknown-linux-gnu
+"#;
+        let config: WorkspaceConfig = yaml_serde::from_str(yaml).unwrap();
+        let sa = config.supported_architectures.as_ref().unwrap();
+        assert_eq!(sa.cpu, vec!["arm", "ppc64"]);
+        assert_eq!(sa.libc, vec!["glibc"]);
+    }
+
+    #[test]
+    fn test_supported_architectures_rust_musl_suffixes() {
+        let yaml = r#"
+supportedArchitectures:
+  - arm-unknown-linux-musleabihf
+"#;
+        let config: WorkspaceConfig = yaml_serde::from_str(yaml).unwrap();
+        let sa = config.supported_architectures.as_ref().unwrap();
+        assert_eq!(sa.cpu, vec!["arm"]);
+        assert_eq!(sa.libc, vec!["musl"]);
+    }
+
+    #[test]
+    fn test_supported_architectures_vendorless_android_triple() {
+        let yaml = r#"
+supportedArchitectures:
+  - aarch64-linux-android
+"#;
+        let config: WorkspaceConfig = yaml_serde::from_str(yaml).unwrap();
+        let sa = config.supported_architectures.as_ref().unwrap();
+        assert_eq!(sa.os, vec!["android"]);
+        assert_eq!(sa.cpu, vec!["arm64"]);
+        assert!(sa.libc.is_empty());
+    }
+
+    #[test]
+    fn test_supported_architectures_nonstandard_vendor_triple() {
+        let yaml = r#"
+supportedArchitectures:
+  - x86_64-oe-linux-gnu
+  - linux-x64-musl
+"#;
+        let config: WorkspaceConfig = yaml_serde::from_str(yaml).unwrap();
+        let sa = config.supported_architectures.as_ref().unwrap();
+        assert_eq!(sa.os, vec!["linux"]);
+        assert_eq!(sa.cpu, vec!["x64"]);
+        assert_eq!(sa.libc, vec!["glibc", "musl"]);
+    }
+
+    #[test]
     fn test_ignored_optional_dependencies() {
         let yaml = r#"
 ignoredOptionalDependencies:

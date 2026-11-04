@@ -33,6 +33,35 @@ EOF
 	assert_file_exists node_modules/is-odd/index.js
 }
 
+@test "aube add -C: bootstraps the named directory instead of an ancestor manifest" {
+	mkdir -p outer/staging dep
+	echo '{"name":"outer","private":true}' >outer/package.json
+	echo '{"name":"dep","version":"1.0.0"}' >dep/package.json
+
+	run aube add "file:$PWD/dep" -C outer/staging
+	assert_success
+
+	run grep -c '"dep"' outer/staging/package.json
+	assert_output 1
+	run grep -c '"dep"' outer/package.json
+	assert_output 0
+	assert_file_exists outer/staging/aube-lock.yaml
+	assert_file_exists outer/staging/node_modules/dep/package.json
+	assert_file_not_exists outer/aube-lock.yaml
+	assert_file_not_exists outer/node_modules
+}
+
+@test "aube add -C: installs into the named directory outside a workspace's packages" {
+	mkdir -p outer/staging dep
+	echo '{"name":"outer","private":true,"workspaces":["packages/*"]}' >outer/package.json
+	echo '{"name":"dep","version":"1.0.0"}' >dep/package.json
+
+	run aube add "file:$PWD/dep" -C outer/staging
+	assert_success
+	assert_file_exists outer/staging/node_modules/dep/package.json
+	assert_file_not_exists outer/node_modules/dep
+}
+
 @test "aube add: adds dev dependency with -D" {
 	cat >package.json <<'EOF'
 {
@@ -395,6 +424,54 @@ EOF
 	refute_output --partial 'is-odd'
 }
 
+@test "aube remove drops the removed dependency's .bin shim" {
+	# A leftover shim would outlive the package it launches and shadow a
+	# same-named command further down PATH.
+	cat >package.json <<'EOF'
+{
+  "name": "test-remove-bin",
+  "version": "0.0.0"
+}
+EOF
+
+	run aube add semver@7.7.4
+	assert_success
+	assert_file_exists node_modules/.bin/semver
+
+	run aube remove semver
+	assert_success
+	[ ! -e node_modules/.bin/semver ]
+	[ ! -L node_modules/.bin/semver ]
+}
+
+@test "aube install drops the .bin shim of a dependency deleted from the manifest" {
+	cat >package.json <<'EOF'
+{
+  "name": "test-install-stale-bin",
+  "version": "0.0.0",
+  "dependencies": {
+    "semver": "7.7.4"
+  }
+}
+EOF
+
+	run aube install
+	assert_success
+	assert_file_exists node_modules/.bin/semver
+
+	cat >package.json <<'EOF'
+{
+  "name": "test-install-stale-bin",
+  "version": "0.0.0"
+}
+EOF
+
+	run aube install
+	assert_success
+	[ ! -e node_modules/.bin/semver ]
+	[ ! -L node_modules/.bin/semver ]
+}
+
 @test "aube add: refuses to add to workspace root without -W" {
 	cat >package.json <<'EOF'
 {
@@ -733,4 +810,16 @@ JSON
 
 	[ -L node_modules/local-dep ]
 	assert_file_exists node_modules/local-dep/package.json
+}
+
+@test "aube add -C: workspace member installs at the workspace root" {
+	mkdir -p ws/packages/app dep
+	echo '{"name":"ws","private":true,"workspaces":["packages/*"]}' >ws/package.json
+	echo '{"name":"app","version":"1.0.0"}' >ws/packages/app/package.json
+	echo '{"name":"dep","version":"1.0.0"}' >dep/package.json
+
+	run aube add "file:$PWD/dep" -C ws/packages/app
+	assert_success
+	assert_file_exists ws/aube-lock.yaml
+	assert_file_not_exists ws/packages/app/aube-lock.yaml
 }
