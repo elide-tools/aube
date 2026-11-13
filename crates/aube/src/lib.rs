@@ -181,6 +181,13 @@ pub(crate) struct Cli {
     #[usage(long, global)]
     no_color: bool,
 
+    /// Leave the workspace root out of recursive workspace operations.
+    ///
+    /// Overrides `--include-workspace-root` and `includeWorkspaceRoot`. The npm shim adds it
+    /// for `npm --workspaces`, which never selects the root package.
+    #[usage(long, global, hide)]
+    no_include_workspace_root: bool,
+
     /// Output format: default, append-only, ndjson, silent.
     ///
     /// `default` renders the progress UI when stderr is a TTY;
@@ -1197,6 +1204,7 @@ async fn async_main(cli: Cli, replace_process: bool) -> miette::Result<Option<i3
 
     // `--recursive` / `-r` is sugar for `--filter=*`. When a filter is
     // already set, `-r` is a no-op — the explicit scope wins.
+    aube_workspace::selector::set_exclude_workspace_root(cli.no_include_workspace_root);
     let effective_filter = compute_effective_filter(&cli);
 
     commands::set_global_output_flags(commands::GlobalOutputFlags {
@@ -1371,6 +1379,9 @@ async fn async_main(cli: Cli, replace_process: bool) -> miette::Result<Option<i3
                     )
                 )
             })?;
+            aube_workspace::selector::set_exclude_workspace_root(
+                cli.no_include_workspace_root || nested.no_include_workspace_root,
+            );
             let nested_filter = compute_effective_filter(&nested);
             match nested.command {
                 Some(Commands::Add(args)) => {
@@ -2097,6 +2108,127 @@ mod multicall_tests {
     }
 
     #[test]
+    fn npm_workspace_flags_select_packages_instead_of_reaching_the_root_script() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["npm", "run", "build", "--workspace=@t/c"],
+                &["aube", "--filter", "@t/c", "run", "build"],
+            ),
+            (
+                &["npm", "run", "build", "-w", "@t/c", "-w@t/d"],
+                &[
+                    "aube", "--filter", "@t/c", "--filter", "@t/d", "run", "build",
+                ],
+            ),
+            (
+                &["npm", "run", "build", "--workspaces", "--if-present"],
+                &[
+                    "aube",
+                    "-r",
+                    "--no-include-workspace-root",
+                    "run",
+                    "build",
+                    "--if-present",
+                ],
+            ),
+            (&["npm", "test", "--workspaces=false"], &["aube", "test"]),
+            (
+                &[
+                    "npm",
+                    "run",
+                    "build",
+                    "--workspaces",
+                    "--",
+                    "--include-workspace-root",
+                ],
+                &[
+                    "aube",
+                    "-r",
+                    "--no-include-workspace-root",
+                    "run",
+                    "build",
+                    "--",
+                    "--include-workspace-root",
+                ],
+            ),
+            (
+                &[
+                    "npm",
+                    "--include-workspace-root=true",
+                    "run",
+                    "build",
+                    "--workspaces",
+                ],
+                &[
+                    "aube",
+                    "-r",
+                    "--include-workspace-root=true",
+                    "run",
+                    "build",
+                ],
+            ),
+            (
+                &["npm", "--silent", "run", "build", "--workspaces"],
+                &[
+                    "aube",
+                    "-r",
+                    "--no-include-workspace-root",
+                    "--silent",
+                    "run",
+                    "build",
+                ],
+            ),
+            (
+                &["npm", "exec", "--workspace", "@t/c", "--", "tsc"],
+                &["aube", "--filter", "@t/c", "exec", "--", "tsc"],
+            ),
+            (
+                &["npm", "run-script", "build", "--workspaces"],
+                &["aube", "-r", "--no-include-workspace-root", "run", "build"],
+            ),
+            (
+                &["npm", "--prefix", ".", "run", "build", "--workspaces"],
+                &[
+                    "aube",
+                    "-r",
+                    "--no-include-workspace-root",
+                    "--prefix",
+                    ".",
+                    "run",
+                    "build",
+                ],
+            ),
+            (
+                &["npm", "--prefix", ".", "rum", "build", "-w", "app"],
+                &["aube", "--filter", "app", "--prefix", ".", "run", "build"],
+            ),
+            (
+                &["npm", "--prefix", ".", "urn", "build", "-w", "app"],
+                &["aube", "--filter", "app", "--prefix", ".", "run", "build"],
+            ),
+            (
+                &["npm", "--prefix", ".", "run-script", "build", "-w", "app"],
+                &["aube", "--filter", "app", "--prefix", ".", "run", "build"],
+            ),
+            (
+                &["npm", "-w", "@t/c", "run", "build"],
+                &["aube", "--filter", "@t/c", "run", "build"],
+            ),
+            (
+                &["npm", "run", "build", "-w", "packages/child"],
+                &["aube", "--filter", "./packages/child", "run", "build"],
+            ),
+            (
+                &["npm", "run", "echo", "--", "--workspaces", "-w"],
+                &["aube", "run", "echo", "--", "--workspaces", "-w"],
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(rewrite_multicall_argv(os(input)), os(expected), "{input:?}");
+        }
+    }
+
+    #[test]
     fn npm_legacy_peer_deps_becomes_auto_install_peers_override() {
         assert_eq!(
             rewrite_multicall_argv(os(&[
@@ -2137,6 +2269,69 @@ mod multicall_tests {
         assert_eq!(
             rewrite_multicall_argv(os(&["npm", "run", "x", "--", "--legacy-peer-deps"])),
             os(&["aube", "run", "x", "--", "--legacy-peer-deps"])
+        );
+    }
+
+    #[test]
+    fn npm_audit_and_fund_flags_are_dropped_for_install_commands() {
+        assert_eq!(
+            rewrite_multicall_argv(os(&[
+                "npm",
+                "install",
+                "--no-audit",
+                "--no-fund",
+                "--",
+                "input-otp"
+            ])),
+            os(&["aube", "add", "--", "input-otp"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "i", "--audit=false", "--fund", "pkg"])),
+            os(&["aube", "add", "pkg"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "ci", "--no-audit", "--fund=false"])),
+            os(&["aube", "ci"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "--no-audit", "--no-fund", "install"])),
+            os(&["aube", "install"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "--no-audit", "uninstall", "pkg"])),
+            os(&["aube", "remove", "pkg"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "install", "--", "--no-audit"])),
+            os(&["aube", "add", "--", "--no-audit"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "install", "--audit", "false"])),
+            os(&["aube", "install"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "install", "--fund", "true", "pkg"])),
+            os(&["aube", "add", "pkg"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "install", "--audit=true", "--fund=true"])),
+            os(&["aube", "install"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "rm", "--no-audit", "react"])),
+            os(&["aube", "remove", "react"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "--audit", "false", "install", "pkg"])),
+            os(&["aube", "add", "pkg"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "--prefix", "ci", "run", "check", "--no-audit"])),
+            os(&["aube", "--prefix", "ci", "run", "check", "--no-audit"])
+        );
+        assert_eq!(
+            rewrite_multicall_argv(os(&["npm", "run", "x", "--no-audit"])),
+            os(&["aube", "run", "x", "--no-audit"])
         );
     }
 
