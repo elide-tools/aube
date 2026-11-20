@@ -35,7 +35,7 @@ panic = "unwind"
 strip = "debuginfo"
 
 [workspace.package]
-version = "2.10.0"
+version = "2.10.1"
 edition = "2024"
 # Kept at the floor mise can build with (its distro packaging pins the
 # toolchain) so mise can embed the library crates. CI enforces this via
@@ -99,13 +99,6 @@ hex = "0.4"
 # Filesystem
 xx = { version = "2", features = ["fslock"] }
 reflink-copy = "0.1"
-# OS-level transparent per-file compression (APFS decmpfs / btrfs / NTFS)
-# applied to native addons as they land in the CAS. The `addon` feature
-# unwraps a napi `--compress` hybrid back to the raw `.node` before the
-# kernel re-compresses it transparently.
-# 0.1.2-0.1.4 fail to compile for *-unknown-linux-musl (FICLONE ioctl request
-# typed as `libc::c_ulong`); 0.1.5 carries the fix.
-decmpfs = { version = "=0.1.5", features = ["addon"] }
 glob = "0.3"
 # BurntSushi's gitignore matcher (from ripgrep). Used by `aube pack` /
 # `aube publish` to honor `.npmignore` / `.gitignore` with full
@@ -152,6 +145,11 @@ ambient-id = "=0.0.11"
 thiserror = "2"
 miette = { version = "7", features = ["fancy"] }
 libc = "0.2"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }
 seccompiler = "0.5"
 
 # Progress UI
@@ -193,24 +191,19 @@ diffy = "0.5"
 # Internal crates — `version` is required so `cargo publish` can resolve
 # transitive crate dependencies via crates.io. release-plz keeps these
 # versions in sync with [workspace.package].version during release PRs.
-aube = { path = "crates/aube", version = "2.10.0", default-features = false }
-aube-codes = { path = "crates/aube-codes", version = "2.10.0" }
-aube-settings = { path = "crates/aube-settings", version = "2.10.0" }
-aube-resolver = { path = "crates/aube-resolver", version = "2.10.0" }
-aube-registry = { path = "crates/aube-registry", version = "2.10.0" }
-aube-store = { path = "crates/aube-store", version = "2.10.0" }
-aube-linker = { path = "crates/aube-linker", version = "2.10.0" }
-aube-lockfile = { path = "crates/aube-lockfile", version = "2.10.0" }
-aube-manifest = { path = "crates/aube-manifest", version = "2.10.0", default-features = false }
-aube-runtime = { path = "crates/aube-runtime", version = "2.10.0" }
-aube-scripts = { path = "crates/aube-scripts", version = "2.10.0" }
-aube-workspace = { path = "crates/aube-workspace", version = "2.10.0" }
-aube-util = { path = "crates/aube-util", version = "2.10.0" }
+aube = { path = "crates/aube", version = "2.10.1", default-features = false }
+aube-codes = { path = "crates/aube-codes", version = "2.10.1" }
+aube-settings = { path = "crates/aube-settings", version = "2.10.1" }
+aube-resolver = { path = "crates/aube-resolver", version = "2.10.1" }
+aube-registry = { path = "crates/aube-registry", version = "2.10.1" }
+aube-store = { path = "crates/aube-store", version = "2.10.1" }
+aube-linker = { path = "crates/aube-linker", version = "2.10.1" }
+aube-lockfile = { path = "crates/aube-lockfile", version = "2.10.1" }
+aube-manifest = { path = "crates/aube-manifest", version = "2.10.1", default-features = false }
+aube-runtime = { path = "crates/aube-runtime", version = "2.10.1" }
+aube-scripts = { path = "crates/aube-scripts", version = "2.10.1" }
+aube-workspace = { path = "crates/aube-workspace", version = "2.10.1" }
+aube-util = { path = "crates/aube-util", version = "2.10.1" }
 
 [profile.dev]
 debug = 1
-
-[patch.crates-io]
-# Same compatibility fork used by Elide: permit patched zstd releases instead
-# of decmpfs 0.1.5's exact vulnerable 0.13.3 pin. Retire after an upstream release.
-decmpfs = { git = "https://github.com/elide-tools/decmpfs.git", rev = "55e417d499b20031a708a12bb31b08f12e4c20ac" }

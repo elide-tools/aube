@@ -81,11 +81,13 @@ use materialize::{
     GvsPrewarmInputs, VirtualStorePlanInputs, combine_install_pipeline_errors, materialize_channel,
     plan_virtual_store, spawn_gvs_prewarm,
 };
-pub(crate) use settings::PeerDependencyRules;
-pub(crate) use settings::resolve_catalog_prune;
 pub(crate) use settings::resolve_minimum_release_age;
+pub(crate) use settings::{PeerDependencyRules, effective_package_extensions};
 pub(crate) use settings::{
     ResolverConfigInputs, configure_resolver, finalize_lockfile_graph, resolve_dependency_policy,
+};
+pub(crate) use settings::{
+    resolve_catalog_prune, resolve_lockfile_settings, resolve_lockfile_settings_extra,
 };
 pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
 
@@ -412,6 +414,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     // workspace's catalog. See `discover_catalogs` for the precedence
     // order.
     let workspace_catalogs = super::discover_catalogs(&cwd)?;
+    let lockfile_settings = settings::resolve_lockfile_settings(&settings_ctx);
     let packument_cache_dir =
         super::resolved_cache_dir_with_ctx(&cwd, &settings_ctx).join("packuments-v1");
     let explicit_store_dir_override = has_explicit_store_dir_override(&opts.cli_flags);
@@ -710,6 +713,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                 workspace_catalogs: &workspace_catalogs,
                 is_workspace_project,
                 lockfile_pre_parse: lockfile_pre_parse.as_ref(),
+                lockfile_settings: &lockfile_settings,
             })? {
                 Ok(_) => {}
                 Err(aube_lockfile::Error::NotFound(_)) => {
@@ -905,6 +909,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
         workspace_catalogs: &workspace_catalogs,
         is_workspace_project,
         lockfile_pre_parse: lockfile_pre_parse.as_ref(),
+        lockfile_settings: &lockfile_settings,
     })?;
 
     // Deprecation messages from freshly-resolved packages. Only the
@@ -1644,6 +1649,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                                 .as_deref()
                                 .is_none_or(|s| s.starts_with("sha512-"));
                         aube_util::diag::instant_lazy(aube_util::diag::Category::Fetch, "tarball_path", || format!(r#"{{"streaming":{},"name":{}}}"#, stream_eligible, aube_util::diag::jstr(&pkg.name)));
+                        let mut stream_throttled = false;
                         if stream_eligible {
                             let streamed = crate::commands::install::lifecycle::fetch_and_import_tarball_streaming(
                                 &client,
@@ -1658,10 +1664,31 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                                 fetch_strict_pkg_content_check,
                             )
                             .await;
-                            let (index, bytes_len, computed_integrity) = match streamed {
-                                Ok(v) => {
+                            match streamed {
+                                Ok((index, bytes_len, computed_integrity)) => {
                                     permit.record_success();
-                                    v
+                                    if let Some(p) = bytes_progress.as_ref() {
+                                        p.inc_downloaded_bytes(bytes_len);
+                                    }
+                                    return Ok::<_, miette::Report>((
+                                        dep_path,
+                                        index,
+                                        computed_integrity,
+                                    ));
+                                }
+                                // A body that broke mid-stream is refetched whole
+                                // by the buffered path below, which retries with
+                                // backoff.
+                                Err(e)
+                                    if crate::commands::install::lifecycle::retry_stream_via_buffered_fetch(
+                                        &client,
+                                        &e,
+                                        &pkg_display_name,
+                                        &pkg_version,
+                                    )
+                                    .await =>
+                                {
+                                    stream_throttled = e.is_throttle;
                                 }
                                 Err(e) => {
                                     if e.is_throttle {
@@ -1671,15 +1698,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                                     }
                                     return Err(e.into());
                                 }
-                            };
-                            if let Some(p) = bytes_progress.as_ref() {
-                                p.inc_downloaded_bytes(bytes_len);
                             }
-                            return Ok::<_, miette::Report>((
-                                dep_path,
-                                index,
-                                computed_integrity,
-                            ));
                         }
 
                         let fetch_outcome = if streaming_sha512_enabled {
@@ -1715,7 +1734,11 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                         };
                         let (bytes, streamed_digest) = match fetch_outcome {
                             Ok(v) => {
-                                permit.record_success();
+                                if stream_throttled {
+                                    permit.record_throttle();
+                                } else {
+                                    permit.record_success();
+                                }
                                 v
                             }
                             Err((report, throttled)) => {

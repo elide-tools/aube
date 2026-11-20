@@ -53,6 +53,7 @@ pub const WARN_AUBE_MANAGED_CONFIG_ENFORCED: &str = "WARN_AUBE_MANAGED_CONFIG_EN
 
 // ── update / prerelease ─────────────────────────────────────────────
 pub const WARN_AUBE_PRERELEASE_CHECK_SKIPPED: &str = "WARN_AUBE_PRERELEASE_CHECK_SKIPPED";
+pub const WARN_AUBE_TRANSITIVE_UPDATE_SKIPPED: &str = "WARN_AUBE_TRANSITIVE_UPDATE_SKIPPED";
 pub const WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE: &str =
     "WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE";
 pub const WARN_AUBE_WORKSPACE_PACKAGE_MISSING_NAME: &str =
@@ -84,6 +85,7 @@ pub const WARN_AUBE_HTTP_RETRY_BODY_DECODE: &str = "WARN_AUBE_HTTP_RETRY_BODY_DE
 pub const WARN_AUBE_PACKUMENT_CACHE_WRITE: &str = "WARN_AUBE_PACKUMENT_CACHE_WRITE";
 pub const WARN_AUBE_SLOW_METADATA: &str = "WARN_AUBE_SLOW_METADATA";
 pub const WARN_AUBE_SLOW_TARBALL: &str = "WARN_AUBE_SLOW_TARBALL";
+pub const WARN_AUBE_DNS_HICKORY_TIMEOUT: &str = "WARN_AUBE_DNS_HICKORY_TIMEOUT";
 
 // ── registry TLS / proxy config ─────────────────────────────────────
 pub const WARN_AUBE_INVALID_HTTPS_PROXY: &str = "WARN_AUBE_INVALID_HTTPS_PROXY";
@@ -92,6 +94,7 @@ pub const WARN_AUBE_INVALID_CA: &str = "WARN_AUBE_INVALID_CA";
 pub const WARN_AUBE_INVALID_CAFILE: &str = "WARN_AUBE_INVALID_CAFILE";
 pub const WARN_AUBE_UNREADABLE_CAFILE: &str = "WARN_AUBE_UNREADABLE_CAFILE";
 pub const WARN_AUBE_INVALID_CLIENT_CERT: &str = "WARN_AUBE_INVALID_CLIENT_CERT";
+pub const WARN_AUBE_BUNDLED_ROOTS_FALLBACK: &str = "WARN_AUBE_BUNDLED_ROOTS_FALLBACK";
 
 // ── resolver ────────────────────────────────────────────────────────
 pub const WARN_AUBE_UNSUPPORTED_PLATFORM_INSTALL: &str = "WARN_AUBE_UNSUPPORTED_PLATFORM_INSTALL";
@@ -373,6 +376,12 @@ pub const ALL: &[CodeMeta] = &[
         exit_code: None,
     },
     CodeMeta {
+        name: WARN_AUBE_TRANSITIVE_UPDATE_SKIPPED,
+        category: category::UPDATE_PRERELEASE,
+        description: "`aube update <transitive>` left the dependency at its locked version because a pnpmfile or `packageExtensions` may change its parents' declared ranges; `<name>@latest` still bumps it.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE,
         category: category::UPDATE_PRERELEASE,
         description: "One or more newer package versions were hidden because they have not satisfied `minimumReleaseAge` yet.",
@@ -502,6 +511,12 @@ pub const ALL: &[CodeMeta] = &[
         description: "A tarball download fell below `fetchMinSpeedKiBps`.",
         exit_code: None,
     },
+    CodeMeta {
+        name: WARN_AUBE_DNS_HICKORY_TIMEOUT,
+        category: category::REGISTRY_PERF,
+        description: "The in-process DNS resolver timed out, so aube switched to the system resolver for the rest of the run.",
+        exit_code: None,
+    },
     // Registry TLS / proxy
     CodeMeta {
         name: WARN_AUBE_INVALID_HTTPS_PROXY,
@@ -537,6 +552,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_INVALID_CLIENT_CERT,
         category: category::REGISTRY_TLS,
         description: "Per-registry client `cert`/`key` PEM pair didn't parse.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_BUNDLED_ROOTS_FALLBACK,
+        category: category::REGISTRY_TLS,
+        description: "The system trust store yielded no CA certificates (minimal container without `ca-certificates`, or `SSL_CERT_FILE`/`SSL_CERT_DIR` naming nothing readable), so aube trusts its bundled Mozilla roots instead. Never emitted when any system root loads.",
         exit_code: None,
     },
     // Resolver

@@ -32,10 +32,12 @@ impl Resolver {
             packument_full_cache_dir: None,
             auto_install_peers: true,
             exclude_links_from_lockfile: false,
+            lockfile_settings_extra: BTreeMap::new(),
             supported_architectures: SupportedArchitectures::default(),
             overrides: BTreeMap::new(),
             override_rules: Vec::new(),
             ignored_optional_dependencies: BTreeSet::new(),
+            preserved_importers: BTreeSet::new(),
             resolution_mode: ResolutionMode::Highest,
             project_root: PathBuf::from("."),
             ignore_scripts: false,
@@ -78,10 +80,12 @@ impl Resolver {
                 packument_full_cache_dir: None,
                 auto_install_peers: true,
                 exclude_links_from_lockfile: false,
+                lockfile_settings_extra: BTreeMap::new(),
                 supported_architectures: SupportedArchitectures::default(),
                 overrides: BTreeMap::new(),
                 override_rules: Vec::new(),
                 ignored_optional_dependencies: BTreeSet::new(),
+                preserved_importers: BTreeSet::new(),
                 resolution_mode: ResolutionMode::Highest,
                 project_root: PathBuf::from("."),
                 ignore_scripts: false,
@@ -240,6 +244,16 @@ impl Resolver {
         self
     }
 
+    /// Set the lockfile `settings:` entries derived from the current
+    /// configuration that aube does not model as typed fields.
+    pub fn with_lockfile_settings_extra(
+        mut self,
+        value: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        self.lockfile_settings_extra = value;
+        self
+    }
+
     /// Override the host platform triple used when filtering optional
     /// dependencies. See [`platform::SupportedArchitectures`].
     pub fn with_supported_architectures(mut self, value: SupportedArchitectures) -> Self {
@@ -293,6 +307,15 @@ impl Resolver {
     /// to both root and transitive optional deps. Empty by default.
     pub fn with_ignored_optional_dependencies(mut self, ignored: BTreeSet<String>) -> Self {
         self.ignored_optional_dependencies = ignored;
+        self
+    }
+
+    /// Name the importers of the existing lockfile that this resolve leaves
+    /// as they are, such as the other workspace members when `aube update`
+    /// resolves one member. Their locked packages can still provide
+    /// optional peers, so lockfile reuse keeps those peer bindings.
+    pub fn with_preserved_importers(mut self, importers: BTreeSet<String>) -> Self {
+        self.preserved_importers = importers;
         self
     }
 

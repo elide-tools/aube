@@ -30,6 +30,9 @@ pub struct UnmetPeer {
     pub from_dep_path: String,
     /// Human-friendly package name (pre-context) for display.
     pub from_name: String,
+    /// The declaring package's own version (its manifest version, which a
+    /// local `file:`/`link:` dep_path does not encode).
+    pub from_version: String,
     /// Name of the peer being declared (e.g. `"react"`).
     pub peer_name: String,
     /// The declared peer range from the package's packument
@@ -40,6 +43,15 @@ pub struct UnmetPeer {
     /// auto-install path usually drags *some* version in, but it can
     /// happen for corner cases.
     pub found: Option<String>,
+}
+
+/// pnpm retries a rejected prerelease provider as its base release, so
+/// `19.0.0-rc.1` satisfies `^19.0.0` for peer checks and provider selection.
+fn peer_version_satisfies(version: &str, range: &str) -> bool {
+    version_satisfies(version, range)
+        || version
+            .split_once(['-', '+'])
+            .is_some_and(|(base, _)| version_satisfies(base, range))
 }
 
 /// Scan the resolved graph and return every declared required peer whose
@@ -68,10 +80,42 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
             }
 
             let found_tail = pkg.dependencies.get(peer_name);
-            let found_version = found_tail.map(|t| canonical_tail(t).to_string());
+            // A linked or local provider's tail is its content-addressed
+            // key (`link+<hash>`), not a version; its version is on the
+            // package. A lockfile does not record that version, so a
+            // placeholder `0.0.0` on a local provider means "not known"
+            // rather than "mismatched".
+            let local_provider = found_tail.and_then(|tail| {
+                aube_lockfile::resolve_dep_edge(peer_name, tail, |key| {
+                    graph.packages.contains_key(key)
+                })
+                .and_then(|key| graph.packages.get(&key))
+                .filter(|p| {
+                    matches!(
+                        p.local_source,
+                        Some(
+                            LocalSource::Directory(_)
+                                | LocalSource::Link(_)
+                                | LocalSource::Portal(_)
+                        )
+                    )
+                })
+            });
+            let found_version = match local_provider {
+                Some(local) => Some(local.version.clone()),
+                None => found_tail.map(|t| canonical_tail(t).to_string()),
+            };
 
             let satisfied = match &found_version {
-                Some(v) => version_satisfies(v, declared_range),
+                Some(_)
+                    if local_provider.is_some_and(|p| {
+                        p.extra_meta
+                            .contains_key(aube_lockfile::EXTRA_UNKNOWN_VERSION)
+                    }) =>
+                {
+                    true
+                }
+                Some(v) => peer_version_satisfies(v, declared_range),
                 None => false,
             };
             if satisfied {
@@ -81,6 +125,7 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
             unmet.push(UnmetPeer {
                 from_dep_path: pkg.dep_path.clone(),
                 from_name: pkg.name.clone(),
+                from_version: pkg.version.clone(),
                 peer_name: peer_name.clone(),
                 declared: declared_range.clone(),
                 found: found_version,
@@ -308,7 +353,7 @@ pub fn hoist_auto_installed_peers(mut graph: LockfileGraph) -> LockfileGraph {
 /// pnpm-compatible settings (`dedupe-peer-dependents`, `dedupe-peers`,
 /// `resolve-peers-from-workspace-root`, `peers-suffix-max-length`)
 /// through the `Resolver`'s `with_*` setters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PeerContextOptions {
     /// When true, run the cross-subtree peer-variant collapse pass
     /// after every iteration of the fixed-point loop. Matches pnpm's
@@ -330,6 +375,13 @@ pub struct PeerContextOptions {
     /// suffix is replaced by a parenthesized short hash `(<short-hash>)`
     /// (pnpm's `createPeerDepGraphHash`). pnpm's default is 1000.
     pub peers_suffix_max_length: usize,
+    /// Workspace member name → importer path (relative to the workspace
+    /// root). A member a `workspace:` dependency resolved to has no
+    /// `packages:` entry, so without this a registry package peering on
+    /// it could only record the peer in its suffix and never wire it. With
+    /// it, the peer pass adds a `LocalSource::Link` package for the member
+    /// and the consumer links to it, as it already does for `link:`.
+    pub workspace_links: BTreeMap<String, String>,
 }
 
 impl Default for PeerContextOptions {
@@ -339,6 +391,7 @@ impl Default for PeerContextOptions {
             dedupe_peers: false,
             resolve_from_workspace_root: true,
             peers_suffix_max_length: 1000,
+            workspace_links: BTreeMap::new(),
         }
     }
 }
@@ -378,6 +431,7 @@ pub fn apply_peer_contexts(
         .saturating_add(1)
         .clamp(MIN_ITERATIONS, MAX_ITERATIONS);
     let mut current = canonical;
+    add_workspace_link_packages(&mut current, &options.workspace_links);
     let mut converged = false;
     // Hash both keys and dependency tails. A peer-context iteration can
     // rewrite a dependency value to point at an existing key without
@@ -781,6 +835,7 @@ fn apply_peer_contexts_once(
         name_index.entry(pkg.name.as_str()).or_default().push(pkg);
     }
 
+    let independent_packages = independently_reachable_packages(&canonical);
     let cyclic_peer_identities = cyclic_peer_identities(&canonical);
 
     // Root-importer scope used by `resolve-peers-from-workspace-root`.
@@ -790,7 +845,7 @@ fn apply_peer_contexts_once(
     let root_scope: FxHashMap<String, PeerProvider> = canonical
         .importers
         .get(".")
-        .map(|deps| scope_map_from_deps(&canonical, deps))
+        .map(|deps| scope_map_from_deps(&canonical, &options.workspace_links, deps))
         .unwrap_or_default();
 
     for (importer_path, direct_deps) in &canonical.importers {
@@ -804,7 +859,7 @@ fn apply_peer_contexts_once(
         // it's already contextualized, and passing the plain version
         // would make descendants look up keys that don't exist in the
         // (now-nested) graph.
-        let importer_scope = scope_map_from_deps(&canonical, direct_deps);
+        let importer_scope = scope_map_from_deps(&canonical, &options.workspace_links, direct_deps);
 
         let mut new_deps = Vec::with_capacity(direct_deps.len());
         for dep in direct_deps {
@@ -826,6 +881,7 @@ fn apply_peer_contexts_once(
                 &dep.dep_path,
                 &canonical,
                 &name_index,
+                &independent_packages,
                 &importer_scope,
                 &root_scope,
                 &mut out_packages,
@@ -903,6 +959,62 @@ struct PeerProvider {
     context_tail: String,
 }
 
+/// Add a `LocalSource::Link` package for each workspace member a direct
+/// dependency resolved to without a `packages:` entry, keyed like the
+/// `link:` dependency on the same directory. The importer keeps its own
+/// `name@version` entry; only peer wiring points at the link package.
+fn add_workspace_link_packages(graph: &mut LockfileGraph, links: &BTreeMap<String, String>) {
+    if links.is_empty() {
+        return;
+    }
+    let mut added = Vec::new();
+    for dep in graph.importers.values().flatten() {
+        let Some(path) = links.get(&dep.name) else {
+            continue;
+        };
+        if graph.packages.contains_key(&dep.dep_path) {
+            continue;
+        }
+        let local = LocalSource::Link(path.into());
+        let dep_path = local.dep_path(&dep.name);
+        let version = dep
+            .dep_path
+            .strip_prefix(&format!("{}@", dep.name))
+            .unwrap_or("0.0.0");
+        added.push(LockedPackage {
+            name: dep.name.clone(),
+            version: version.to_string(),
+            dep_path,
+            local_source: Some(local),
+            ..Default::default()
+        });
+    }
+    for pkg in added {
+        graph.packages.entry(pkg.dep_path.clone()).or_insert(pkg);
+    }
+}
+
+/// The provider for a workspace member with no `packages:` entry: wired
+/// through its link package, while the suffix keeps the member's version.
+fn workspace_link_provider(
+    graph: &LockfileGraph,
+    links: &BTreeMap<String, String>,
+    name: &str,
+    version: &str,
+) -> Option<PeerProvider> {
+    let local = LocalSource::Link(links.get(name)?.into());
+    let dep_path = local.dep_path(name);
+    let target_tail = dep_path.strip_prefix(&format!("{name}@"))?.to_string();
+    graph
+        .packages
+        .contains_key(&dep_path)
+        .then(|| PeerProvider {
+            target_tail,
+            context_name: name.to_string(),
+            context_tail: version.to_string(),
+        })
+}
+
 fn peer_provider(graph: &LockfileGraph, name: &str, target_tail: &str) -> PeerProvider {
     let package =
         aube_lockfile::resolve_dep_edge(name, target_tail, |key| graph.packages.contains_key(key))
@@ -931,6 +1043,7 @@ fn peer_provider(graph: &LockfileGraph, name: &str, target_tail: &str) -> PeerPr
 /// `apply_peer_contexts_once`.
 fn scope_map_from_deps(
     graph: &LockfileGraph,
+    links: &BTreeMap<String, String>,
     deps: &[DirectDep],
 ) -> FxHashMap<String, PeerProvider> {
     let mut out = FxHashMap::with_capacity_and_hasher(deps.len(), Default::default());
@@ -944,7 +1057,15 @@ fn scope_map_from_deps(
         } else {
             d.dep_path.clone()
         };
-        out.insert(d.name.clone(), peer_provider(graph, &d.name, &tail));
+        let provider = if graph.packages.contains_key(&d.dep_path) {
+            None
+        } else {
+            workspace_link_provider(graph, links, &d.name, &tail)
+        };
+        out.insert(
+            d.name.clone(),
+            provider.unwrap_or_else(|| peer_provider(graph, &d.name, &tail)),
+        );
     }
     out
 }
@@ -1766,6 +1887,48 @@ fn apply_dedupe_peers_to_tail(tail: &str) -> String {
 /// the consumer chain again. Membership is per graph key, peer context
 /// included: a cycle through one `host@1` context says nothing about
 /// another `host@1` context or about `host@2`.
+/// Reach the graph through real declarations, excluding remembered optional-peer
+/// bindings so those bindings cannot establish their own independent providers.
+pub(crate) fn independently_reachable_packages(graph: &LockfileGraph) -> FxHashSet<String> {
+    let mut pending: Vec<_> = graph
+        .importers
+        .values()
+        .flatten()
+        .filter_map(|dep| {
+            if graph.packages.contains_key(&dep.dep_path) {
+                return Some(dep.dep_path.clone());
+            }
+            let tail = dep.dep_path.strip_prefix(&format!("{}@", dep.name))?;
+            aube_lockfile::resolve_dep_edge(&dep.name, tail, |key| graph.packages.contains_key(key))
+        })
+        .collect();
+    let mut reached = FxHashSet::default();
+    while let Some(key) = pending.pop() {
+        let Some(pkg) = graph.packages.get(&key) else {
+            continue;
+        };
+        if !reached.insert(key) {
+            continue;
+        }
+        for (name, tail) in &pkg.dependencies {
+            if pkg
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional)
+                && !pkg.declared_dependencies.contains_key(name)
+            {
+                continue;
+            }
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            {
+                pending.push(child);
+            }
+        }
+    }
+    reached
+}
+
 fn cyclic_peer_identities(graph: &LockfileGraph) -> FxHashSet<String> {
     let nodes: Vec<&LockedPackage> = graph.packages.values().collect();
     let index_of: FxHashMap<&str, usize> = graph
@@ -1866,6 +2029,7 @@ fn visit_peer_context<'g>(
     input_dep_path: &str,
     graph: &'g LockfileGraph,
     name_index: &FxHashMap<&'g str, Vec<&'g LockedPackage>>,
+    independent_packages: &FxHashSet<String>,
     ancestor_scope: &FxHashMap<String, PeerProvider>,
     root_scope: &FxHashMap<String, PeerProvider>,
     out_packages: &mut BTreeMap<String, LockedPackage>,
@@ -1961,7 +2125,7 @@ fn visit_peer_context<'g>(
             // The tail may carry a nested peer suffix on fixed-point
             // iterations 2+; strip it before checking the semver.
             let canonical = canonical_tail(&provider.context_tail);
-            version_satisfies(canonical, declared_range)
+            peer_version_satisfies(canonical, declared_range)
         };
 
         let from_ancestor = ancestor_scope
@@ -2011,12 +2175,20 @@ fn visit_peer_context<'g>(
         // from `new_dependencies`. The semver check is against the
         // package's canonical `version` field, not the tail, because
         // the tail may carry a peer suffix that isn't valid semver.
-        let from_graph_scan = || {
+        let from_graph_scan = |independent_only: bool| {
             name_index
                 .get(peer_name.as_str())
                 .into_iter()
                 .flat_map(|bucket| bucket.iter().copied())
-                .filter(|p| version_satisfies(&p.version, declared_range))
+                .filter(|p| !independent_only || independent_packages.contains(&p.dep_path))
+                // A workspace member's link package exists to wire the
+                // importers that depend on it; it must not satisfy a peer
+                // of an importer that doesn't.
+                .filter(|p| {
+                    !(options.workspace_links.contains_key(&p.name)
+                        && matches!(p.local_source, Some(LocalSource::Link(_))))
+                })
+                .filter(|p| peer_version_satisfies(&p.version, declared_range))
                 .filter_map(|p| {
                     let tail = p
                         .dep_path
@@ -2049,8 +2221,31 @@ fn visit_peer_context<'g>(
             .peer_dependencies_meta
             .get(peer_name)
             .is_some_and(|m| m.optional);
+        // A retained pure optional-peer edge is a fallback for the current
+        // ancestor scope, including an incompatible newly provided version.
+        // A declared dependency still takes precedence over incompatible peers.
+        let optional_only = is_optional && !pkg.declared_dependencies.contains_key(peer_name);
+        let from_optional_ancestor = optional_only
+            .then(|| from_ancestor_incompatible.clone())
+            .flatten();
+        // pnpm replaces an optional-only lockfile provider with a compatible
+        // real dependency from any importer, even with peer deduplication
+        // off. An independently reachable old provider keeps its binding.
+        let from_retained_replacement = if optional_only
+            && pkg.dependencies.get(peer_name).is_some_and(|tail| {
+                aube_lockfile::resolve_dep_edge(peer_name, tail, |key| {
+                    graph.packages.contains_key(key)
+                })
+                .is_some_and(|key| !independent_packages.contains(&key))
+            }) {
+            from_graph_scan(true)
+        } else {
+            None
+        };
         let resolved = if is_optional {
-            from_ancestor
+            from_optional_ancestor
+                .or(from_retained_replacement)
+                .or(from_ancestor)
                 .or(from_pkg_deps)
                 .or(from_ancestor_incompatible)
                 .or(from_pkg_deps_incompatible)
@@ -2059,7 +2254,7 @@ fn visit_peer_context<'g>(
                 .or_else(|| {
                     options
                         .dedupe_peer_dependents
-                        .then(from_graph_scan)
+                        .then(|| from_graph_scan(false))
                         .flatten()
                 })
         } else {
@@ -2068,7 +2263,7 @@ fn visit_peer_context<'g>(
                 .or(from_ancestor_incompatible)
                 .or(from_pkg_deps_incompatible)
                 .or(from_root)
-                .or_else(from_graph_scan)
+                .or_else(|| from_graph_scan(false))
                 .or(from_root_incompatible)
         };
         if let Some(provider) = resolved {
@@ -2194,6 +2389,7 @@ fn visit_peer_context<'g>(
             &child_canonical_dep_path,
             graph,
             name_index,
+            independent_packages,
             &child_scope,
             root_scope,
             out_packages,
@@ -2226,6 +2422,7 @@ fn visit_peer_context<'g>(
             &child_canonical_dep_path,
             graph,
             name_index,
+            independent_packages,
             &child_scope,
             root_scope,
             out_packages,
@@ -3074,6 +3271,163 @@ mod tests {
         assert!(
             !plugin.dependencies.contains_key("shared"),
             "a package that may sit in the shared virtual store must not link a project-specific workspace directory"
+        );
+    }
+
+    fn workspace_peer_graph() -> LockfileGraph {
+        let mut g = LockfileGraph::default();
+        g.importers.insert(
+            "packages/app".to_string(),
+            vec![
+                DirectDep {
+                    name: "plugin".to_string(),
+                    dep_path: "plugin@1.0.0".to_string(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                },
+                DirectDep {
+                    name: "react".to_string(),
+                    dep_path: "react@18.2.0".to_string(),
+                    dep_type: DepType::Production,
+                    specifier: Some("workspace:*".to_string()),
+                },
+            ],
+        );
+        g.importers.insert("packages/react".to_string(), Vec::new());
+        let mut plugin = locked("plugin", &[]);
+        plugin
+            .peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
+        g.packages.insert(plugin.dep_path.clone(), plugin);
+        g
+    }
+
+    fn workspace_links() -> PeerContextOptions {
+        PeerContextOptions {
+            workspace_links: BTreeMap::from([("react".to_string(), "packages/react".to_string())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn registry_package_links_a_workspace_peer_provider() {
+        let out =
+            apply_peer_contexts(workspace_peer_graph(), &workspace_links()).expect("peer pass");
+
+        let plugin = out
+            .packages
+            .get("plugin@1.0.0(react@18.2.0)")
+            .expect("the suffix keeps the workspace package's version");
+        let tail = plugin
+            .dependencies
+            .get("react")
+            .expect("the peer edge must be wired to the workspace package");
+        let link = out
+            .packages
+            .get(&format!("react@{tail}"))
+            .expect("the edge names a package in the graph");
+        assert_eq!(
+            link.local_source,
+            Some(LocalSource::Link("packages/react".into()))
+        );
+        assert_eq!(
+            out.importers["packages/app"]
+                .iter()
+                .find(|d| d.name == "react")
+                .map(|d| d.dep_path.as_str()),
+            Some("react@18.2.0"),
+            "the importer keeps its workspace entry"
+        );
+    }
+
+    #[test]
+    fn workspace_peer_link_is_stable_across_reruns() {
+        let once =
+            apply_peer_contexts(workspace_peer_graph(), &workspace_links()).expect("peer pass");
+        let twice = apply_peer_contexts(once.clone(), &workspace_links()).expect("peer pass");
+
+        assert_eq!(
+            once.packages.keys().collect::<Vec<_>>(),
+            twice.packages.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            once.packages["plugin@1.0.0(react@18.2.0)"].dependencies,
+            twice.packages["plugin@1.0.0(react@18.2.0)"].dependencies
+        );
+    }
+
+    #[test]
+    fn workspace_link_package_does_not_satisfy_other_importers_peers() {
+        let mut g = workspace_peer_graph();
+        g.importers.insert(
+            "packages/other".to_string(),
+            vec![DirectDep {
+                name: "plugin".to_string(),
+                dep_path: "plugin@1.0.0".to_string(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            }],
+        );
+        let options = PeerContextOptions {
+            dedupe_peer_dependents: true,
+            resolve_from_workspace_root: false,
+            ..workspace_links()
+        };
+
+        let out = apply_peer_contexts(g, &options).expect("peer pass");
+
+        let unmet = detect_unmet_peers(&out);
+        assert!(
+            unmet.iter().any(|u| u.peer_name == "react"),
+            "an importer that does not depend on the workspace package must still report the missing peer: {unmet:?}"
+        );
+    }
+
+    #[test]
+    fn unmet_peer_check_reads_a_linked_provider_by_version() {
+        let mut g = LockfileGraph::default();
+        let mut plugin = locked("plugin", &[("react", "link+0123456789abcdef")]);
+        plugin
+            .peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
+        g.packages.insert(plugin.dep_path.clone(), plugin);
+        let mut react = LockedPackage {
+            name: "react".to_string(),
+            version: "18.2.0".to_string(),
+            dep_path: "react@link+0123456789abcdef".to_string(),
+            local_source: Some(LocalSource::Link("packages/react".into())),
+            ..Default::default()
+        };
+        g.packages.insert(react.dep_path.clone(), react.clone());
+        assert!(detect_unmet_peers(&g).is_empty());
+
+        react.version = "17.0.0".to_string();
+        g.packages.insert(react.dep_path.clone(), react.clone());
+        g.packages
+            .get_mut("plugin@1.0.0")
+            .expect("plugin")
+            .peer_dependencies
+            .insert("react".to_string(), "^18.0.0".to_string());
+        let unmet = detect_unmet_peers(&g);
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].found.as_deref(), Some("17.0.0"));
+
+        react.version = "0.0.0".to_string();
+        g.packages.insert(react.dep_path.clone(), react.clone());
+        assert_eq!(
+            detect_unmet_peers(&g).len(),
+            1,
+            "a manifest version of 0.0.0 is a real version and must be checked"
+        );
+
+        react.extra_meta.insert(
+            aube_lockfile::EXTRA_UNKNOWN_VERSION.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        g.packages.insert(react.dep_path.clone(), react);
+        assert!(
+            detect_unmet_peers(&g).is_empty(),
+            "a lockfile-read link has no known version, so it cannot be called a mismatch"
         );
     }
 }

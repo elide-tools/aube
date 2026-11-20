@@ -31,10 +31,34 @@ pub(crate) fn load_graph(
     }
 }
 
+/// Read a shared workspace graph when cwd belongs to one of its importers.
+pub(crate) fn shared_workspace_graph(
+    cwd: &Path,
+) -> miette::Result<Option<(PathBuf, aube_lockfile::LockfileGraph)>> {
+    if crate::dirs::ignore_workspace() {
+        return Ok(None);
+    }
+    let Some(root) = crate::dirs::find_workspace_root(cwd) else {
+        return Ok(None);
+    };
+    if !super::with_settings_ctx(&root, aube_settings::resolved::shared_workspace_lockfile) {
+        return Ok(None);
+    }
+    let manifest = super::load_manifest_or_default(&root)?;
+    let Ok(graph) = super::parse_lockfile(&root, &manifest) else {
+        return Ok(None);
+    };
+    let importer = workspace_importer_path(&root, cwd)?;
+    if !graph.importers.contains_key(&importer) {
+        return Ok(None);
+    }
+    Ok(Some((root, graph)))
+}
+
 /// Collect the transitive dep-path closure reachable from the filtered
-/// root deps, keyed by dep_path for stable iteration. Used by audit,
-/// sbom, and anything else that needs "which packages would apply if
-/// the user ran install in this mode".
+/// root deps, keyed by dep_path for stable iteration. Used by audit and
+/// anything else that needs "which packages would apply if the user ran
+/// install in this mode".
 pub(crate) fn collect_dep_closure(
     graph: &aube_lockfile::LockfileGraph,
     filter: DepFilter,
@@ -54,6 +78,25 @@ pub(crate) fn collect_workspace_dep_closure(
     collect_closure_from(
         graph,
         graph.importers.values().flatten(),
+        filter,
+        no_optional,
+    )
+}
+
+/// Like [`collect_workspace_dep_closure`], but seeded only from importers
+/// other than the root (`.`), so it yields what workspace members reach.
+pub(crate) fn collect_member_dep_closure(
+    graph: &aube_lockfile::LockfileGraph,
+    filter: DepFilter,
+    no_optional: bool,
+) -> std::collections::BTreeMap<String, &aube_lockfile::LockedPackage> {
+    collect_closure_from(
+        graph,
+        graph
+            .importers
+            .iter()
+            .filter(|(path, _)| path.as_str() != ".")
+            .flat_map(|(_, deps)| deps),
         filter,
         no_optional,
     )
@@ -150,7 +193,13 @@ pub(crate) fn write_and_log_lockfile(
     manifest: &aube_manifest::PackageJson,
 ) -> miette::Result<PathBuf> {
     let kind = super::lockfile_kind_for_write(cwd)?;
-    let written_path = aube_lockfile::write_lockfile_as(cwd, graph, manifest, kind)
+    // Graphs that came from parsing the lockfile (prune/merge paths) carry
+    // the settings recorded when it was written; restamp them from the
+    // current config so a changed setting isn't restored from the old file.
+    let mut graph = graph.clone();
+    graph.settings.extra =
+        super::with_settings_ctx(cwd, super::install::resolve_lockfile_settings_extra);
+    let written_path = aube_lockfile::write_lockfile_as(cwd, &graph, manifest, kind)
         .into_diagnostic()
         .wrap_err("failed to write lockfile")?;
     eprintln!(

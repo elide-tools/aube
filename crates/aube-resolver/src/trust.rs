@@ -218,6 +218,20 @@ pub fn strongest_prior_evidence(
     best
 }
 
+/// Whether `current` is weaker than `prior` enough to count as a downgrade.
+///
+/// Staged publish needs a human to approve each release, so a maintainer
+/// who automates releases has to move to trusted publishing. Staged publish
+/// followed by a trusted publisher with provenance is therefore accepted,
+/// a deliberate divergence from pnpm. Dropping to provenance alone, to no
+/// evidence, or going from trusted publisher to a weaker source still fails.
+fn is_downgrade(current: Option<TrustEvidence>, prior: TrustEvidence) -> bool {
+    if prior == TrustEvidence::StagedPublish && current == Some(TrustEvidence::TrustedPublisher) {
+        return false;
+    }
+    current.map_or(0, TrustEvidence::rank) < prior.rank()
+}
+
 /// Run the trust-downgrade check. Returns `Ok(())` when the picked
 /// version is acceptable (excluded, missing-evidence-everywhere, older
 /// than `ignore_after_minutes`, or carrying evidence at least as strong
@@ -277,8 +291,7 @@ pub fn check_no_downgrade(
     };
 
     let current = evidence_for(picked_meta);
-    let current_rank = current.map_or(0, TrustEvidence::rank);
-    if current_rank < prior.evidence.rank() {
+    if is_downgrade(current, prior.evidence) {
         return Err(TrustCheckError::Downgrade(TrustDowngradeDetails {
             name: packument.name.clone(),
             picked_version: picked_version.to_string(),
@@ -451,7 +464,7 @@ fn check_no_downgrade_over_history<'a>(
     let Some(prior) = strongest else {
         return Ok(());
     };
-    if picked_evidence.map_or(0, TrustEvidence::rank) < prior.evidence.rank() {
+    if is_downgrade(picked_evidence, prior.evidence) {
         return Err(TrustCheckError::Downgrade(TrustDowngradeDetails {
             name: name.to_string(),
             picked_version: picked_version.to_string(),
@@ -495,9 +508,51 @@ pub const DEFAULT_TRUST_POLICY_EXCLUDES: &[&str] = &[
     "why-is-node-running@3.2.2",
     // vercel moved CLI development to a private repository at 58.5.1. It still
     // publishes through npm Trusted Publishing, but npm cannot attach SLSA
-    // provenance for a private source repo, and the abbreviated packument
-    // omits `_npmUser`, so every release since looks like a downgrade.
+    // provenance for a private source repo. Trusted-publisher metadata only
+    // counts alongside provenance, so every later release looks like a
+    // downgrade even though the full packument still says
+    // `_npmUser.trustedPublisher.id = github`. The same cutoff applies to the
+    // CLI's own dependencies: exempting `vercel` alone still fails the install
+    // on the first of these. Each range starts at the first stable release
+    // after which no later stable release restored provenance, checked against
+    // the vercel@65.14.0 tree. Releases before the cutoff stay checked.
     "vercel@>=58.5.1",
+    "@vercel/backends@>=0.8.32",
+    "@vercel/build-utils@>=14.0.1",
+    "@vercel/cervel@>=0.1.40",
+    "@vercel/cli-auth@>=0.3.2",
+    "@vercel/cli-config@>=0.2.2",
+    "@vercel/cli-exec@>=1.0.1",
+    "@vercel/container@>=0.1.1",
+    "@vercel/detect-agent@>=1.2.4",
+    "@vercel/elysia@>=0.1.109",
+    "@vercel/error-utils@>=2.2.1",
+    "@vercel/express@>=0.1.123",
+    "@vercel/fastify@>=0.1.112",
+    "@vercel/gatsby-plugin-vercel-analytics@>=1.0.12",
+    "@vercel/gatsby-plugin-vercel-builder@>=2.2.35",
+    "@vercel/go@>=3.10.4",
+    "@vercel/h3@>=0.1.118",
+    "@vercel/hono@>=0.2.112",
+    "@vercel/hydrogen@>=1.4.1",
+    "@vercel/koa@>=0.1.92",
+    "@vercel/nestjs@>=0.2.113",
+    "@vercel/next@>=4.21.1",
+    "@vercel/node@>=5.9.5",
+    "@vercel/oidc@>=3.8.2",
+    "@vercel/python@>=6.55.1",
+    "@vercel/python-analysis@>=0.13.1",
+    "@vercel/redwood@>=2.5.1",
+    "@vercel/remix-builder@>=5.9.2",
+    "@vercel/ruby@>=3.0.0",
+    "@vercel/rust@>=1.4.1",
+    "@vercel/static-build@>=2.12.1",
+    "@vercel/static-config@>=3.4.1",
+    "@vercel/vc-native-darwin-arm64@>=58.7.0",
+    "@vercel/vc-native-darwin-x64@>=58.7.0",
+    "@vercel/vc-native-linux-arm64@>=58.7.0",
+    "@vercel/vc-native-linux-x64@>=58.7.0",
+    "@vercel/vc-native-win32-x64@>=59.19.1",
     "chokidar",
     "eslint-config-prettier",
     "eslint-import-resolver-typescript",
@@ -1281,6 +1336,62 @@ mod tests {
     }
 
     #[test]
+    fn history_allows_staged_publish_to_trusted_publisher_but_not_provenance_only() {
+        let provenance = || aube_registry::VersionTrustDist {
+            attestations: Some(Attestations {
+                provenance: Some(serde_json::json!({
+                    "predicateType": "https://slsa.dev/provenance/v1"
+                })),
+            }),
+        };
+        let staged = aube_registry::VersionTrustMetadata {
+            npm_user: Some(NpmUser {
+                approver: Some(serde_json::json!({"name": "maintainer"})),
+                trusted_publisher: None,
+            }),
+            dist: None,
+        };
+        let trusted = aube_registry::VersionTrustMetadata {
+            npm_user: Some(NpmUser {
+                approver: None,
+                trusted_publisher: Some(serde_json::json!({"id": "github"})),
+            }),
+            dist: Some(provenance()),
+        };
+        let provenance_only = aube_registry::VersionTrustMetadata {
+            npm_user: None,
+            dist: Some(provenance()),
+        };
+        let history =
+            |latest: &aube_registry::VersionTrustMetadata| aube_registry::PackumentTrustHistory {
+                time: BTreeMap::from([
+                    ("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string()),
+                    ("2.0.0".to_string(), "2025-02-01T00:00:00.000Z".to_string()),
+                ]),
+                versions: BTreeMap::from([
+                    ("1.0.0".to_string(), staged.clone()),
+                    ("2.0.0".to_string(), latest.clone()),
+                ]),
+            };
+        let check = |latest: &aube_registry::VersionTrustMetadata| {
+            check_no_downgrade_history(
+                "foo",
+                &history(latest),
+                "2.0.0",
+                latest,
+                &TrustExcludeRules::default(),
+                None,
+            )
+        };
+
+        check(&trusted).expect("staged publish → trusted publisher is not a downgrade");
+        assert!(matches!(
+            check(&provenance_only),
+            Err(TrustCheckError::Downgrade(_))
+        ));
+    }
+
+    #[test]
     fn standalone_history_detects_downgrade_and_skips_picked_version() {
         let trust_meta =
             |dist: Option<aube_registry::VersionTrustDist>| aube_registry::VersionTrustMetadata {
@@ -1371,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn downgrade_staged_publish_to_trusted_publisher_fails() {
+    fn staged_publish_to_trusted_publisher_with_provenance_passes() {
         let p = packument(
             "foo",
             vec![
@@ -1389,16 +1500,31 @@ mod tests {
             ],
         );
         let picked = p.versions.get("3.0.0").unwrap();
+        check_no_downgrade(&p, "3.0.0", picked, &TrustExcludeRules::default(), None)
+            .expect("staged publish → trusted publisher is not a downgrade");
+    }
+
+    #[test]
+    fn downgrade_staged_publish_to_provenance_only_fails() {
+        let p = packument(
+            "foo",
+            vec![
+                (
+                    "2.0.0",
+                    "2025-02-01T00:00:00.000Z",
+                    with_staged_publish(version("foo", "2.0.0")),
+                ),
+                (
+                    "3.0.0",
+                    "2025-03-01T00:00:00.000Z",
+                    with_provenance(version("foo", "3.0.0")),
+                ),
+            ],
+        );
+        let picked = p.versions.get("3.0.0").unwrap();
         let err = check_no_downgrade(&p, "3.0.0", picked, &TrustExcludeRules::default(), None)
-            .expect_err("staged publish → trusted publisher is a downgrade");
-        match err {
-            TrustCheckError::Downgrade(d) => {
-                assert_eq!(d.prior_evidence, TrustEvidence::StagedPublish);
-                assert_eq!(d.prior_version, "2.0.0");
-                assert_eq!(d.current_evidence, Some(TrustEvidence::TrustedPublisher));
-            }
-            _ => panic!("expected Downgrade"),
-        }
+            .expect_err("staged publish → provenance only is a downgrade");
+        assert!(matches!(err, TrustCheckError::Downgrade(_)));
     }
 
     #[test]
@@ -1723,6 +1849,96 @@ mod tests {
         }
         for v in ["58.5.0", "58.4.4"] {
             assert!(!r.matches("vercel", &node_semver::Version::parse(v).unwrap()));
+        }
+    }
+
+    #[test]
+    fn default_excludes_vercel_cli_dependencies() {
+        // Exempting `vercel` alone does not install the CLI: its private-repo
+        // dependencies fail the same check. The current release is covered;
+        // the version just below each cutoff is not.
+        let r = TrustExcludeRules::default();
+        let covered = [
+            ("@vercel/backends", "25.0.0", "0.8.32", "0.8.31"),
+            ("@vercel/build-utils", "15.3.0", "14.0.1", "14.0.0"),
+            ("@vercel/cervel", "0.1.93", "0.1.40", "0.1.39"),
+            ("@vercel/cli-auth", "0.4.1", "0.3.2", "0.3.1"),
+            ("@vercel/cli-config", "0.3.8", "0.2.2", "0.2.1"),
+            ("@vercel/cli-exec", "1.0.1", "1.0.1", "1.0.0"),
+            ("@vercel/container", "25.0.2", "0.1.1", "0.1.0"),
+            ("@vercel/detect-agent", "1.2.7", "1.2.4", "1.2.3"),
+            ("@vercel/elysia", "25.0.0", "0.1.109", "0.1.108"),
+            ("@vercel/error-utils", "2.2.1", "2.2.1", "2.2.0"),
+            ("@vercel/express", "25.0.0", "0.1.123", "0.1.122"),
+            ("@vercel/fastify", "25.0.0", "0.1.112", "0.1.111"),
+            (
+                "@vercel/gatsby-plugin-vercel-analytics",
+                "1.0.12",
+                "1.0.12",
+                "1.0.11",
+            ),
+            (
+                "@vercel/gatsby-plugin-vercel-builder",
+                "2.2.85",
+                "2.2.35",
+                "2.2.34",
+            ),
+            ("@vercel/go", "28.0.1", "3.10.4", "3.10.3"),
+            ("@vercel/h3", "25.0.0", "0.1.118", "0.1.117"),
+            ("@vercel/hono", "25.0.0", "0.2.112", "0.2.111"),
+            ("@vercel/hydrogen", "26.0.0", "1.4.1", "1.4.0"),
+            ("@vercel/koa", "25.0.0", "0.1.92", "0.1.91"),
+            ("@vercel/nestjs", "25.0.0", "0.2.113", "0.2.112"),
+            ("@vercel/next", "29.0.0", "4.21.1", "4.21.0"),
+            ("@vercel/node", "30.0.0", "5.9.5", "5.9.4"),
+            ("@vercel/oidc", "4.0.0", "3.8.2", "3.8.1"),
+            ("@vercel/python", "31.0.1", "6.55.1", "6.55.0"),
+            ("@vercel/python-analysis", "0.15.3", "0.13.1", "0.13.0"),
+            ("@vercel/redwood", "27.0.0", "2.5.1", "2.5.0"),
+            ("@vercel/remix-builder", "30.0.0", "5.9.2", "5.9.1"),
+            ("@vercel/ruby", "27.0.0", "3.0.0", "2.9.9"),
+            ("@vercel/rust", "26.0.1", "1.4.1", "1.4.0"),
+            ("@vercel/static-build", "27.0.0", "2.12.1", "2.12.0"),
+            ("@vercel/static-config", "3.4.4", "3.4.1", "3.4.0"),
+            (
+                "@vercel/vc-native-darwin-arm64",
+                "65.14.0",
+                "58.7.0",
+                "58.6.9",
+            ),
+            (
+                "@vercel/vc-native-darwin-x64",
+                "65.14.0",
+                "58.7.0",
+                "58.6.9",
+            ),
+            (
+                "@vercel/vc-native-linux-arm64",
+                "65.14.0",
+                "58.7.0",
+                "58.6.9",
+            ),
+            ("@vercel/vc-native-linux-x64", "65.14.0", "58.7.0", "58.6.9"),
+            (
+                "@vercel/vc-native-win32-x64",
+                "65.14.0",
+                "59.19.1",
+                "59.19.0",
+            ),
+        ];
+        for (name, current, cutoff, before) in covered {
+            assert!(
+                r.matches(name, &node_semver::Version::parse(current).unwrap()),
+                "{name}@{current}"
+            );
+            assert!(
+                r.matches(name, &node_semver::Version::parse(cutoff).unwrap()),
+                "{name}@{cutoff}"
+            );
+            assert!(
+                !r.matches(name, &node_semver::Version::parse(before).unwrap()),
+                "{name}@{before} should stay checked"
+            );
         }
     }
 

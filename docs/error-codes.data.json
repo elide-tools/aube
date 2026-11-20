@@ -819,6 +819,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_TRANSITIVE_UPDATE_SKIPPED",
+      "category": "Update / prerelease",
+      "description": "`aube update <transitive>` left the dependency at its locked version because a pnpmfile or `packageExtensions` may change its parents' declared ranges; `<name>@latest` still bumps it.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE",
       "category": "Update / prerelease",
       "description": "One or more newer package versions were hidden because they have not satisfied `minimumReleaseAge` yet.",
@@ -945,6 +951,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_DNS_HICKORY_TIMEOUT",
+      "category": "Registry caching / perf",
+      "description": "The in-process DNS resolver timed out, so aube switched to the system resolver for the rest of the run.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_INVALID_HTTPS_PROXY",
       "category": "Registry TLS / proxy",
       "description": "`https-proxy` URL didn't parse.",
@@ -978,6 +990,12 @@
       "name": "WARN_AUBE_INVALID_CLIENT_CERT",
       "category": "Registry TLS / proxy",
       "description": "Per-registry client `cert`/`key` PEM pair didn't parse.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_BUNDLED_ROOTS_FALLBACK",
+      "category": "Registry TLS / proxy",
+      "description": "The system trust store yielded no CA certificates (minimal container without `ca-certificates`, or `SSL_CERT_FILE`/`SSL_CERT_DIR` naming nothing readable), so aube trusts its bundled Mozilla roots instead. Never emitted when any system root loads.",
       "exit_code": null
     },
     {

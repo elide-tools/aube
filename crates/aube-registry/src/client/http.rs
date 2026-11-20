@@ -252,13 +252,16 @@ fn build_http_client_inner(
     // In-process DNS caching via hickory-dns. The system resolver
     // does not cache and uses a thread pool for `getaddrinfo`,
     // which serializes the first cold lookup per origin. hickory
-    // resolves async + caches for the process lifetime. Feature-gated
+    // resolves async + caches for the process lifetime, and falls back
+    // to the OS resolver when its lookups time out (see `dns.rs`). Feature-gated
     // so embedders that keep their host binary on getaddrinfo (reqwest's
     // hickory-dns cargo feature flips the default for every client in
     // the binary) can opt out; default features keep it on for aube.
     #[cfg(feature = "hickory-dns")]
     {
-        builder = builder.hickory_dns(true);
+        builder = builder.dns_resolver(std::sync::Arc::new(super::dns::FallbackResolver::shared(
+            timeout,
+        )));
     }
     builder = builder
         .tcp_keepalive(std::time::Duration::from_secs(60))
@@ -586,7 +589,7 @@ mod tests {
 
     /// A throwaway CA plus a loopback HTTPS listener whose leaf chains
     /// only to it. Neither the OS trust store nor the webpki bundle
-    /// `with_webpki_root_fallback` merges in issued this chain, so a
+    /// `with_webpki_root_fallback` can merge in issued this chain, so a
     /// completed handshake against the listener is proof that the CA
     /// reached the client through `NODE_EXTRA_CA_CERTS`.
     struct PrivateCaServer {

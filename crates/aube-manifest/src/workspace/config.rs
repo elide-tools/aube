@@ -494,6 +494,11 @@ pub struct WorkspaceConfig {
     #[serde(default, rename = "jailBuildPermissions")]
     pub jail_build_permissions: BTreeMap<String, JailBuildPermission>,
 
+    /// Seed the build allowlist with aube's built-in trusted-dependencies
+    /// list. Same typed/raw duality as `child_concurrency`.
+    #[serde(default, rename = "useDefaultTrustedDependencies")]
+    pub use_default_trusted_dependencies: Option<bool>,
+
     // -- Catalog Settings --
     /// Drop catalog entries that no importer references after resolve.
     /// Wired through `aube_settings::resolved::catalog_prune`;
@@ -547,6 +552,26 @@ pub struct WorkspaceConfig {
     /// in the lockfile. Default: false.
     #[serde(default)]
     pub dedupe_peers: Option<bool>,
+
+    /// Recorded in the lockfile `settings:` header (pnpm parity).
+    /// Default: false.
+    #[serde(default)]
+    pub add_missing_peer_types: Option<bool>,
+
+    /// Recorded in the lockfile `settings:` header (pnpm parity).
+    /// Default: false.
+    #[serde(default)]
+    pub inject_workspace_packages: Option<bool>,
+
+    /// Recorded in the lockfile resolution settings (pnpm parity).
+    /// Default: false.
+    #[serde(default)]
+    pub auto_dedupe: Option<bool>,
+
+    /// Recorded in the lockfile resolution settings (pnpm parity).
+    /// Default: true.
+    #[serde(default)]
+    pub dedupe_injected_deps: Option<bool>,
 
     /// Consult the root workspace importer's direct deps for peer
     /// resolution before falling back to a graph-wide scan.

@@ -512,6 +512,87 @@ pub(super) fn resolve_dedupe_peers(ctx: &aube_settings::ResolveCtx<'_>) -> bool 
     aube_settings::resolved::dedupe_peers(ctx)
 }
 
+/// pnpm's default `peersSuffixMaxLength`, omitted from `settings:` when unchanged.
+const DEFAULT_PEERS_SUFFIX_MAX_LENGTH: u64 = 1000;
+
+/// Whether pnpm's `lockfile.includeResolutionSettings` is on. pnpm reads it
+/// from the nested `lockfile:` map of `pnpm-workspace.yaml`.
+fn include_resolution_settings(ctx: &aube_settings::ResolveCtx<'_>) -> bool {
+    ctx.workspace_yaml
+        .get("lockfile")
+        .and_then(|v| v.get("includeResolutionSettings"))
+        .and_then(yaml_serde::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The `settings:` header entries pnpm records beyond `autoInstallPeers`
+/// and `excludeLinksFromLockfile`, derived from the current configuration.
+/// Each key appears only where pnpm 12 writes it: boolean opt-ins and a
+/// nondefault `peersSuffixMaxLength` when set, and the resolution settings
+/// snapshot (always, with defaults) under
+/// `lockfile.includeResolutionSettings`. pnpm compares these on a frozen
+/// install, so a stale or missing entry makes it fail with
+/// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
+pub(crate) fn resolve_lockfile_settings_extra(
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut flag = |key: &str, value: bool| {
+        if value {
+            out.insert(key.to_string(), serde_json::Value::Bool(true));
+        }
+    };
+    flag(
+        "addMissingPeerTypes",
+        aube_settings::resolved::add_missing_peer_types(ctx),
+    );
+    flag("dedupePeers", aube_settings::resolved::dedupe_peers(ctx));
+    flag(
+        "injectWorkspacePackages",
+        aube_settings::resolved::inject_workspace_packages(ctx),
+    );
+    let max_length = aube_settings::resolved::peers_suffix_max_length(ctx);
+    if max_length != DEFAULT_PEERS_SUFFIX_MAX_LENGTH {
+        out.insert("peersSuffixMaxLength".into(), max_length.into());
+    }
+    if include_resolution_settings(ctx) {
+        out.insert(
+            "autoDedupe".into(),
+            aube_settings::resolved::auto_dedupe(ctx).into(),
+        );
+        out.insert(
+            "dedupeInjectedDeps".into(),
+            aube_settings::resolved::dedupe_injected_deps(ctx).into(),
+        );
+        out.insert(
+            "dedupePeerDependents".into(),
+            aube_settings::resolved::dedupe_peer_dependents(ctx).into(),
+        );
+        out.insert(
+            "linkWorkspacePackages".into(),
+            match aube_settings::resolved::link_workspace_packages(ctx) {
+                aube_settings::resolved::LinkWorkspacePackages::True => true.into(),
+                aube_settings::resolved::LinkWorkspacePackages::False => false.into(),
+                aube_settings::resolved::LinkWorkspacePackages::Deep => "deep".into(),
+            },
+        );
+    }
+    out
+}
+
+/// The full `settings:` header the current config implies, for comparing
+/// against what a lockfile recorded.
+pub(crate) fn resolve_lockfile_settings(
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> aube_lockfile::LockfileSettings {
+    aube_lockfile::LockfileSettings {
+        auto_install_peers: aube_settings::resolved::auto_install_peers(ctx),
+        exclude_links_from_lockfile: aube_settings::resolved::exclude_links_from_lockfile(ctx),
+        lockfile_include_tarball_url: aube_settings::resolved::lockfile_include_tarball_url(ctx),
+        extra: resolve_lockfile_settings_extra(ctx),
+    }
+}
+
 /// Resolve `resolvePeersFromWorkspaceRoot` from `.npmrc` / workspace
 /// yaml. When true (pnpm's default), unresolved peers fall back to
 /// the root importer's direct deps before the graph-wide scan.
@@ -1292,6 +1373,7 @@ pub(crate) fn configure_resolver(
         .with_auto_install_peers(auto_install_peers)
         .with_peers_suffix_max_length(peers_suffix_max_length)
         .with_exclude_links_from_lockfile(exclude_links_from_lockfile)
+        .with_lockfile_settings_extra(resolve_lockfile_settings_extra(settings_ctx))
         .with_dedupe_peer_dependents(dedupe_peer_dependents)
         .with_dedupe_peers(dedupe_peers)
         .with_resolve_peers_from_workspace_root(resolve_peers_from_workspace_root_opt)
@@ -1429,34 +1511,59 @@ impl PeerDependencyRules {
             return true;
         }
         if let Some(found) = u.found.as_deref()
-            && self.allowed_versions_permit(&u.from_name, &u.peer_name, found)
+            && self.allowed_versions_permit(&u.from_name, &u.from_version, &u.peer_name, found)
         {
             return true;
         }
         false
     }
 
-    fn allowed_versions_permit(&self, parent: &str, peer: &str, found: &str) -> bool {
-        let scoped_key = format!("{parent}>{peer}");
-        let candidates = [
-            self.allowed_versions.get(&scoped_key),
-            self.allowed_versions.get(peer),
-        ];
+    /// Keys take three forms: `peer`, `parent>peer`, and
+    /// `parent@range>peer`, where the range must contain the parent's
+    /// resolved version. Scoped names keep their leading `@`.
+    fn allowed_versions_permit(
+        &self,
+        parent: &str,
+        parent_version: &str,
+        peer: &str,
+        found: &str,
+    ) -> bool {
         let Ok(found_v) = node_semver::Version::parse(found) else {
             return false;
         };
-        candidates
-            .into_iter()
-            .flatten()
-            .any(|range| matches_range(range, &found_v))
+        self.allowed_versions.iter().any(|(key, range)| {
+            let Some((selector, key_peer)) = key.rsplit_once('>') else {
+                return key == peer && matches_range(range, &found_v);
+            };
+            if key_peer != peer {
+                return false;
+            }
+            let parent_matches = match selector.rfind('@').filter(|&at| at > 0) {
+                Some(at) => {
+                    &selector[..at] == parent
+                        && node_semver::Version::parse(parent_version).is_ok_and(|version| {
+                            node_semver::Range::parse(&selector[at + 1..])
+                                .is_ok_and(|r| r.satisfies(&version))
+                        })
+                }
+                None => selector == parent,
+            };
+            parent_matches && matches_range(range, &found_v)
+        })
     }
 }
 
+/// pnpm admits a prerelease provider whose base release is in range, and
+/// `*` admits every version including prereleases.
 fn matches_range(range: &str, found: &node_semver::Version) -> bool {
-    match node_semver::Range::parse(range) {
-        Ok(r) => r.satisfies(found),
-        Err(_) => false,
+    let Ok(r) = node_semver::Range::parse(range) else {
+        return false;
+    };
+    if r.satisfies(found) || range.trim() == "*" {
+        return true;
     }
+    let base = format!("{}.{}.{}", found.major, found.minor, found.patch);
+    node_semver::Version::parse(&base).is_ok_and(|v| r.satisfies(&v))
 }
 
 fn compile_peer_patterns(field: &str, raw: &[String]) -> Vec<glob::Pattern> {
@@ -1641,6 +1748,7 @@ mod peer_dependency_rules_tests {
         aube_resolver::UnmetPeer {
             from_dep_path: format!("{parent}@0.0.0"),
             from_name: parent.to_string(),
+            from_version: "0.0.0".to_string(),
             peer_name: peer.to_string(),
             declared: declared.to_string(),
             found: found.map(String::from),
@@ -1701,6 +1809,40 @@ mod peer_dependency_rules_tests {
         assert!(!r.silences(&unmet("lib", "react", "^18.0.0", Some("20.0.0"))));
         // Missing peers are not silenced by allowed_versions.
         assert!(!r.silences(&unmet("lib", "react", "^18.0.0", None)));
+    }
+
+    #[test]
+    fn allowed_versions_parent_range_key_matches_parent_version() {
+        let r = rules(&[], &[], &[("use-sync-external-store@1>react", "19")]);
+        let mut u = unmet(
+            "use-sync-external-store",
+            "react",
+            "^18.0.0",
+            Some("19.2.0"),
+        );
+        u.from_version = "1.2.0".to_string();
+        assert!(r.silences(&u));
+        u.from_version = "2.0.0".to_string();
+        assert!(!r.silences(&u));
+
+        let scoped = rules(&[], &[], &[("@scope/lib@^2>react", "19")]);
+        let mut u = unmet("@scope/lib", "react", "^18.0.0", Some("19.0.0"));
+        u.from_version = "2.1.0".to_string();
+        assert!(scoped.silences(&u));
+
+        // A local (`file:`) parent has no version in its dep_path; the
+        // manifest version still has to match the rule.
+        let local = rules(&[], &[], &[("consumer@1>react", "19")]);
+        let mut u = unmet("consumer", "react", "^18.0.0", Some("19.0.0"));
+        u.from_dep_path = "consumer@file+abc123".to_string();
+        u.from_version = "1.2.0".to_string();
+        assert!(local.silences(&u));
+    }
+
+    #[test]
+    fn allowed_versions_star_admits_prereleases() {
+        let r = rules(&[], &[], &[("react", "*")]);
+        assert!(r.silences(&unmet("lib", "react", "^18.0.0", Some("19.0.0-canary-1"))));
     }
 
     #[test]
@@ -1848,5 +1990,58 @@ mod finalize_lockfile_graph_tests {
             ignored.pnpmfile_checksum.is_none(),
             "--ignore-pnpmfile must not record a pnpmfile checksum"
         );
+    }
+}
+
+#[cfg(test)]
+mod lockfile_settings_extra_tests {
+    use super::*;
+
+    fn extra(npmrc: &[(&str, &str)], workspace_yaml: &str) -> BTreeMap<String, serde_json::Value> {
+        let npmrc: Vec<(String, String)> = npmrc
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ws: BTreeMap<String, yaml_serde::Value> = yaml_serde::from_str(workspace_yaml).unwrap();
+        resolve_lockfile_settings_extra(&aube_settings::ResolveCtx::files_only(&npmrc, &ws))
+    }
+
+    #[test]
+    fn defaults_add_nothing() {
+        assert!(extra(&[], "{}").is_empty());
+        assert!(extra(&[], "dedupePeers: false\npeersSuffixMaxLength: 1000\n").is_empty());
+    }
+
+    #[test]
+    fn opt_ins_and_nondefault_suffix_length_are_recorded() {
+        let got = extra(
+            &[("dedupe-peers", "true")],
+            "injectWorkspacePackages: true\naddMissingPeerTypes: true\npeersSuffixMaxLength: 80\n",
+        );
+        let keys: Vec<_> = got.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "addMissingPeerTypes",
+                "dedupePeers",
+                "injectWorkspacePackages",
+                "peersSuffixMaxLength"
+            ]
+        );
+        assert_eq!(got["peersSuffixMaxLength"], 80);
+    }
+
+    #[test]
+    fn resolution_snapshot_requires_the_nested_opt_in() {
+        let off = extra(&[], "linkWorkspacePackages: deep\nautoDedupe: true\n");
+        assert!(off.is_empty());
+        let on = extra(
+            &[],
+            "lockfile:\n  includeResolutionSettings: true\nlinkWorkspacePackages: deep\n",
+        );
+        assert_eq!(on["autoDedupe"], false);
+        assert_eq!(on["dedupeInjectedDeps"], true);
+        assert_eq!(on["dedupePeerDependents"], true);
+        assert_eq!(on["linkWorkspacePackages"], "deep");
     }
 }

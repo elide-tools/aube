@@ -166,6 +166,11 @@ structured metadata shapes npm emits after registry-side checks:
    --provenance` (`dist.attestations.provenance.predicateType` with an SLSA
    provenance URI).
 
+Moving from staged publish approval to a trusted publisher with provenance is
+not a downgrade: staged publishing needs a human to approve every release, so
+maintainers who automate releases have to switch to trusted publishing. Any
+other drop in tier still fails.
+
 This install-time policy validates the registry metadata shape; it does not
 cryptographically verify the attached attestation bundle.
 
@@ -501,6 +506,13 @@ aube audit --json | jq    # machine-readable for CI
 
 Same advisory data source as `npm audit` and `pnpm audit`; same response
 schema.
+
+Only registry packages are sent to the advisory endpoint. Workspace, `file:`,
+`link:`, git, and tarball-URL dependencies are neither sent nor audited, so
+their names are not sent. Registry dependencies, including private ones, are
+sent by name. A tarball URL on your configured registry counts as a registry
+package and is still audited, provided it follows the registry's standard
+`<name>/-/<name>-<version>.tgz` layout for that package and version.
 
 ## Example strict policy
 

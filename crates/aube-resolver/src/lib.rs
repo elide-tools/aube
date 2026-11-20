@@ -128,6 +128,11 @@ pub struct Resolver {
     /// the `canonical.settings.exclude_links_from_lockfile` flag the
     /// writer reads.
     exclude_links_from_lockfile: bool,
+    /// Header settings pnpm records beyond the modeled ones
+    /// (`dedupePeers`, `injectWorkspacePackages`, …), derived from the
+    /// current configuration and stamped into
+    /// `LockfileGraph::settings.extra`.
+    lockfile_settings_extra: BTreeMap<String, serde_json::Value>,
     /// User-declared override for the host platform triple, used when
     /// deciding whether an optional dep's `os`/`cpu`/`libc` constraints
     /// are satisfied. Empty fields fall back to the host.
@@ -146,6 +151,10 @@ pub struct Resolver {
     /// dropped before enqueueing — the resolver never fetches or locks it.
     /// Mirrors pnpm's `createOptionalDependenciesRemover` read-package hook.
     ignored_optional_dependencies: BTreeSet<String>,
+    /// Importers of the existing lockfile that this resolve does not
+    /// re-resolve and the caller writes back unchanged. Their locked
+    /// packages stay installed, so they can still provide optional peers.
+    preserved_importers: BTreeSet<String>,
     /// pnpm's `resolution-mode`.
     resolution_mode: ResolutionMode,
     /// Project root used to resolve `file:` / `link:` paths to the
